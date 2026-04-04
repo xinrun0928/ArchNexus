@@ -1,0 +1,610 @@
+---
+title: 常见场景的幂等性设计
+description: 支付、订单、消息等场景的实践
+---
+
+# 常见场景的幂等性设计
+
+理论讲完了，现在来看实际场景。这一章将讨论几个典型业务场景的幂等性设计：支付、订单、消息、接口调用。
+
+## 场景一：支付幂等性
+
+支付是最需要幂等性的场景，因为金钱不能出错。
+
+### 支付幂等性的关键问题
+
+```
+支付场景的核心问题：
+1. 用户点击支付，可能触发多次请求
+2. 网关返回超时，不知道是否成功
+3. 回调通知可能重复
+
+支付幂等性的目标：
+1. 同一笔订单不会被扣款两次
+2. 扣款成功的结果必须返回
+3. 扣款失败可以重试
+```
+
+### 设计方案
+
+```java
+// 支付幂等性设计
+@Service
+public class PaymentService {
+
+    @Autowired
+    private PaymentRepository paymentRepository;
+
+    @Autowired
+    private IdempotencyService idempotencyService;
+
+    @Autowired
+    private AccountService accountService;
+
+    /**
+     * 支付接口
+     * 使用商户订单号作为幂等键
+     */
+    public PaymentResult pay(PaymentRequest request) {
+        String idempotentKey = request.getMerchantOrderNo();
+
+        // 1. 检查是否已处理
+        return idempotencyService.executeWithIdempotency(
+            idempotentKey,
+            "PAYMENT",
+            () -> doPay(request)
+        );
+    }
+
+    private PaymentResult doPay(PaymentRequest request) {
+        // 2. 校验订单
+        Order order = orderService.getOrder(request.getMerchantOrderNo());
+        if (order == null) {
+            return PaymentResult.failed("订单不存在");
+        }
+
+        // 3. 检查余额
+        BigDecimal balance = accountService.getBalance(order.getUserId());
+        if (balance.compareTo(order.getAmount()) < 0) {
+            return PaymentResult.failed("余额不足");
+        }
+
+        // 4. 扣款（乐观锁保证幂等）
+        try {
+            accountService.deductBalance(order.getUserId(),
+                                       order.getAmount(),
+                                       request.getMerchantOrderNo());
+
+            // 5. 更新订单状态
+            orderService.updateStatus(order.getOrderId(),
+                                   OrderStatus.PAID);
+
+            // 6. 记录支付流水
+            PaymentRecord record = new PaymentRecord();
+            record.setMerchantOrderNo(request.getMerchantOrderNo());
+            record.setAmount(order.getAmount());
+            record.setStatus(PaymentStatus.SUCCESS);
+            record.setPaidAt(LocalDateTime.now());
+            paymentRepository.save(record);
+
+            return PaymentResult.success("支付成功",
+                                       request.getMerchantOrderNo());
+
+        } catch (OptimisticLockException e) {
+            // 并发更新，可能是重复扣款
+            return PaymentResult.failed("扣款失败，请重试");
+        }
+    }
+}
+```
+
+### 支付回调幂等性
+
+支付回调（Webhook）是另一个容易出现幂等性问题的场景。
+
+```java
+// 支付回调幂等性
+@RestController
+public class PaymentCallbackController {
+
+    @Autowired
+    private PaymentCallbackService callbackService;
+
+    /**
+     * 支付回调
+     * 使用支付流水号作为幂等键
+     */
+    @PostMapping("/callback/payment")
+    public String handleCallback(@RequestBody PaymentCallback callback,
+                                @RequestHeader("X-Signature") String signature) {
+        // 1. 验证签名
+        if (!verifySignature(callback, signature)) {
+            return "FAIL";
+        }
+
+        String idempotentKey = callback.getTransactionId();
+
+        // 2. 幂等处理
+        return callbackService.executeWithIdempotency(
+            idempotentKey,
+            () -> doCallback(callback)
+        );
+    }
+
+    private String doCallback(PaymentCallback callback) {
+        switch (callback.getStatus()) {
+            case "SUCCESS":
+                // 支付成功，更新订单
+                orderService.updateStatus(callback.getOrderNo(),
+                                        OrderStatus.PAID);
+                return "SUCCESS";
+
+            case "FAILED":
+                // 支付失败，记录日志
+                logger.warn("Payment failed: {}", callback);
+                return "FAIL";
+
+            default:
+                return "FAIL";
+        }
+    }
+}
+```
+
+### 支付幂等性注意事项
+
+| 注意事项 | 说明 |
+| --- | --- |
+| 幂等键选择 | 使用商户订单号，不使用支付流水号 |
+| 余额检查 | 检查余额时也要考虑并发，使用乐观锁 |
+| 回调验证 | 必须验证签名，防止伪造回调 |
+| 异步处理 | 回调处理要异步，避免超时 |
+
+## 场景二：订单幂等性
+
+订单创建和状态更新都需要幂等性设计。
+
+### 订单创建幂等性
+
+```java
+// 订单创建幂等性
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    /**
+     * 创建订单
+     * 使用业务订单号作为幂等键
+     */
+    @Transactional
+    public Order createOrder(CreateOrderRequest request) {
+        String orderNo = request.getOrderNo();
+
+        // 1. 检查订单是否已存在
+        Order existing = orderRepository.findByOrderNo(orderNo);
+        if (existing != null) {
+            // 订单已创建，直接返回
+            // 这是幂等的关键
+            return existing;
+        }
+
+        // 2. 创建新订单
+        Order order = new Order();
+        order.setOrderNo(orderNo);
+        order.setUserId(request.getUserId());
+        order.setTotalAmount(request.getTotalAmount());
+        order.setStatus(OrderStatus.PENDING);
+        order.setItems(buildOrderItems(request.getItems()));
+        order.setCreatedAt(LocalDateTime.now());
+
+        // 3. 扣减库存（乐观锁）
+        for (OrderItem item : order.getItems()) {
+            inventoryService.deductStock(
+                item.getProductId(),
+                item.getQuantity(),
+                orderNo  // 幂等键，防止超卖
+            );
+        }
+
+        // 4. 保存订单
+        return orderRepository.save(order);
+    }
+}
+```
+
+### 订单状态更新幂等性
+
+```java
+// 订单状态更新幂等性
+@Service
+public class OrderService {
+
+    /**
+     * 取消订单（幂等实现）
+     */
+    @Transactional
+    public void cancelOrder(String orderNo, String reason) {
+        Order order = orderRepository.findByOrderNo(orderNo);
+
+        if (order == null) {
+            throw new RuntimeException("订单不存在");
+        }
+
+        // 状态机检查：只有特定状态才能取消
+        Set<OrderStatus> cancellableStatuses =
+            EnumSet.of(OrderStatus.PENDING, OrderStatus.PAID);
+
+        if (!cancellableStatuses.contains(order.getStatus())) {
+            // 幂等处理：已经是不可取消状态
+            if (order.getStatus() == OrderStatus.CANCELLED) {
+                logger.info("Order already cancelled: {}", orderNo);
+                return;
+            }
+            throw new RuntimeException("订单状态不允许取消");
+        }
+
+        // 更新状态
+        order.setStatus(OrderStatus.CANCELLED);
+        order.setCancelReason(reason);
+        order.setCancelledAt(LocalDateTime.now());
+        orderRepository.save(order);
+
+        // 恢复库存
+        for (OrderItem item : order.getItems()) {
+            inventoryService.restoreStock(
+                item.getProductId(),
+                item.getQuantity(),
+                orderNo
+            );
+        }
+
+        // 退还金额（如果已支付）
+        if (order.getStatus() == OrderStatus.PAID) {
+            accountService.refund(order.getUserId(),
+                               order.getTotalAmount(),
+                               orderNo);
+        }
+    }
+}
+```
+
+### 库存扣减幂等性
+
+库存扣减是最容易出现超卖问题的操作。
+
+```java
+// 库存扣减幂等性
+@Service
+public class InventoryService {
+
+    @Autowired
+    private InventoryRepository inventoryRepository;
+
+    /**
+     * 扣减库存（乐观锁 + 幂等键）
+     */
+    @Transactional
+    public void deductStock(String productId, int quantity, String orderNo) {
+        // 1. 查询库存
+        Inventory inventory = inventoryRepository.findByProductId(productId)
+            .orElseThrow(() -> new RuntimeException("库存记录不存在"));
+
+        // 2. 检查库存
+        if (inventory.getStock() < quantity) {
+            throw new InsufficientStockException("库存不足");
+        }
+
+        // 3. 乐观锁扣减
+        // UPDATE inventory SET stock = stock - ?, version = version + 1
+        // WHERE product_id = ? AND stock >= ? AND version = ?
+        int updated = inventoryRepository.deductWithOptimisticLock(
+            productId,
+            quantity,
+            inventory.getVersion()
+        );
+
+        if (updated == 0) {
+            throw new OptimisticLockException("并发更新，请重试");
+        }
+
+        // 4. 记录库存流水（幂等）
+        StockRecord record = new StockRecord();
+        record.setProductId(productId);
+        record.setOrderNo(orderNo);
+        record.setType(StockChangeType.DEDUCT);
+        record.setQuantity(quantity);
+        record.setCreatedAt(LocalDateTime.now());
+        stockRecordRepository.save(record);
+    }
+
+    /**
+     * 恢复库存（用于取消订单）
+     */
+    @Transactional
+    public void restoreStock(String productId, int quantity, String orderNo) {
+        // 1. 恢复库存
+        inventoryRepository.increaseStock(productId, quantity);
+
+        // 2. 记录库存流水
+        StockRecord record = new StockRecord();
+        record.setProductId(productId);
+        record.setOrderNo(orderNo);
+        record.setType(StockChangeType.RESTORE);
+        record.setQuantity(quantity);
+        record.setCreatedAt(LocalDateTime.now());
+        stockRecordRepository.save(record);
+    }
+}
+```
+
+## 场景三：消息消费幂等性
+
+消息队列天然支持消息重试，必须实现幂等性。
+
+### RocketMQ 消费幂等性
+
+```java
+// RocketMQ 消费幂等性
+@RocketMQMessageListener(
+    topic = "order-topic",
+    consumerGroup = "order-consumer-group"
+)
+public class OrderMessageConsumer implements RocketMQListener<OrderMessage> {
+
+    @Autowired
+    private OrderService orderService;
+
+    @Autowired
+    private IdempotencyService idempotencyService;
+
+    @Override
+    public void onMessage(OrderMessage message) {
+        String messageId = message.getMessageId();
+
+        // 1. 幂等检查
+        idempotencyService.executeWithIdempotency(
+            messageId,
+            "ORDER_MESSAGE",
+            () -> {
+                processMessage(message);
+                return null;
+            }
+        );
+    }
+
+    private void processMessage(OrderMessage message) {
+        // 2. 解析消息
+        CreateOrderRequest request = message.toOrderRequest();
+
+        // 3. 处理订单
+        try {
+            orderService.createOrder(request);
+        } catch (DuplicateOrderException e) {
+            // 订单已存在，忽略重复消息
+            logger.info("Order already exists: {}", request.getOrderNo());
+        }
+    }
+}
+```
+
+### Kafka 消费幂等性
+
+```java
+// Kafka 消费幂等性
+@Service
+public class KafkaOrderConsumer {
+
+    @Autowired
+    private OrderService orderService;
+
+    @KafkaListener(
+        topics = "order-topic",
+        groupId = "order-consumer-group"
+    )
+    public void consume(ConsumerRecord<String, OrderMessage> record) {
+        OrderMessage message = record.value();
+        String messageKey = record.key();  // 消息 key 作为幂等键
+
+        // 1. 幂等处理
+        processMessage(messageKey, message);
+    }
+
+    @Transactional
+    public void processMessage(String messageKey, OrderMessage message) {
+        // 检查是否已处理
+        if (isProcessed(messageKey)) {
+            logger.info("Message already processed: {}", messageKey);
+            return;
+        }
+
+        // 处理消息
+        try {
+            orderService.createOrder(message.toOrderRequest());
+
+            // 标记已处理
+            markAsProcessed(messageKey);
+
+        } catch (DuplicateOrderException e) {
+            // 订单已存在，标记已处理
+            markAsProcessed(messageKey);
+        }
+    }
+}
+```
+
+### 消息幂等性注意事项
+
+| 注意事项 | 说明 |
+| --- | --- |
+| 使用消息 ID | RocketMQ 有 MessageId，Kafka 有 offset + partition |
+| 业务去重 | 结合业务 ID（订单号）双重去重 |
+| 消费确认 | 消费成功后手动提交 offset |
+| 死信处理 | 消费失败进入死信队列，防止无限重试 |
+
+## 场景四：HTTP 接口幂等性
+
+HTTP 接口也需要考虑幂等性，特别是 POST 类接口。
+
+### RESTful API 幂等性设计
+
+```java
+// HTTP 接口幂等性
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired
+    private OrderService orderService;
+
+    /**
+     * 创建订单 - 非幂等
+     * POST 请求，重复调用会创建多个订单
+     */
+    @PostMapping
+    public Response<OrderResponse> createOrder(
+            @RequestBody CreateOrderRequest request,
+            @RequestHeader(value = "X-Idempotency-Key", required = false)
+                String idempotencyKey) {
+
+        if (StringUtils.isNotBlank(idempotencyKey)) {
+            // 有幂等键，使用幂等处理
+            Order order = orderService.createOrderIdempotent(
+                idempotencyKey, request);
+            return Response.success(toResponse(order));
+        } else {
+            // 无幂等键，正常创建
+            Order order = orderService.createOrder(request);
+            return Response.success(toResponse(order));
+        }
+    }
+
+    /**
+     * 取消订单 - 幂等
+     * DELETE 请求，重复调用结果相同
+     */
+    @DeleteMapping("/{orderNo}")
+    public Response<Void> cancelOrder(@PathVariable String orderNo) {
+        orderService.cancelOrder(orderNo);
+        return Response.success();
+    }
+
+    /**
+     * 更新订单 - 幂等
+     * PUT 请求，重复调用结果相同
+     */
+    @PutMapping("/{orderNo}")
+    public Response<OrderResponse> updateOrder(
+            @PathVariable String orderNo,
+            @RequestBody UpdateOrderRequest request) {
+        Order order = orderService.updateOrder(orderNo, request);
+        return Response.success(toResponse(order));
+    }
+
+    /**
+     * 查询订单 - 幂等
+     * GET 请求，天然幂等
+     */
+    @GetMapping("/{orderNo}")
+    public Response<OrderResponse> getOrder(@PathVariable String orderNo) {
+        Order order = orderService.getOrder(orderNo);
+        return Response.success(toResponse(order));
+    }
+}
+```
+
+### 幂等性中间件
+
+```java
+// 幂等性注解 + 拦截器
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Idempotent {
+    String key();
+    int expireSeconds() default 3600;
+}
+
+@Aspect
+@Component
+public class IdempotentAspect {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Around("@annotation(idempotent)")
+    public Object around(ProceedingJoinPoint point,
+                        Idempotent idempotent) throws Throwable {
+        String idempotentKey = getIdempotentKey(point, idempotent.key());
+
+        // 尝试获取锁
+        Boolean acquired = redisTemplate.opsForValue()
+            .setIfAbsent(idempotentKey,
+                        "PROCESSING",
+                        Duration.ofSeconds(idempotent.expireSeconds()));
+
+        if (Boolean.FALSE.equals(acquired)) {
+            String status = (String) redisTemplate.opsForValue().get(idempotentKey);
+            if ("SUCCESS".equals(status)) {
+                return getCachedResult(idempotentKey);
+            }
+            throw new ConcurrentProcessingException("请求正在处理中");
+        }
+
+        try {
+            Object result = point.proceed();
+
+            // 缓存结果
+            redisTemplate.opsForValue().set(
+                idempotentKey + ":result",
+                result,
+                Duration.ofSeconds(idempotent.expireSeconds())
+            );
+
+            return result;
+        } finally {
+            redisTemplate.opsForValue().set(idempotentKey, "SUCCESS",
+                Duration.ofSeconds(idempotent.expireSeconds()));
+        }
+    }
+}
+```
+
+```java
+// 使用幂等性注解
+@RestController
+public class PaymentController {
+
+    @Autowired
+    private PaymentService paymentService;
+
+    @PostMapping("/pay")
+    @Idempotent(key = "#request.merchantOrderNo", expireSeconds = 3600)
+    public Response<PaymentResult> pay(@RequestBody PaymentRequest request) {
+        PaymentResult result = paymentService.pay(request);
+        return Response.success(result);
+    }
+}
+```
+
+## 总结
+
+不同场景的幂等性设计要点：
+
+| 场景 | 幂等键 | 实现方案 | 注意事项 |
+| --- | --- | --- | --- |
+| 支付 | 商户订单号 | 去重表 + 乐观锁 | 必须验证签名 |
+| 订单创建 | 订单号 | 数据库唯一约束 | 库存扣减也要幂等 |
+| 状态更新 | 订单号 + 状态 | 状态机 | 检查当前状态 |
+| 消息消费 | 消息 ID | Redis 去重 | 结合业务 ID |
+| HTTP 接口 | 幂等键头 | Redis + 注解 | 超时时间要合理 |
+
+**幂等性设计的最佳实践**：
+
+1. **优先使用业务 ID**：订单号、支付流水号等天然唯一
+2. **结合多种方案**：去重表 + 乐观锁 + 状态机
+3. **幂等键要传递**：前端生成，后端校验
+4. **记录处理结果**：方便排查问题
+5. **设置过期时间**：避免存储无限增长
+
+至此，我们完成了幂等性理论的讨论。从定义、实现到实践，幂等性是分布式系统中最基础也是最重要的设计原则之一。

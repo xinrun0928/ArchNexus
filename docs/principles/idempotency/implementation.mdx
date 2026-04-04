@@ -1,0 +1,548 @@
+---
+title: 如何实现幂等性
+description: 常见的技术实现方案
+---
+
+# 如何实现幂等性
+
+知道了幂等性的重要性后，下一个问题是：**如何在实际系统中实现幂等性？**
+
+不同的业务场景、不同的技术栈，需要不同的实现方案。这一章将介绍几种常见的幂等性实现方案，以及它们的适用场景。
+
+## 幂等性实现的核心问题
+
+幂等性实现需要解决两个核心问题：
+
+1. **如何识别重复请求？** — 需要一个唯一标识
+2. **如何防止重复执行？** — 需要一个去重机制
+
+### 唯一标识的来源
+
+重复请求的标识（幂等键）可以来自：
+
+| 来源 | 示例 | 说明 |
+| --- | --- | --- |
+| 客户端生成 | 雪花算法 UUID | 需要保证全局唯一 |
+| 业务标识 | 订单号、手机号 | 自然存在的唯一标识 |
+| 服务端生成 | Session ID、Token | 需要先获取标识 |
+| 消息 ID | 消息队列提供的 ID | MQ 天然支持 |
+
+### 去重机制的选择
+
+去重机制的实现方式：
+
+| 机制 | 实现 | 适用场景 |
+| --- | --- | --- |
+| 数据库唯一约束 | UNIQUE KEY | 单库、单表 |
+| 分布式锁 | Redis/ZooKeeper | 跨库、跨服务 |
+| 去重表 | Redis Set/MongoDB | 高并发、低延迟 |
+| 状态机 | 业务流程控制 | 复杂业务 |
+
+## 方案一：数据库唯一约束
+
+最简单的幂等性实现方式是利用数据库的唯一约束。
+
+### 适用场景
+
+- 单库单表或分库分表后能保证唯一性
+- 并发量不是特别高
+- 操作主要是 INSERT
+
+### 实现方式
+
+```sql
+-- 创建订单表，使用订单号作为唯一键
+CREATE TABLE orders (
+    order_id VARCHAR(32) PRIMARY KEY,
+    user_id VARCHAR(32) NOT NULL,
+    product_id VARCHAR(32) NOT NULL,
+    amount DECIMAL(10, 2) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_user_id (user_id),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### 代码实现
+
+```java
+// 数据库唯一约束实现幂等性
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Transactional
+    public Order createOrder(CreateOrderRequest request) {
+        // 订单号由调用方生成，确保幂等
+        String orderId = request.getOrderId();
+
+        // 先查询是否已存在
+        Optional<Order> existing = orderRepository.findById(orderId);
+        if (existing.isPresent()) {
+            // 已存在，直接返回
+            return existing.get();
+        }
+
+        // 不存在，创建新订单
+        Order order = new Order();
+        order.setOrderId(orderId);
+        order.setUserId(request.getUserId());
+        order.setProductId(request.getProductId());
+        order.setAmount(request.getAmount());
+        order.setStatus(OrderStatus.PENDING);
+
+        return orderRepository.save(order);
+    }
+}
+```
+
+### 异常处理
+
+```java
+// 处理唯一约束冲突
+try {
+    return orderRepository.save(order);
+} catch (DataIntegrityViolationException e) {
+    // 唯一约束冲突，说明订单已存在
+    return orderRepository.findById(order.getOrderId())
+           .orElseThrow(() -> new RuntimeException("订单异常"));
+}
+```
+
+### 优缺点
+
+| 优点 | 缺点 |
+| --- | --- |
+| 实现简单 | 只适合 INSERT 类操作 |
+| 数据库保证强一致性 | 并发高时可能有性能问题 |
+| 无额外存储 | 分库分表时需要额外处理唯一性 |
+
+## 方案二：乐观锁
+
+乐观锁通过版本号实现幂等性，适用于 UPDATE 操作。
+
+### 适用场景
+
+- 更新的数据有版本号或时间戳
+- 并发冲突不频繁
+- 读多写少
+
+### 实现方式
+
+```sql
+-- 账户表，带版本号
+CREATE TABLE accounts (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id VARCHAR(32) NOT NULL UNIQUE,
+    balance DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    version INT NOT NULL DEFAULT 0,  -- 乐观锁版本号
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_user_id (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### 代码实现
+
+```java
+// 乐观锁实现幂等性
+@Service
+public class AccountService {
+
+    @Autowired
+    private AccountRepository accountRepository;
+
+    @Transactional
+    public void deductBalance(String userId, BigDecimal amount) {
+        // 1. 读取账户信息和版本号
+        Account account = accountRepository.findByUserId(userId)
+                .orElseThrow(() -> new RuntimeException("账户不存在"));
+
+        // 2. 检查余额
+        if (account.getBalance().compareTo(amount) < 0) {
+            throw new RuntimeException("余额不足");
+        }
+
+        // 3. 扣减余额，更新版本号
+        // UPDATE accounts SET balance = balance - ?, version = version + 1
+        // WHERE user_id = ? AND version = ?
+        int updated = accountRepository.deductBalanceWithVersion(
+            userId, amount, account.getVersion()
+        );
+
+        if (updated == 0) {
+            // 版本号不匹配，说明有并发更新，抛出异常让调用方重试
+            throw new OptimisticLockException("并发更新，请重试");
+        }
+    }
+}
+```
+
+```java
+// Repository 层
+@Modifying
+@Query("UPDATE Account a SET a.balance = a.balance - :amount, " +
+       "a.version = a.version + 1 " +
+       "WHERE a.userId = :userId AND a.version = :version")
+int deductBalanceWithVersion(@Param("userId") String userId,
+                             @Param("amount") BigDecimal amount,
+                             @Param("version") Long version);
+```
+
+### 优缺点
+
+| 优点 | 缺点 |
+| --- | --- |
+| 无锁实现，性能好 | 并发冲突时需要重试 |
+| 适用于 UPDATE | 需要额外版本号字段 |
+| 天然幂等 | 重试可能失败多次 |
+
+## 方案三：分布式去重表
+
+对于跨服务、跨数据库的幂等性需求，可以使用分布式去重表。
+
+### 适用场景
+
+- 跨服务调用
+- 分布式事务
+- 需要记录处理结果
+
+### 实现方式
+
+```sql
+-- 幂等性记录表
+CREATE TABLE idempotency_records (
+    idempotency_key VARCHAR(64) PRIMARY KEY,
+    biz_type VARCHAR(32) NOT NULL,
+    biz_data TEXT,  -- 存储原始请求数据
+    result_data TEXT,  -- 存储处理结果
+    status VARCHAR(16) NOT NULL DEFAULT 'PROCESSING',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    expire_at TIMESTAMP NOT NULL,  -- 过期时间
+
+    INDEX idx_expire_at (expire_at),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### 代码实现
+
+```java
+// 分布式去重表实现幂等性
+@Service
+public class IdempotentService {
+
+    @Autowired
+    private IdempotencyRecordRepository recordRepository;
+
+    @Autowired
+    private PaymentService paymentService;
+
+    public PaymentResult executePayment(String idempotentKey,
+                                       PaymentRequest request) {
+        // 1. 查询是否已处理
+        Optional<IdempotencyRecord> existing =
+            recordRepository.findById(idempotentKey);
+
+        if (existing.isPresent()) {
+            IdempotencyRecord record = existing.get();
+
+            switch (record.getStatus()) {
+                case "SUCCESS":
+                    // 已成功，直接返回结果
+                    return parseResult(record.getResultData());
+                case "PROCESSING":
+                    // 处理中，可能是超时重试
+                    throw new ConcurrentProcessingException("请求正在处理中");
+                case "FAILED":
+                    // 之前失败了，可以重试
+                    break;
+                default:
+                    throw new RuntimeException("未知状态");
+            }
+        }
+
+        // 2. 记录处理中状态
+        IdempotencyRecord record = new IdempotencyRecord();
+        record.setIdempotencyKey(idempotentKey);
+        record.setBizType("PAYMENT");
+        record.setBizData(toJson(request));
+        record.setStatus("PROCESSING");
+        record.setExpireAt(LocalDateTime.now().plusDays(7));
+
+        try {
+            recordRepository.save(record);
+        } catch (DuplicateKeyException e) {
+            // 已经被其他节点插入，重试查询
+            return executePayment(idempotentKey, request);
+        }
+
+        // 3. 执行支付
+        PaymentResult result;
+        try {
+            result = paymentService.process(request);
+
+            // 4. 更新成功状态
+            record.setStatus("SUCCESS");
+            record.setResultData(toJson(result));
+            recordRepository.save(record);
+
+        } catch (Exception e) {
+            // 5. 更新失败状态
+            record.setStatus("FAILED");
+            record.setResultData(e.getMessage());
+            recordRepository.save(record);
+
+            throw e;
+        }
+
+        return result;
+    }
+}
+```
+
+### 优缺点
+
+| 优点 | 缺点 |
+| --- | --- |
+| 适用所有操作类型 | 实现复杂 |
+| 支持跨服务 | 需要额外存储 |
+| 可记录处理结果 | 有一定延迟 |
+
+## 方案四：Redis 去重
+
+对于高并发的场景，可以使用 Redis 实现快速的去重。
+
+### 适用场景
+
+- 超高并发（> 10,000 TPS）
+- 需要快速判断是否重复
+- 可以接受短暂的不一致性
+
+### 实现方式
+
+```java
+// Redis 去重实现幂等性
+@Service
+public class IdempotentService {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private PaymentService paymentService;
+
+    private static final Duration EXPIRE_TIME = Duration.ofMinutes(30);
+
+    public PaymentResult executePayment(String idempotentKey,
+                                       PaymentRequest request) {
+        // 1. SET NX：原子性地设置值，如果不存在则设置成功
+        Boolean success = redisTemplate.opsForValue()
+            .setIfAbsent("idempotent:" + idempotentKey,
+                        "PROCESSING",
+                        EXPIRE_TIME);
+
+        if (Boolean.FALSE.equals(success)) {
+            // 设置失败，说明已经存在
+            String status = redisTemplate.opsForValue()
+                .get("idempotent:" + idempotentKey);
+
+            if ("SUCCESS".equals(status)) {
+                // 之前处理成功，返回成功
+                String result = redisTemplate.opsForValue()
+                    .get("idempotent:result:" + idempotentKey);
+                return parseResult(result);
+            } else if ("PROCESSING".equals(status)) {
+                throw new ConcurrentProcessingException("请求正在处理中");
+            } else {
+                // 之前失败了，删除后重试
+                redisTemplate.delete("idempotent:" + idempotentKey);
+            }
+        }
+
+        // 2. 执行支付
+        PaymentResult result;
+        try {
+            result = paymentService.process(request);
+
+            // 3. 更新成功状态
+            redisTemplate.opsForValue()
+                .set("idempotent:" + idempotentKey, "SUCCESS", EXPIRE_TIME);
+            redisTemplate.opsForValue()
+                .set("idempotent:result:" + idempotentKey,
+                    toJson(result), EXPIRE_TIME);
+
+        } catch (Exception e) {
+            // 4. 更新失败状态
+            redisTemplate.opsForValue()
+                .set("idempotent:" + idempotentKey, "FAILED", EXPIRE_TIME);
+            throw e;
+        }
+
+        return result;
+    }
+}
+```
+
+### 优化：Pipeline 减少网络开销
+
+```java
+// 使用 Pipeline 优化
+public PaymentResult executePaymentOptimized(String idempotentKey,
+                                            PaymentRequest request) {
+    // 1. 尝试获取锁
+    String lockKey = "idempotent:lock:" + idempotentKey;
+    String lockValue = UUID.randomUUID().toString();
+
+    Boolean locked = redisTemplate.opsForValue()
+        .setIfAbsent(lockKey, lockValue, Duration.ofSeconds(5));
+
+    if (Boolean.FALSE.equals(locked)) {
+        throw new ConcurrentProcessingException("请求正在处理中");
+    }
+
+    try {
+        // 2. 使用 Pipeline 批量操作
+        redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            // 检查是否已处理
+            connection.stringCommands()
+                .get("idempotent:status:" + idempotentKey.getBytes());
+            // 设置处理中
+            connection.stringCommands()
+                .setEx("idempotent:lock:" + idempotentKey,
+                       EXPIRE_TIME.getSeconds(),
+                       lockValue.getBytes());
+            return null;
+        });
+
+        // 3. 执行支付
+        PaymentResult result = paymentService.process(request);
+
+        // 4. 更新结果
+        redisTemplate.opsForValue()
+            .set("idempotent:status:" + idempotentKey, "SUCCESS", EXPIRE_TIME);
+        redisTemplate.opsForValue()
+            .set("idempotent:result:" + idempotentKey,
+                toJson(result), EXPIRE_TIME);
+
+        return result;
+
+    } finally {
+        // 5. 释放锁
+        redisTemplate.delete(lockKey);
+    }
+}
+```
+
+### 优缺点
+
+| 优点 | 缺点 |
+| --- | --- |
+| 性能极高 | 需要额外的 Redis 组件 |
+| 支持分布式 | 可能有小概率不一致 |
+| 天然支持过期 | 不适合长期存储 |
+
+## 方案五：状态机幂等
+
+对于业务流程明确的场景，可以通过状态机控制实现幂等性。
+
+### 适用场景
+
+- 有明确的状态流转
+- 状态转换是单向的
+- 业务逻辑复杂
+
+### 实现方式
+
+```java
+// 订单状态枚举
+public enum OrderStatus {
+    PENDING,     // 待支付
+    PAID,        // 已支付
+    SHIPPING,    // 配送中
+    COMPLETED,   // 已完成
+    CANCELLED,   // 已取消
+    REFUNDED     // 已退款
+}
+
+// 订单支付
+public void payOrder(String orderId, String paymentId) {
+    Order order = orderRepository.findById(orderId)
+        .orElseThrow(() -> new RuntimeException("订单不存在"));
+
+    // 状态机检查：只有 PENDING 才能转为 PAID
+    if (order.getStatus() != OrderStatus.PENDING) {
+        // 重复支付，但订单已经不是待支付状态
+        if (order.getStatus() == OrderStatus.PAID) {
+            // 已支付，忽略重复请求（幂等）
+            return;
+        }
+        throw new RuntimeException("订单状态不允许支付");
+    }
+
+    // 更新状态
+    order.setStatus(OrderStatus.PAID);
+    order.setPaymentId(paymentId);
+    order.setPaidAt(LocalDateTime.now());
+    orderRepository.save(order);
+}
+
+// 订单发货
+public void shipOrder(String orderId, String trackingNo) {
+    Order order = orderRepository.findById(orderId)
+        .orElseThrow(() -> new RuntimeException("订单不存在"));
+
+    // 状态机检查
+    if (order.getStatus() != OrderStatus.PAID) {
+        throw new RuntimeException("订单状态不允许发货");
+    }
+
+    order.setStatus(OrderStatus.SHIPPING);
+    order.setTrackingNo(trackingNo);
+    order.setShippedAt(LocalDateTime.now());
+    orderRepository.save(order);
+}
+```
+
+### 优缺点
+
+| 优点 | 缺点 |
+| --- | --- |
+| 符合业务流程 | 只适合有状态的场景 |
+| 实现自然 | 需要明确状态流转 |
+| 易于理解 | 状态多时复杂 |
+
+## 方案对比
+
+| 方案 | 适用场景 | 性能 | 复杂度 | 一致性 |
+| --- | --- | --- | --- | --- |
+| 数据库唯一约束 | INSERT 类 | 高 | 低 | 强一致 |
+| 乐观锁 | UPDATE 类 | 高 | 低 | 最终一致 |
+| 去重表 | 跨服务 | 中 | 中 | 强一致 |
+| Redis 去重 | 高并发 | 极高 | 中 | 弱一致 |
+| 状态机 | 流程性业务 | 高 | 中 | 强一致 |
+
+## 总结
+
+幂等性实现有多种方案，各有优缺点：
+
+1. **数据库唯一约束**：最简单，适用于 INSERT 类操作
+2. **乐观锁**：适用于 UPDATE 类操作，无锁实现
+3. **去重表**：适用于跨服务、分布式场景
+4. **Redis 去重**：适用于高并发场景，性能最优
+5. **状态机**：适用于有明确状态流转的业务
+
+**选择原则**：
+
+- 简单场景用数据库唯一约束
+- 高并发场景用 Redis 去重
+- 复杂业务用状态机 + 去重表
+- 跨服务调用用分布式去重表
+
+在下一章中，我们将讨论常见业务场景的幂等性设计，包括支付、订单、消息等具体实现。

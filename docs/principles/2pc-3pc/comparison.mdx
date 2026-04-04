@@ -1,0 +1,436 @@
+---
+title: 2PC vs 3PC 对比
+description: 分布式事务协议的选择指南
+---
+
+# 2PC vs 3PC 对比
+
+两阶段提交（2PC）和三阶段提交（3PC）都是分布式事务的核心协议，但它们各有优缺点。在实际项目中，如何选择？
+
+这一章将从多个维度对比 2PC 和 3PC，帮助你在具体场景下做出正确的选择。
+
+## 核心区别回顾
+
+### 2PC 的两阶段
+
+```
+第一阶段（准备）：协调者询问参与者是否可以提交
+第二阶段（提交）：所有参与者都准备好了，协调者决定提交
+
+参与者状态：
+- 收到 Prepare 后：锁定资源，等待 Commit 或 Abort
+- 收到 Commit：提交事务，释放锁
+- 收到 Abort：回滚事务，释放锁
+```
+
+### 3PC 的三阶段
+
+```
+第一阶段（CanCommit）：协调者询问参与者是否可以提交
+第二阶段（PreCommit）：协调者决定提交，通知参与者准备提交
+第三阶段（DoCommit）：协调者确认提交
+
+参与者状态：
+- 收到 CanCommit：等待 PreCommit
+- 收到 PreCommit：等待 DoCommit（超时后可主动提交）
+- 收到 DoCommit：提交事务
+```
+
+## 阻塞问题对比
+
+### 2PC 的阻塞
+
+2PC 最严重的问题是**协调者崩溃时的阻塞**。
+
+```
+时间轴：
+
+T1: 协调者发送 Prepare
+T2: 所有参与者返回 Vote-Commit
+T3: 协调者发送 Commit
+T4: 协调者崩溃（Commit 未送达部分参与者）
+
+结果：
+- 参与者 A 收到 Commit，提交成功
+- 参与者 B 未收到 Commit，一直等待
+- 参与者 B 的资源被锁定，无法处理其他事务
+```
+
+**阻塞的危害**：
+
+1. 资源无法释放，影响系统吞吐量
+2. 等待时间不确定，取决于协调者恢复时间
+3. 可能引发级联阻塞，影响更多事务
+
+### 3PC 的阻塞
+
+3PC 显著减少了阻塞情况。
+
+```
+时间轴：
+
+T1: 协调者发送 CanCommit
+T2: 所有参与者返回 Yes
+T3: 协调者发送 PreCommit
+T4: 协调者崩溃
+
+结果：
+- 参与者 A、B 都收到 PreCommit
+- 它们知道协调者已经决定提交
+- 如果超时未收到 DoCommit，可以主动提交
+```
+
+**3PC 的改进**：
+
+- 参与者知道协调者的决策，可以主动继续
+- 只有在特定阶段才会阻塞
+- 阻塞概率大大降低
+
+### 阻塞情况对比表
+
+| 崩溃场景 | 2PC 阻塞 | 3PC 阻塞 |
+| --- | --- | --- |
+| 协调者发送 Prepare 前崩溃 | 无阻塞 | 无阻塞 |
+| 协调者发送 Prepare 后崩溃 | 阻塞（等待协调者恢复） | 无阻塞（可回滚） |
+| 协调者发送 Commit 前崩溃 | 阻塞 | 无阻塞（参与者可提交） |
+| 协调者发送 Commit 后崩溃 | 阻塞 | 极少阻塞 |
+| 协调者发送 Abort 后崩溃 | 无阻塞 | 无阻塞 |
+| 参与者崩溃 | 可能阻塞 | 可能阻塞 |
+
+## 一致性保证对比
+
+### 2PC 的一致性保证
+
+2PC 提供**强一致性保证**（在正常情况下）：
+
+- 所有参与者要么全部提交，要么全部回滚
+- 不存在"部分提交"的状态
+- 事务的原子性得到保证
+
+**但是**，2PC 在协调者崩溃时**不保证活性**（系统可能一直等待）。
+
+### 3PC 的一致性保证
+
+3PC 同样提供**强一致性保证**：
+
+- 在正常情况下，与 2PC 相同
+- 在协调者崩溃时，参与者可以继续完成事务
+- 减少了不一致的窗口
+
+**但是**，3PC 在网络分区时**仍可能不一致**：
+
+```
+网络分区场景：
+
+分区 1：参与者 A + 协调者（收到 DoCommit）
+分区 2：参与者 B（未收到 DoCommit）
+
+结果：
+- 分区 1 的 A 提交事务
+- 分区 2 的 B 超时后提交事务
+- 两个节点最终都提交，但时序不同
+```
+
+### 一致性对比表
+
+| 维度 | 2PC | 3PC |
+| --- | --- | --- |
+| 强一致性 | 支持 | 支持 |
+| 协调者崩溃时一致性 | 可能丢失 | 可能丢失 |
+| 网络分区时一致性 | 可能不一致 | 可能不一致 |
+| 线性一致性 | 支持 | 支持 |
+
+## 性能对比
+
+### 延迟
+
+2PC 和 3PC 都需要多轮网络通信：
+
+| 协议 | 网络往返次数 | 典型延迟 |
+| --- | --- | --- |
+| 2PC | 2 次 | 2 × RTT |
+| 3PC | 3 次 | 3 × RTT |
+
+**RTT**（Round Trip Time）：网络往返时间，局域网约 1ms，跨地域约 50-200ms。
+
+**结论**：3PC 比 2PC 多一次网络往返，延迟增加约 50%。
+
+### 吞吐量
+
+在低并发场景下，两者的吞吐量差异不明显。
+
+在高并发场景下：
+
+| 协议 | 100 并发 | 1000 并发 |
+| --- | --- | --- |
+| 2PC | ~10,000 tps | ~5,000 tps |
+| 3PC | ~8,000 tps | ~3,000 tps |
+
+**结论**：由于锁定时间更长，3PC 的吞吐量略低。
+
+### 资源占用
+
+| 维度 | 2PC | 3PC |
+| --- | --- | --- |
+| 锁持有时间 | 短 | 长 |
+| 日志写入 | 2 次 | 3 次 |
+| 内存占用 | 相似 | 相似 |
+
+## 实现复杂度对比
+
+### 2PC 的实现
+
+2PC 的实现相对简单：
+
+```java
+// 简化的协调者实现
+public class TwoPhaseCoordinator {
+    public void execute(Transaction tx) {
+        // 阶段 1：准备
+        boolean allPrepared = prepare(tx);
+        if (!allPrepared) {
+            abort(tx);
+            return;
+        }
+
+        // 阶段 2：提交
+        commit(tx);
+    }
+
+    private boolean prepare(Transaction tx) {
+        for (Participant p : tx.getParticipants()) {
+            if (!p.prepare()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void commit(Transaction tx) {
+        for (Participant p : tx.getParticipants()) {
+            p.commit();
+        }
+    }
+
+    private void abort(Transaction tx) {
+        for (Participant p : tx.getParticipants()) {
+            p.abort();
+        }
+    }
+}
+```
+
+### 3PC 的实现
+
+3PC 的实现更复杂：
+
+```java
+// 简化的协调者实现
+public class ThreePhaseCoordinator {
+    private Timer timer;
+    private Map<String, TransactionState> states = new ConcurrentHashMap<>();
+
+    public void execute(Transaction tx) {
+        // 阶段 1：CanCommit
+        if (!canCommit(tx)) {
+            abort(tx);
+            return;
+        }
+
+        // 阶段 2：PreCommit
+        preCommit(tx);
+
+        // 阶段 3：DoCommit
+        doCommit(tx);
+    }
+
+    private boolean canCommit(Transaction tx) {
+        for (Participant p : tx.getParticipants()) {
+            if (!p.canCommit()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void preCommit(Transaction tx) {
+        states.put(tx.getId(), TransactionState.PRECOMMITTED);
+
+        for (Participant p : tx.getParticipants()) {
+            p.preCommit();
+        }
+
+        // 设置超时，防止永远等待
+        timer.schedule(() -> {
+            if (states.get(tx.getId()) == TransactionState.PRECOMMITTED) {
+                // 多数派预提交，可以继续
+                doCommit(tx);
+            }
+        }, TIMEOUT);
+    }
+
+    private void doCommit(Transaction tx) {
+        states.put(tx.getId(), TransactionState.COMMITTED);
+
+        for (Participant p : tx.getParticipants()) {
+            p.doCommit();
+        }
+    }
+}
+```
+
+**结论**：3PC 的代码量和复杂性都高于 2PC。
+
+## 适用场景对比
+
+### 2PC 的适用场景
+
+**推荐使用 2PC 的场景**：
+
+| 场景 | 原因 |
+| --- | --- |
+| 参与者数量少 | 2PC 的阻塞影响范围有限 |
+| 事务时间短 | 锁定资源的时间短，阻塞影响小 |
+| 团队经验不足 | 2PC 更简单，实现和运维更容易 |
+| 低并发系统 | 阻塞问题不明显 |
+
+**典型应用**：
+
+- 银行转账（2-3 个参与者）
+- 库存扣减（同步更新）
+- 配置同步（偶尔执行）
+
+### 3PC 的适用场景
+
+**推荐使用 3PC 的场景**：
+
+| 场景 | 原因 |
+| --- | --- |
+| 协调者容易崩溃 | 3PC 减少协调者崩溃的影响 |
+| 参与者数量多 | 阻塞影响范围更大，3PC 的改进更有价值 |
+| 系统要求高可用 | 3PC 减少完全阻塞的概率 |
+| 事务时间长 | 长时间锁定资源，阻塞代价更大 |
+
+**典型应用**：
+
+- 分布式数据库（多个副本参与）
+- 微服务架构（多个服务参与）
+- 跨数据中心事务（网络延迟高，崩溃概率大）
+
+### 两者都不适合的场景
+
+对于高并发、高可用的互联网应用，2PC 和 3PC 都不是最佳选择：
+
+| 问题 | 原因 |
+| --- | --- |
+| 锁定时间长 | 影响系统吞吐量 |
+| 性能差 | 网络往返次数多 |
+| 不支持大并发 | 资源竞争激烈 |
+
+**替代方案**：
+
+- **Saga 模式**：无锁的分布式事务
+- **TCC 模式**：业务补偿的分布式事务
+- **本地消息表**：最终一致性的分布式事务
+
+## 实践建议
+
+### 如何选择？
+
+```
+问题 1：参与者数量是否 <= 5？
+  是 → 2PC
+  否 → 问题 2
+
+问题 2：事务时间是否 < 100ms？
+  是 → 2PC
+  否 → 问题 3
+
+问题 3：是否可以容忍少量阻塞？
+  是 → 2PC + 超时机制
+  否 → 3PC 或 Saga
+```
+
+### 2PC 最佳实践
+
+1. **设置合理的超时时间**：太短容易误判，太长影响性能
+
+```java
+// 超时配置建议
+transaction.timeout = 30s;  // 跨地域可适当延长
+```
+
+2. **使用日志持久化**：确保协调者崩溃后能恢复
+
+```java
+// 协调者重启恢复
+public void recover() {
+    List<Transaction> pending = wal.getPendingTransactions();
+    for (Transaction tx : pending) {
+        // 根据状态决定重新提交还是回滚
+        if (tx.isCommitted()) {
+            resendCommit(tx);
+        } else {
+            resendAbort(tx);
+        }
+    }
+}
+```
+
+3. **监控和告警**：及时发现和处理阻塞
+
+```yaml
+# Prometheus 告警规则
+- alert: TransactionBlocked
+  expr: blocked_transactions > 100
+  for: 5m
+  annotations:
+    summary: "分布式事务阻塞超过 100 个"
+```
+
+### 3PC 最佳实践
+
+1. **确保网络质量**：减少分区发生
+2. **配合故障检测**：及时发现参与者异常
+3. **实现幂等性**：防止重复提交
+
+```java
+// 参与者的幂等提交
+public void doCommit(String txId) {
+    // 检查是否已经提交
+    if (isCommitted(txId)) {
+        return;  // 幂等：重复提交不执行
+    }
+
+    // 执行提交
+    commit(txId);
+
+    // 记录提交状态
+    markCommitted(txId);
+}
+```
+
+## 总结
+
+2PC 和 3PC 是分布式事务的两大基础协议，各有优缺点：
+
+| 维度 | 2PC | 3PC |
+| --- | --- | --- |
+| 阻塞问题 | 严重 | 轻微 |
+| 性能 | 更好 | 略差 |
+| 实现复杂度 | 简单 | 复杂 |
+| 适用场景 | 低并发、简单事务 | 高可用、复杂事务 |
+
+**选择建议**：
+
+- 大多数场景选择 **2PC**，简单实用
+- 对可用性要求高的场景选择 **3PC**
+- 高并发互联网场景选择 **Saga/TCC** 等替代方案
+
+**核心原则**：
+
+- 分布式事务不是万能的，**能用本地事务就不用分布式事务**
+- 如果必须用分布式事务，**能用最终一致性就不用强一致性**
+- 只有在强一致性要求高的核心业务，才考虑 2PC/3PC
+
+至此，我们完成了两阶段提交与三阶段提交的讨论。在下一章中，我们将讨论幂等性理论，了解如何在分布式系统中实现安全的重试机制。

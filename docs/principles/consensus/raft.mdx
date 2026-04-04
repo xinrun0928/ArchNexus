@@ -1,0 +1,346 @@
+---
+title: Raft 算法详解
+description: 以可理解性为设计目标的共识算法
+---
+
+# Raft 算法详解
+
+2014 年 Diego Ongaro 和 John Ousterhout 发表了一篇论文，标题是"In Search of an Understandable Consensus Algorithm"。这篇论文介绍了一个叫 Raft 的共识算法，它的唯一设计目标就是：**比 Paxos 更容易理解。**
+
+这个目标在当时引起了很多质疑。毕竟 Paxos 已经存在了 20 多年，无数工程师在它上面踩过坑，怎么可能有算法比它"更正确"？但 Raft 做到了。它不仅正确性不输 Paxos，还因为易于理解和实现，成为目前工业界应用最广泛的共识算法——Etcd、Consul、TiKV、CockroachDB 都使用 Raft。
+
+Raft 的成功告诉我们一个道理：**一个算法无论多么正确，如果没人能正确实现，它就没有价值。**
+
+## Raft 的设计理念
+
+Raft 的设计理念是"分解"和"状态简化"。
+
+### 分解策略
+
+Raft 将共识问题分解为三个独立的子问题：
+
+1. **Leader 选举**：如何在集群中选出一个领导者
+2. **日志复制**：如何将日志复制到所有节点
+3. **安全性**：如何保证算法的安全性
+
+这种分解策略让每个子问题都可以独立理解和实现。
+
+### 状态简化
+
+Raft 通过引入强领导者来简化状态：
+
+- 所有写操作都必须经过 Leader
+- 日志只能从 Leader 流向 Follower
+- 不允许日志出现"空洞"
+
+这使得 Raft 的状态机比 Paxos 简单得多。
+
+## Leader 选举
+
+Raft 使用随机超时来实现 Leader 选举。
+
+### 节点状态
+
+Raft 集群中的节点有三种状态：
+
+- **Leader**：处理所有客户端请求，负责日志复制
+- **Follower**：被动响应请求，响应来自 Leader 和 Candidate 的请求
+- **Candidate**：参与选举的状态
+
+```
+状态转换图：
+         选举超时
+         ──────────>
+┌────────┐                   ┌───────────┐
+│ Follower│<────────────────│ Candidate │
+└────────┘   发现新 Leader    └───────────┘
+     ^       或收到投票            │
+     │                               │ 赢得选举
+     │                               ▼
+     │                          ┌────────┐
+     └──────────────────────────│ Leader │
+            心跳超时            └────────┘
+```
+
+### 选举流程
+
+```
+初始状态：所有节点都是 Follower
+
+1. Follower 在选举超时时间内没有收到 Leader 的心跳
+2. Follower 转换为 Candidate，增加当前任期号
+3. Candidate 向所有节点发送投票请求
+4. 如果获得多数派投票，Candidate 成为 Leader
+5. Leader 向所有节点发送心跳，确立领导地位
+```
+
+### 随机超时
+
+选举超时是随机设置的，避免多个节点同时发起选举：
+
+```java
+// 选举超时时间：150ms ~ 300ms 之间的随机值
+int electionTimeout = 150 + random.nextInt(150);
+```
+
+这种随机性带来一个有趣的效果：**谁先醒来，谁就更有可能成为 Leader。**
+
+### 选举安全保障
+
+Raft 使用两个机制来保证选举的安全性：
+
+1. **多数派投票**：只有获得多数派投票的节点才能成为 Leader
+2. **日志完整性限制**：只有包含所有已提交日志的节点才能成为 Leader
+
+```java
+// 投票请求的处理逻辑
+boolean canVoteFor(RequestVoteRequest request) {
+    // 1. 任期号必须是最新的
+    if (request.term < currentTerm) {
+        return false;
+    }
+
+    // 2. 候选人必须包含所有已提交的日志
+    if (lastLogIndex < request.lastLogIndex ||
+        lastLogTerm < request.lastLogTerm) {
+        return false;
+    }
+
+    // 3. 还没有投票给其他人
+    if (votedFor != null && votedFor != request.candidateId) {
+        return false;
+    }
+
+    return true;
+}
+```
+
+## 日志复制
+
+日志复制是 Raft 的核心功能，它确保所有节点按照相同的顺序执行相同的命令。
+
+### 日志结构
+
+Raft 的日志由日志条目组成，每个条目包含：
+
+- **索引**：日志条目的唯一标识
+- **任期号**：创建该条目的 Leader 的任期
+- **命令**：需要执行的命令
+
+```
+日志结构：
+索引    任期号    命令
+1       1         SET x = 0
+2       1         SET y = 5
+3       2         INCR x      // Leader 变更
+4       2         SET z = 10
+```
+
+### 日志复制流程
+
+```
+客户端请求：SET x = 10
+
+1. Leader 将命令追加到本地日志
+2. Leader 并行向所有 Follower 发送 AppendEntries 请求
+3. Follower 收到后追加到本地日志
+4. Follower 返回确认
+5. Leader 收到多数派确认后，提交日志
+6. Leader 执行命令，返回结果给客户端
+7. Leader 通知 Follower 提交日志
+```
+
+### 日志一致性
+
+Raft 保证日志的一致性通过以下机制：
+
+1. **AppendEntries 一致性检查**：新日志条目必须紧接在上一条日志之后
+2. **Leader 只追加**：Leader 不会覆盖或删除已有日志
+
+```java
+// AppendEntries 请求的处理逻辑
+boolean appendEntries(AppendEntriesRequest request) {
+    // 1. 任期号必须是最新的
+    if (request.term < currentTerm) {
+        return false;
+    }
+
+    // 2. 本地日志必须包含前一条日志
+    if (prevLogIndex > 0 &&
+        (log.size() < prevLogIndex ||
+         log.get(prevLogIndex - 1).term != prevLogTerm)) {
+        return false;
+    }
+
+    // 3. 追加新日志，覆盖冲突日志
+    for (int i = 0; i < request.entries.size(); i++) {
+        int index = prevLogIndex + 1 + i;
+        if (index < log.size() && log.get(index).term != request.entries.get(i).term) {
+            // 冲突：删除后续所有日志
+            log.removeRange(index, log.size());
+        }
+        if (index >= log.size()) {
+            log.add(request.entries.get(i));
+        }
+    }
+
+    return true;
+}
+```
+
+## 安全性保证
+
+Raft 的安全性通过 Leader 选举限制和日志提交规则来保证。
+
+### Leader 选举限制
+
+Raft 只允许包含所有已提交日志的节点成为 Leader。这通过以下规则实现：
+
+```
+投票条件：
+- 候选人最后一条日志的任期号 > 投票者最后一条日志的任期号
+- 或者，候选人最后一条日志的任期号 == 投票者最后一条日志的任期号
+   且 候选人最后一条日志的索引 >= 投票者最后一条日志的索引
+```
+
+### 日志提交规则
+
+Raft 的日志提交有以下规则：
+
+1. **多数派复制**：日志条目必须复制到多数派节点才能提交
+2. **Leader 提交**：只有 Leader 才能提交自己任期的日志
+3. **间接提交**：Leader 可以间接提交之前任期的日志
+
+```java
+// 提交日志的逻辑
+void commitLog(int index) {
+    // 只能提交当前任期的日志
+    if (log.get(index).term == currentTerm) {
+        // 检查是否已经复制到多数派
+        int count = 1; // Leader 自身
+        for (Node peer : peers) {
+            if (peer.matchIndex >= index) {
+                count++;
+            }
+        }
+        if (count > peers.size() / 2) {
+            // 多数派确认，可以提交
+            commitIndex = index;
+            // 应用到状态机
+            applyToStateMachine(index);
+        }
+    }
+}
+```
+
+## 成员变更
+
+在实际系统中，节点可能会因为故障或扩容而变更。Raft 通过联合共识来安全地处理成员变更。
+
+### 问题
+
+如果直接在旧配置下添加新节点，可能会出现脑裂问题：
+
+```
+旧配置：节点 A、B、C（多数派 = 2）
+新配置：节点 A、B、C、D（多数派 = 3）
+
+在配置切换期间，可能出现两个多数派：
+- 旧多数派：A、B
+- 新多数派：B、C、D
+```
+
+### 联合共识
+
+Raft 使用两阶段方法处理成员变更：
+
+1. **阶段一**：将集群切换到联合配置（Old + New）
+2. **阶段二**：将集群切换到新配置
+
+```
+配置变更流程：
+1. Leader 收到成员变更请求
+2. Leader 将联合配置写入日志
+3. 复制到多数派后，提交联合配置
+4. Leader 将新配置写入日志
+5. 复制到多数派后，提交新配置
+```
+
+## Raft vs Paxos
+
+Raft 和 Paxos 都解决了分布式共识问题，但它们有不同的设计目标：
+
+| 维度 | Paxos | Raft |
+| --- | --- | --- |
+| 设计目标 | 理论上的正确性 | 可理解性和可实现性 |
+| 核心思想 | 多数派投票 | 强领导者 + 日志复制 |
+| 子问题分解 | 无 | 有（选举、日志、安全性） |
+| Leader 选举 | 无内置机制 | 随机超时机制 |
+| 成员变更 | 需要额外机制 | 联合共识 |
+| 性能 | 取决于实现 | 通常比 Paxos 更好 |
+
+### Raft 的优势
+
+1. **易于理解**：分解策略让算法更直观
+2. **易于实现**：状态简化减少了边界情况
+3. **易于调试**：清晰的日志流便于问题定位
+4. **工业级实现**：Etcd、Consul 等成熟系统验证
+
+### Raft 的局限性
+
+1. **强领导者**：Leader 是瓶颈，不适合高写入场景
+2. **日志膨胀**：需要定期压缩日志
+3. **线性一致性限制**：读操作必须经过 Leader
+
+## Raft 在实际系统中的应用
+
+### Etcd
+
+Etcd 是云原生基础设施的核心组件，使用 Raft 实现一致性。
+
+**应用场景**：
+
+- Kubernetes 的配置存储和服务发现
+- 分布式系统的协调服务
+- 元数据存储
+
+**性能指标**：
+
+- 单集群支持数千节点
+- 写入延迟约 1-10ms
+- 支持每秒数千次写入
+
+### TiKV
+
+TiKV 是 PingCAP 开发的分布式关系数据库，使用 Raft 实现数据复制。
+
+**应用场景**：
+
+- 金融级分布式数据库
+- 实时分析
+- 全球分布的强一致性存储
+
+### Consul
+
+Consul 是 HashiCorp 开发的服务网格解决方案，使用 Raft 实现一致性。
+
+**应用场景**：
+
+- 服务发现
+- 健康检查
+- 分布式锁
+- KV 存储
+
+## 总结
+
+Raft 是以可理解性为设计目标的共识算法。它通过分解策略和状态简化，让共识问题变得更容易理解和实现。
+
+Raft 的核心机制包括：
+
+- **Leader 选举**：通过随机超时和多数派投票选出 Leader
+- **日志复制**：通过两阶段复制确保所有节点日志一致
+- **安全性**：通过选举限制和提交规则保证安全性
+
+Raft 的成功证明了**正确性和可理解性并不矛盾**。一个算法不仅要正确，还要能够被正确实现才有价值。
+
+在下一章中，我们将对比 Paxos 和 Raft，帮助你在实际项目中做出正确的技术选择。
