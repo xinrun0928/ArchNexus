@@ -1,0 +1,544 @@
+---
+title: Future 模式
+description: 异步计算结果的表示与获取
+---
+
+# Future 模式
+
+你调用一个远程接口，这个接口平均耗时 200ms。在等待结果返回的这 200ms 里，你的线程什么都做不了，只能干等着——这是巨大的浪费。
+
+Future 模式正是为了解决这个问题：**不要阻塞等待结果，而是先拿到一个「承诺」，等结果准备好了再去取**。
+
+## 问题背景
+
+```java
+// 同步调用：线程阻塞 200ms
+public class OrderService {
+    private final RemoteService remoteService;
+
+    public OrderDetail getOrderDetail(String orderId) {
+        // 远程调用，线程阻塞 200ms
+        return remoteService.fetchOrderDetail(orderId);  // [!code warning]
+    }
+}
+
+// 调用方
+public String processOrder(String orderId) {
+    long start = System.currentTimeMillis();
+
+    OrderDetail detail = orderService.getOrderDetail(orderId);  // 阻塞等待
+    // 这 200ms，线程什么都做不了
+
+    Invoice invoice = invoiceService.generate(detail);
+
+    return renderInvoice(invoice);  // 继续执行
+}
+```
+
+问题分析：
+
+- 线程在等待远程调用时完全空闲，浪费 CPU 时间片
+- 如果有多个不相关的远程调用，也只能串行执行
+- 系统吞吐量低，无法充分利用线程资源
+
+## Future 模式的核心
+
+```
+核心思想：
+┌──────────────┐                              ┌──────────────┐
+│   Client     │                              │   Remote     │
+│  (客户端)    │                              │   Service    │
+└──────┬───────┘                              └──────┬───────┘
+       │  submit() 返回 Future                       │
+       │  ──────────────────────────────────────────▶│ 异步执行
+       │                                              │
+       │  return Future                               │
+       ◀─────────────────────────────────────────────│
+       │                                              │
+       │  future.get()  // 结果准备好了才返回          │
+       │                                              │
+```
+
+**关键特点**：
+
+1. **异步提交**：调用方立即拿到一个 Future，不阻塞
+2. **延迟获取**：调用方在需要结果时再调用 `get()`
+3. **结果容器**：Future 是一个「承诺」，最终会包含计算结果
+
+## 代码实现
+
+### 最简版本：手动实现 Future
+
+```java
+// Future 接口
+public interface Future<T> {
+    T get() throws InterruptedException, ExecutionException;
+    boolean isDone();
+}
+
+// FutureTask：包装异步任务
+public class FutureTask<T> implements Runnable, Future<T> {
+    private final Callable<T> callable;
+    private T result;
+    private volatile State state = State.PENDING;
+    private Exception exception;
+    private final Object lock = new Object();
+
+    private enum State { PENDING, RUNNING, COMPLETED, FAILED }
+
+    public FutureTask(Callable<T> callable) {
+        this.callable = callable;
+    }
+
+    @Override
+    public void run() {
+        synchronized (lock) {
+            if (state != State.PENDING) {
+                return;
+            }
+            state = State.RUNNING;
+        }
+
+        try {
+            T result = callable.call();
+            synchronized (lock) {
+                this.result = result;
+                state = State.COMPLETED;
+                lock.notifyAll();
+            }
+        } catch (Exception e) {
+            synchronized (lock) {
+                this.exception = e;
+                state = State.FAILED;
+                lock.notifyAll();
+            }
+        }
+    }
+
+    @Override
+    public T get() throws InterruptedException, ExecutionException {
+        synchronized (lock) {
+            while (state == State.PENDING || state == State.RUNNING) {
+                lock.wait();
+            }
+        }
+
+        if (state == State.FAILED) {
+            throw new ExecutionException(exception);
+        }
+        return result;
+    }
+
+    @Override
+    public boolean isDone() {
+        synchronized (lock) {
+            return state == State.COMPLETED || state == State.FAILED;
+        }
+    }
+}
+
+// 异步执行器
+public class AsyncExecutor {
+    public <T> Future<T> submit(Callable<T> task) {
+        FutureTask<T> future = new FutureTask<>(task);
+        new Thread(future).start();
+        return future;
+    }
+}
+
+// 使用示例
+public class OrderService {
+    private final AsyncExecutor executor = new AsyncExecutor();
+
+    public Future<OrderDetail> getOrderDetailAsync(String orderId) {
+        return executor.submit(() -> {
+            // 远程调用
+            return remoteService.fetchOrderDetail(orderId);
+        });
+    }
+}
+
+// 调用方
+public void processOrder(String orderId) {
+    Future<OrderDetail> future = orderService.getOrderDetailAsync(orderId);
+    // 线程可以做其他事情
+
+    // ... 做其他事情 ...
+
+    // 需要结果时再获取
+    OrderDetail detail = future.get();  // 可能阻塞
+    Invoice invoice = invoiceService.generate(detail);
+}
+```
+
+### 使用 Java 内置的 Future
+
+```java
+public class OrderService {
+    private final ExecutorService executor = Executors.newFixedThreadPool(10);
+
+    // 使用 JDK 自带的 Future
+    public Future<OrderDetail> getOrderDetailAsync(String orderId) {
+        return executor.submit(() -> {
+            // 模拟远程调用
+            Thread.sleep(200);
+            return remoteService.fetchOrderDetail(orderId);
+        });
+    }
+
+    // 使用示例
+    public OrderProcessResult processOrder(String orderId) {
+        long start = System.currentTimeMillis();
+
+        // 异步获取订单详情和用户信息（可以并行）
+        Future<OrderDetail> orderFuture = getOrderDetailAsync(orderId);
+        Future<UserInfo> userFuture = getUserInfoAsync(orderId);  // [!code highlight]
+
+        // 异步获取商品信息
+        Future<List<Product>> productsFuture = getProductsAsync(orderId);
+
+        try {
+            // 获取结果，可能需要等待
+            OrderDetail order = orderFuture.get();      // 最多等 5 秒
+            UserInfo user = userFuture.get(5, TimeUnit.SECONDS);
+            List<Product> products = productsFuture.get(3, TimeUnit.SECONDS);
+
+            // 组合结果
+            return new OrderProcessResult(order, user, products);
+        } catch (Exception e) {
+            throw new RuntimeException("处理订单失败", e);
+        }
+    }
+}
+```
+
+### 使用 CompletableFuture（推荐）
+
+`CompletableFuture` 是 Java 8 引入的，比 `Future` 更强大，支持流式调用和组合：
+
+```java
+public class OrderService {
+    private final ExecutorService executor = Executors.newFixedThreadPool(20);
+
+    public CompletableFuture<OrderDetail> getOrderDetailAsync(String orderId) {
+        return CompletableFuture.supplyAsync(() ->
+            remoteService.fetchOrderDetail(orderId), executor);
+    }
+
+    public CompletableFuture<UserInfo> getUserInfoAsync(String orderId) {
+        return CompletableFuture.supplyAsync(() ->
+            userService.fetchUserInfo(orderId), executor);
+    }
+
+    // 组合多个异步操作
+    public CompletableFuture<OrderProcessResult> processOrder(String orderId) {
+        long start = System.currentTimeMillis();
+
+        // 1. 获取订单详情
+        CompletableFuture<OrderDetail> orderFuture =
+            getOrderDetailAsync(orderId);
+
+        // 2. 获取用户信息（依赖于订单信息中的用户 ID）
+        CompletableFuture<UserInfo> userFuture =
+            orderFuture.thenCompose(order ->
+                getUserInfoAsync(order.getUserId()));  // [!code highlight]
+
+        // 3. 获取商品信息
+        CompletableFuture<List<Product>> productsFuture =
+            orderFuture.thenCompose(order ->
+                getProductsAsync(order.getProductIds()));
+
+        // 4. 组合所有结果
+        return CompletableFuture.allOf(orderFuture, userFuture, productsFuture)
+            .thenApply(v -> new OrderProcessResult(
+                orderFuture.join(),
+                userFuture.join(),
+                productsFuture.join()
+            ));
+    }
+
+    // 异常处理
+    public CompletableFuture<OrderDetail> getOrderDetailWithFallback(String orderId) {
+        return getOrderDetailAsync(orderId)
+            .exceptionally(ex -> {
+                // 降级处理：返回缓存或默认值
+                log.warn("获取订单详情失败，使用缓存: {}", orderId, ex);
+                return orderCache.get(orderId);
+            });
+    }
+
+    // 超时处理
+    public CompletableFuture<OrderDetail> getOrderDetailWithTimeout(String orderId) {
+        return getOrderDetailAsync(orderId)
+            .orTimeout(3, TimeUnit.SECONDS)  // [!code highlight]
+            .exceptionally(ex -> {
+                log.warn("获取订单详情超时: {}", orderId);
+                return OrderDetail.empty(orderId);
+            });
+    }
+}
+```
+
+### 异步流程编排
+
+```java
+public class AsyncWorkflow {
+    private final ExecutorService executor =
+        Executors.newFixedThreadPool(20);
+
+    // 流水线的每个步骤
+    public CompletableFuture<String> step1(String input) {
+        return CompletableFuture.supplyAsync(() -> {
+            // 步骤 1：数据校验
+            return "Step1 done: " + input;
+        }, executor);
+    }
+
+    public CompletableFuture<String> step2(String input) {
+        return CompletableFuture.supplyAsync(() -> {
+            // 步骤 2：数据转换
+            return "Step2 done: " + input;
+        }, executor);
+    }
+
+    public CompletableFuture<String> step3(String input) {
+        return CompletableFuture.supplyAsync(() -> {
+            // 步骤 3：数据持久化
+            return "Step3 done: " + input;
+        }, executor);
+    }
+
+    // 串行执行
+    public CompletableFuture<String> executePipeline(String input) {
+        return step1(input)
+            .thenCompose(this::step2)
+            .thenCompose(this::step2)
+            .thenApply(result -> "Final: " + result);
+    }
+
+    // 并行执行 + 聚合
+    public CompletableFuture<Summary> aggregate(String orderId) {
+        CompletableFuture<OrderDetail> orderFuture = getOrderDetailAsync(orderId);
+        CompletableFuture<UserInfo> userFuture = getUserInfoAsync(orderId);
+        CompletableFuture<InventoryInfo> inventoryFuture = getInventoryAsync(orderId);
+
+        return CompletableFuture.allOf(orderFuture, userFuture, inventoryFuture)
+            .thenApply(v -> new Summary(
+                orderFuture.join(),
+                userFuture.join(),
+                inventoryFuture.join()
+            ));
+    }
+
+    // anyOf：任一完成即可
+    public CompletableFuture<String> getFromMultipleSources(String key) {
+        List<CompletableFuture<String>> sources = Arrays.asList(
+            cacheService.getAsync(key),
+            redisService.getAsync(key),
+            databaseService.getAsync(key)
+        );
+
+        return sources.stream()
+            .reduce(CompletableFuture::firstComplete)
+            .orElse(CompletableFuture.completedFuture("default"));
+    }
+}
+```
+
+## Future vs CompletableFuture
+
+| 特性 | `Future` | `CompletableFuture` |
+|---|---|---|
+| 异步获取结果 | ✅ | ✅ |
+| 流式调用 | ❌ | ✅ |
+| 组合多个 Future | ❌ | ✅ |
+| 异常处理 | ❌ | ✅ |
+| 超时控制 | ❌ | ✅ |
+| 手动完成 | ❌ | ✅ |
+
+**建议**：新代码优先使用 `CompletableFuture`。
+
+## Future 模式的实际应用
+
+### 批量查询优化
+
+```java
+public class BatchQueryService {
+    private final ExecutorService executor =
+        Executors.newFixedThreadPool(50);
+
+    // 串行查询：耗时 = 100 × 10ms = 1000ms
+    public Map<String, User> getUsersSerial(List<String> ids) {
+        Map<String, User> result = new HashMap<>();
+        for (String id : ids) {
+            result.put(id, userService.getUser(id));  // 10ms
+        }
+        return result;
+    }
+
+    // 并行查询：耗时 = 10ms（假设 10 个线程并发）
+    public CompletableFuture<Map<String, User>> getUsersParallel(List<String> ids) {
+        List<CompletableFuture<User>> futures = ids.stream()
+            .map(id -> CompletableFuture.supplyAsync(
+                () -> userService.getUser(id), executor))
+            .collect(Collectors.toList());
+
+        return CompletableFuture.allOf(
+                futures.toArray(new CompletableFuture[0]))
+            .thenApply(v -> {
+                Map<String, User> result = new HashMap<>();
+                for (int i = 0; i < ids.size(); i++) {
+                    result.put(ids.get(i), futures.get(i).join());
+                }
+                return result;
+            });
+    }
+
+    // 优化版本：分批并发
+    public CompletableFuture<Map<String, User>> getUsersBatched(
+            List<String> ids, int batchSize, int concurrency) {
+
+        List<CompletableFuture<Map<String, User>>> batches = new ArrayList<>();
+
+        for (List<String> batch : Lists.partition(ids, batchSize)) {
+            CompletableFuture<Map<String, User>> batchFuture =
+                CompletableFuture.supplyAsync(() -> {
+                    Map<String, User> batchResult = new HashMap<>();
+                    for (String id : batch) {
+                        batchResult.put(id, userService.getUser(id));
+                    }
+                    return batchResult;
+                }, executor);
+            batches.add(batchFuture);
+        }
+
+        return CompletableFuture.allOf(
+                batches.toArray(new CompletableFuture[0]))
+            .thenApply(v -> {
+                Map<String, User> result = new HashMap<>();
+                for (CompletableFuture<Map<String, User>> batch : batches) {
+                    result.putAll(batch.join());
+                }
+                return result;
+            });
+    }
+}
+```
+
+### 超时与重试
+
+```java
+public class ResilientService {
+    private final ExecutorService executor =
+        Executors.newFixedThreadPool(20);
+
+    public CompletableFuture<Result> callWithRetry(
+            String request, int maxRetries, long timeoutMs) {
+
+        return CompletableFuture
+            .supplyAsync(() -> doCall(request), executor)
+            .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .exceptionallyCompose(ex -> {
+                // 触发重试
+                if (ex instanceof TimeoutException && maxRetries > 0) {
+                    log.warn("调用超时，触发重试，剩余次数: {}", maxRetries);
+                    return callWithRetry(request, maxRetries - 1, timeoutMs);
+                }
+                // 降级处理
+                return CompletableFuture.completedFuture(
+                    Result.fallback("服务不可用"));
+            });
+    }
+
+    // 熔断器模式
+    public CompletableFuture<Result> callWithCircuitBreaker(String request) {
+        if (circuitBreaker.isOpen()) {
+            return CompletableFuture.completedFuture(
+                Result.fallback("服务熔断中"));
+        }
+
+        return CompletableFuture
+            .supplyAsync(() -> doCall(request), executor)
+            .whenComplete((result, ex) -> {
+                if (ex != null) {
+                    circuitBreaker.recordFailure();
+                } else {
+                    circuitBreaker.recordSuccess();
+                }
+            });
+    }
+}
+```
+
+## 常见问题
+
+### 问题一：不要在 Future 的回调中阻塞
+
+```java
+// 错误：在 thenApply 中阻塞
+future.thenApply(this::blockingOperation);  // [!code warning]
+
+// 正确：使用 thenCompose 切换线程
+future.thenCompose(value ->
+    CompletableFuture.supplyAsync(() -> blockingOperation(value), executor));
+```
+
+### 问题二：不要忘记处理异常
+
+```java
+// 错误：异常被吞掉
+future.get();  // 如果抛出异常，不会被处理
+
+// 正确：显式处理异常
+try {
+    future.get();
+} catch (ExecutionException e) {
+    log.error("异步任务执行失败", e.getCause());
+}
+```
+
+### 问题三：线程池泄漏
+
+```java
+// 错误：没有关闭线程池
+CompletableFuture.runAsync(() -> doSomething());
+// 线程池会一直运行
+
+// 正确：管理好线程池生命周期
+public class MyService implements AutoCloseable {
+    private final ExecutorService executor =
+        Executors.newFixedThreadPool(10);
+
+    public CompletableFuture<Result> doSomethingAsync() {
+        return CompletableFuture.supplyAsync(() -> doSomething(), executor);
+    }
+
+    @Override
+    public void close() {
+        executor.shutdown();
+    }
+}
+```
+
+## 总结
+
+Future 模式通过「先拿承诺、后取结果」的异步模式，显著提升了系统的吞吐量和资源利用率。
+
+**核心要点**：
+
+- 使用 `Future` 或 `CompletableFuture` 表示异步计算结果
+- `CompletableFuture` 支持流式调用、组合、异常处理
+- 注意处理超时和降级
+- 合理管理线程池生命周期
+
+**适用场景**：
+
+- 远程调用、数据库查询等 IO 密集型操作
+- 需要并行执行多个独立任务的场景
+- 需要超时控制、降级处理的场景
+
+**不适用场景**：
+
+- CPU 密集型任务（线程已经在忙计算，没有多余的等待时间）
+- 任务之间有强依赖关系的场景
+- 需要同步执行结果的场景

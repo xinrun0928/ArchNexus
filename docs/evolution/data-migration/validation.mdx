@@ -1,0 +1,376 @@
+---
+title: 数据校验
+description: 数据迁移中的质量保障方法
+---
+
+# 数据校验
+
+你的数据迁移完成了，但怎么确保迁移后数据是正确的？
+
+问题出在哪？**没有建立完善的数据校验机制**。
+
+数据校验是迁移质量的关键保障。
+
+## 校验的重要性
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    校验的重要性                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  「数据是系统的核心，迁移后不校验等于没做」            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  常见迁移问题：                                        │   │
+│  │                                                         │   │
+│  │  ✗ 字段映射错误                                        │   │
+│  │  ✗ 数据类型转换丢失精度                               │   │
+│  │  ✗ 特殊字符未处理                                      │   │
+│  │  ✗ 关联数据丢失                                        │   │
+│  │  ✗ 索引约束未迁移                                     │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 校验维度
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    校验维度                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 数量校验                                            │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  旧库记录数 = 新库记录数？                            │   │
+│  │  增量同步后数量是否一致？                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. 内容校验                                            │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  每条记录的字段值是否一致？                            │   │
+│  │  特别关注：金额、日期、枚举值等                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 约束校验                                            │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  主键、唯一索引、外键是否正确？                        │   │
+│  │  非空、长度限制是否满足？                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 4. 业务规则校验                                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  账户余额不能为负？                                    │   │
+│  │  订单状态流转是否合法？                                │   │
+│  │  关联数据是否完整？                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 校验实现
+
+### 数量校验
+
+```sql
+-- 基础数量校验
+SELECT
+    (SELECT COUNT(*) FROM users) AS old_count,
+    (SELECT COUNT(*) FROM users_new) AS new_count;
+
+-- 按状态分组校验
+SELECT
+    status,
+    COUNT(*) AS old_count
+FROM users
+GROUP BY status;
+
+SELECT
+    status,
+    COUNT(*) AS new_count
+FROM users_new
+GROUP BY status;
+
+-- 增量校验
+SELECT
+    COUNT(*) AS changed_count
+FROM users
+WHERE updated_at > '2024-01-01 00:00:00';
+```
+
+```java
+// 数量校验服务
+@Service
+public class Count校验Service {
+    @Autowired
+    private JdbcTemplate oldJdbcTemplate;
+
+    @Autowired
+    private JdbcTemplate newJdbcTemplate;
+
+    public校验Result validateCount(String tableName) {
+        校验Result result = new 校验Result();
+        result.setTableName(tableName);
+
+        // 旧库数量
+        Long oldCount = oldJdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM " + tableName, Long.class);
+
+        // 新库数量
+        Long newCount = newJdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM " + tableName + "_new", Long.class);
+
+        result.setOldCount(oldCount);
+        result.setNewCount(newCount);
+        result.setConsistent(oldCount.equals(newCount));
+        result.setDifference(oldCount - newCount);
+
+        return result;
+    }
+
+    // 批量校验
+    public List<校验Result> validateAllTables() {
+        List<String> tables = Arrays.asList("users", "orders", "products");
+        return tables.stream()
+            .map(this::validateCount)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### 内容校验
+
+```java
+// 内容校验服务
+@Service
+public class Content校验Service {
+    @Autowired
+    private JdbcTemplate oldJdbcTemplate;
+
+    @Autowired
+    private JdbcTemplate newJdbcTemplate;
+
+    public List<校验差异> validateContent(String tableName) {
+        List<校验差异> differences = new ArrayList<>();
+
+        // 分页校验
+        int pageSize = 1000;
+        int page = 0;
+
+        while (true) {
+            // 查询旧库数据
+            List<Map<String, Object>> oldData = queryOldData(
+                tableName, page * pageSize, pageSize);
+
+            if (oldData.isEmpty()) {
+                break;
+            }
+
+            // 逐条对比
+            for (Map<String, Object> oldRow : oldData) {
+                Map<String, Object> newRow = queryNewData(
+                    tableName, getPrimaryKey(oldRow));
+
+                if (newRow == null) {
+                    differences.add(new 校验差异(
+                        tableName, getPrimaryKey(oldRow), "记录不存在"));
+                    continue;
+                }
+
+                // 对比每个字段
+                for (String key : oldRow.keySet()) {
+                    Object oldValue = oldRow.get(key);
+                    Object newValue = newRow.get(key);
+
+                    if (!equals(oldValue, newValue)) {
+                        differences.add(new 校验差异(
+                            tableName,
+                            getPrimaryKey(oldRow),
+                            key,
+                            oldValue,
+                            newValue));
+                    }
+                }
+            }
+
+            page++;
+        }
+
+        return differences;
+    }
+
+    // 字段级别对比
+    private boolean equals(Object a, Object b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.toString().trim().equals(b.toString().trim());
+    }
+}
+```
+
+### 抽样校验
+
+```java
+// 抽样校验
+@Service
+public class Sample校验Service {
+    public List<Map<String, Object>> randomSample(
+            JdbcTemplate jdbcTemplate,
+            String table,
+            int sampleSize) {
+
+        return jdbcTemplate.queryForList(
+            "SELECT * FROM " + table +
+            " ORDER BY RAND() LIMIT ?",
+            sampleSize);
+    }
+
+    public校验Result validateSample(String tableName) {
+        // 随机抽取 1000 条
+        List<Map<String, Object>> oldSample = randomSample(
+            oldJdbcTemplate, tableName, 1000);
+        List<Map<String, Object>> newSample = randomSample(
+            newJdbcTemplate, tableName, 1000);
+
+        // 比对抽样结果
+        int matchCount = 0;
+        for (Map<String, Object> oldRow : oldSample) {
+            String pk = getPrimaryKey(oldRow);
+            Map<String, Object> newRow = findByPk(newSample, pk);
+            if (newRow != null && rowEquals(oldRow, newRow)) {
+                matchCount++;
+            }
+        }
+
+        校验Result result = new 校验Result();
+        result.setSampleSize(1000);
+        result.setMatchCount(matchCount);
+        result.setMatchRate((double) matchCount / 1000);
+        return result;
+    }
+}
+```
+
+### 业务规则校验
+
+```java
+// 业务规则校验
+@Service
+public class Business校验Service {
+    @Autowired
+    private JdbcTemplate newJdbcTemplate;
+
+    // 校验账户余额不为负
+    public List<String> validateBalanceNotNegative() {
+        return newJdbcTemplate.queryForList(
+            "SELECT username, balance FROM users WHERE balance < 0",
+            String.class);
+    }
+
+    // 校验订单金额一致性
+    public List<Order> validateOrderAmountConsistency() {
+        // 订单金额应该等于商品总价
+        String sql = """
+            SELECT o.* FROM orders o
+            LEFT JOIN (
+                SELECT order_id, SUM(price * quantity) AS total
+                FROM order_items
+                GROUP BY order_id
+            ) i ON o.id = i.order_id
+            WHERE o.amount != i.total OR i.total IS NULL
+            """;
+
+        return newJdbcTemplate.query(sql, new OrderRowMapper());
+    }
+
+    // 校验数据完整性
+    public List<String> validateDataIntegrity() {
+        // 查找引用不存在的用户 ID
+        String sql = """
+            SELECT DISTINCT user_id FROM orders o
+            LEFT JOIN users u ON o.user_id = u.id
+            WHERE u.id IS NULL
+            """;
+
+        return newJdbcTemplate.queryForList(sql, String.class);
+    }
+}
+```
+
+## 校验报告
+
+```java
+// 校验报告
+@Service
+public class校验ReportService {
+    public校验Report generateReport() {
+       校验Report report = new校验Report();
+        report.setGenerateTime(LocalDateTime.now());
+
+        // 数量校验
+        List<校验Result> countResults = count校验Service.validateAllTables();
+        report.setCountResults(countResults);
+
+        // 内容校验
+        List<校验差异> contentDiff = content校验Service.validateContent("users");
+        report.setContentDifferences(contentDiff);
+
+        // 业务校验
+        List<String> negativeBalances = business校验Service.validateBalanceNotNegative();
+        report.setNegativeBalances(negativeBalances);
+
+        // 统计
+        report.setTotalTables(countResults.size());
+        report.setConsistentTables((int) countResults.stream()
+            .filter(校验Result::isConsistent).count());
+        report.setTotalDifferences(contentDiff.size());
+
+        return report;
+    }
+
+    // 发送报告
+    public void sendReport(校验Report report) {
+        if (report.hasIssues()) {
+            alertService.sendCritical("数据校验发现问题",
+                buildReportMessage(report));
+        }
+    }
+}
+```
+
+## 总结
+
+数据校验是迁移质量的关键保障。
+
+**校验维度**：
+
+- 数量校验：记录数是否一致
+- 内容校验：字段值是否一致
+- 约束校验：索引约束是否正确
+- 业务校验：业务规则是否满足
+
+**校验方法**：
+
+- 全量校验：所有数据逐条对比
+- 抽样校验：随机抽样验证
+- 业务规则校验：校验业务逻辑
+
+**核心认知**：数据校验不是迁移完成后才做的，而是贯穿整个迁移过程。尽早发现差异，尽早修复。

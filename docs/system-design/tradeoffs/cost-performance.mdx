@@ -1,0 +1,596 @@
+---
+title: 存储成本 vs 查询性能
+description: 存储选型的核心权衡
+---
+
+# 存储成本 vs 查询性能
+
+你的系统数据量从 1TB 增长到 100TB，每个月存储费用从 1 万涨到 100 万。产品经理说：「能不能省钱？」
+
+你开始优化：
+
+- 冷数据归档到对象存储 → 查询变慢了
+- 压缩历史数据 → 解压有开销
+- 删掉旧数据 → 业务要查历史
+
+问题出在哪？**存储成本和查询性能天生矛盾，没有两全其美的方案**。
+
+## 存储选型光谱
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    存储选型光谱                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   成本低、查询慢                    成本高、查询快               │
+│   ◀──────────────────────────────────────────────────────────▶   │
+│                                                                  │
+│   磁带/对象存储    文件存储     NoSQL        OLAP      内存     │
+│   (S3/OSS)                   (HBase)    (ClickHouse)  (Redis)  │
+│                                                                  │
+│   存储：$0.02/GB    $0.1/GB    $0.25/GB    $0.5/GB   $5/GB     │
+│   查询：秒级         毫秒级     毫秒~秒级    毫秒级    微秒级   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 常见存储方案对比
+
+### 关系型数据库（MySQL/PostgreSQL）
+
+```
+适用场景：
+- 结构化数据
+- 强事务要求
+- 复杂查询
+- 适中数据量（< 10TB）
+
+成本：
+- 存储：$0.1-0.3/GB/月（云盘）
+- 计算：按规格收费
+
+查询性能：
+- 单机：万级 QPS
+- 分库分表：十万级 QPS
+- 延迟：毫秒级
+```
+
+```sql
+-- MySQL 表结构优化
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_no VARCHAR(32) NOT NULL,
+    user_id BIGINT NOT NULL,
+    total_amount DECIMAL(12, 2) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    -- 优化索引
+    INDEX idx_user_status_created (user_id, status, created_at),
+    INDEX idx_order_no (order_no),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 分区策略（处理大数据量）
+ALTER TABLE orders
+PARTITION BY RANGE (UNIX_TIMESTAMP(created_at)) (
+    PARTITION p202401 VALUES LESS THAN (UNIX_TIMESTAMP('2024-02-01')),
+    PARTITION p202402 VALUES LESS THAN (UNIX_TIMESTAMP('2024-03-01')),
+    PARTITION p202403 VALUES LESS THAN (UNIX_TIMESTAMP('2024-04-01')),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+### NoSQL（HBase/MongoDB/Cassandra）
+
+```
+适用场景：
+- 海量数据（TB ~ PB 级）
+- 高并发读写
+- 灵活 Schema
+- 简单查询
+
+成本：
+- 存储：$0.1-0.25/GB/月
+- 计算：按集群规格收费
+
+查询性能：
+- 延迟：毫秒级
+- 吞吐：百万级 QPS
+```
+
+```java
+// HBase 表设计
+public class HBaseExample {
+    // RowKey 设计：用户ID + 时间戳（倒序）
+    // 查询：获取用户最新 N 条订单
+    public void saveOrder(Order order) {
+        String rowKey = buildRowKey(order.getUserId(), order.getCreatedAt());
+        Put put = new Put(Bytes.toBytes(rowKey));
+        put.addColumn(Bytes.toBytes("o"), Bytes.toBytes("orderNo"),
+            Bytes.toBytes(order.getOrderNo()));
+        put.addColumn(Bytes.toBytes("o"), Bytes.toBytes("amount"),
+            Bytes.toBytes(order.getTotalAmount().toString()));
+        table.put(put);
+    }
+
+    // 预分区：避免热点
+    public void createTableWithPresplit() {
+        HTableDescriptor table = new HTableDescriptor("orders");
+        // 按用户ID哈希分区
+        byte[][] splitKeys = new byte[9][];
+        for (int i = 0; i < 9; i++) {
+            splitKeys[i] = Bytes.toBytes(String.format("%02d", (i + 1) * 10));
+        }
+        admin.createTable(table, splitKeys);
+    }
+}
+```
+
+### 对象存储（S3/OSS/MinIO）
+
+```
+适用场景：
+- 非结构化数据
+- 冷数据存储
+- 备份归档
+- 静态资源
+
+成本：
+- 存储：$0.02-0.05/GB/月（冷存储更低）
+- 请求：按次收费
+
+查询性能：
+- 延迟：百毫秒~秒级
+- 需要配合索引服务使用
+```
+
+```java
+// 对象存储 + 索引服务
+public class ArchiveSystem {
+    private final S3Client s3;
+    private final ElasticsearchClient es;
+
+    // 归档数据
+    public void archive(Order order) {
+        // 1. 上传到对象存储
+        String key = "archives/orders/" + order.getId() + ".json";
+        s3.putObject(PutObjectRequest.builder()
+            .bucket("archive-bucket")
+            .key(key)
+            .build());
+
+        // 2. 元数据写入索引
+        IndexRequest request = IndexRequest.of(i -> i
+            .index("order-archives")
+            .id(order.getId().toString())
+            .document(new OrderArchiveMeta(
+                order.getId(),
+                order.getUserId(),
+                key,
+                order.getCreatedAt()
+            ))
+        );
+        es.index(request);
+    }
+
+    // 查询归档数据
+    public Order getArchivedOrder(Long orderId) {
+        // 1. 从索引获取元数据
+        SearchResponse response = es.search(s -> s
+            .index("order-archives")
+            .query(q -> q.term(t -> t.field("id").value(orderId))),
+            OrderArchiveMeta.class
+        );
+
+        // 2. 从对象存储获取完整数据
+        OrderArchiveMeta meta = response.hits().hits().get(0).source();
+        S3Object object = s3.getObject(GetObjectRequest.builder()
+            .bucket("archive-bucket")
+            .key(meta.getS3Key())
+            .build());
+
+        return deserialize(object);
+    }
+}
+```
+
+### 列式存储（ClickHouse/Apache Druid）
+
+```
+适用场景：
+- OLAP 分析
+- 时序数据
+- 日志分析
+- 即时查询
+
+成本：
+- 存储：$0.3-0.5/GB/月
+- 计算：按集群规格
+
+查询性能：
+- 延迟：毫秒级
+- 吞吐：亿级数据秒查
+```
+
+```sql
+-- ClickHouse 表设计
+CREATE TABLE orders_analytics (
+    order_id UInt64,
+    user_id UInt64,
+    order_no String,
+    total_amount Decimal(12,2),
+    status String,
+    created_at DateTime,
+    -- 物化视图用于聚合
+    -- 存储引擎优化
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (user_id, created_at)
+TTL created_at + INTERVAL 2 YEAR;
+
+-- 使用物化视图加速查询
+CREATE MATERIALIZED VIEW order_stats
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (status, created_at)
+AS SELECT
+    status,
+    toStartOfDay(created_at) AS day,
+    count() AS order_count,
+    sum(total_amount) AS total_amount
+FROM orders_analytics
+GROUP BY status, toStartOfDay(created_at);
+```
+
+## 存储成本优化策略
+
+### 冷热分离
+
+```
+策略：
+- 热数据：SSD，高性能，存储最近数据
+- 温数据：普通磁盘，存储中期数据
+- 冷数据：对象存储，存储历史数据
+
+成本对比：
+- 热存储：$0.5/GB/月
+- 温存储：$0.1/GB/月
+- 冷存储：$0.02/GB/月
+
+节省比例：
+- 80% 冷数据 → 节省 60%+ 成本
+```
+
+```java
+// 冷热分离实现
+public class TieredStorageService {
+    @Value("${hot.threshold.days:7}")
+    private int hotThresholdDays;
+
+    @Value("${warm.threshold.days:90}")
+    private int warmThresholdDays;
+
+    public DataObject get(String key) {
+        // 检查缓存层（热数据）
+        DataObject cached = cache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 根据数据时间判断存储层
+        DataMeta meta = metaStore.get(key);
+        LocalDateTime age = LocalDateTime.now().minusDays(meta.getAge());
+
+        if (age < Duration.ofDays(hotThresholdDays)) {
+            // 热数据：SSD
+            return hotStorage.get(key);
+        } else if (age < Duration.ofDays(warmThresholdDays)) {
+            // 温数据：普通存储
+            return warmStorage.get(key);
+        } else {
+            // 冷数据：对象存储
+            return coldStorage.get(key);
+        }
+    }
+}
+
+// 数据分层调度
+@Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点
+public void scheduleTiering() {
+    // 迁移到冷存储
+    List<DataMeta> coldCandidates = metaStore.findCandidatesForCold(
+        LocalDateTime.now().minusDays(warmThresholdDays));
+
+    for (DataMeta meta : coldCandidates) {
+        coldStorage.moveFromWarm(meta);
+        meta.setTier("COLD");
+        metaStore.update(meta);
+    }
+}
+```
+
+### 数据压缩
+
+```
+压缩策略：
+- 冷数据启用压缩
+- 使用列式压缩算法
+- 历史数据高压缩比
+
+压缩收益：
+- 文本数据：压缩 3-5 倍
+- 数值数据：压缩 2-3 倍
+- 混合数据：压缩 2 倍
+```
+
+```java
+// Parquet 列式压缩
+public class ParquetStorage {
+    public void writeParquet(List<Order> orders) throws IOException {
+        // Parquet 自动压缩
+        Schema schema = new Schema.Parser()
+            .parse(new File("order.avsc"));
+
+        Path file = new Path("orders.parquet");
+        try (ParquetWriter<Order> writer = AvroParquetWriter
+                .<Order>builder(file)
+                .withSchema(schema)
+                .withCompressionCodec(CompressionCodecName.SNAPPY)
+                .withPageSize(1024 * 1024)  // 1MB page
+                .build()) {
+
+            for (Order order : orders) {
+                writer.write(order);
+            }
+        }
+    }
+}
+```
+
+### 数据生命周期管理
+
+```java
+// 数据生命周期管理
+public class DataLifecycleManager {
+    // TTL 配置
+    @Value("${data.ttl.orders:730}")  // 2 年
+    private int ordersTtl;
+
+    @Value("${data.ttl.logs:90}")     // 90 天
+    private int logsTtl;
+
+    @Value("${data.ttl.sessions:7}")  // 7 天
+    private int sessionsTtl;
+
+    // 过期数据清理
+    @Scheduled(cron = "0 0 3 * * ?")  // 每天凌晨 3 点
+    public void cleanupExpiredData() {
+        // 清理过期订单
+        cleanupOrders();
+
+        // 清理过期日志
+        cleanupLogs();
+
+        // 清理过期会话
+        cleanupSessions();
+    }
+
+    private void cleanupOrders() {
+        LocalDateTime cutoff = LocalDateTime.now().minusDays(ordersTtl);
+
+        // 1. 归档到对象存储
+        List<Order> archived = orderRepository.findByCreatedAtBefore(cutoff);
+        archiveToS3(archived);
+
+        // 2. 从主表删除
+        orderRepository.deleteByCreatedAtBefore(cutoff);
+
+        log.info("清理 {} 条过期订单", archived.size());
+    }
+}
+```
+
+## 查询性能优化策略
+
+### 索引优化
+
+```sql
+-- 复合索引设计
+-- 查询：SELECT * FROM orders WHERE user_id = ? AND status = ? ORDER BY created_at DESC
+
+-- 正确：覆盖查询条件 + 排序字段
+CREATE INDEX idx_user_status_created ON orders(user_id, status, created_at DESC);
+
+-- 错误：单独的索引无法优化查询
+CREATE INDEX idx_user_id ON orders(user_id);
+CREATE INDEX idx_status ON orders(status);
+
+-- 索引覆盖：查询不需要回表
+CREATE INDEX idx_cover ON orders(user_id, status, created_at DESC)
+INCLUDE (order_no, total_amount);  -- 包含查询字段
+```
+
+### 预计算和物化视图
+
+```java
+// 预计算热门数据
+public class PrecomputedCache {
+    // 预计算用户订单统计
+    @Scheduled(fixedRate = 60000)  // 每分钟
+    public void precomputeUserStats() {
+        // 统计每个用户的订单数
+        String sql = """
+            SELECT user_id,
+                   COUNT(*) as order_count,
+                   SUM(total_amount) as total_spent,
+                   MAX(created_at) as last_order_at
+            FROM orders
+            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+            GROUP BY user_id
+            """;
+
+        List<UserStats> stats = jdbcTemplate.query(sql,
+            (rs, rowNum) -> new UserStats(
+                rs.getLong("user_id"),
+                rs.getInt("order_count"),
+                rs.getBigDecimal("total_spent"),
+                rs.getTimestamp("last_order_at").toLocalDateTime()
+            ));
+
+        // 写入缓存
+        for (UserStats stat : stats) {
+            redis.opsForValue().set(
+                "user:stats:" + stat.getUserId(),
+                stat,
+                Duration.ofMinutes(2));
+        }
+    }
+}
+```
+
+### 分层缓存
+
+```java
+// 多级缓存
+public class MultiLevelCache {
+    // L1：进程内缓存（Guava/Caffeine）
+    private final Cache<Long, Object> l1Cache = Caffeine.newBuilder()
+        .maximumSize(10000)
+        .expireAfterWrite(1, TimeUnit.MINUTES)
+        .build();
+
+    // L2：分布式缓存（Redis）
+    private final RedisTemplate<String, Object> redis;
+
+    // L3：数据库
+    private final JdbcTemplate jdbcTemplate;
+
+    public Object get(Long id) {
+        // L1 查询
+        Object result = l1Cache.getIfPresent(id);
+        if (result != null) {
+            return result;
+        }
+
+        // L2 查询
+        String redisKey = "cache:" + id;
+        result = redis.opsForValue().get(redisKey);
+        if (result != null) {
+            l1Cache.put(id, result);  // 回填 L1
+            return result;
+        }
+
+        // L3 查询
+        result = jdbcTemplate.queryForObject(
+            "SELECT * FROM data WHERE id = ?", id);
+
+        // 回填缓存
+        l1Cache.put(id, result);
+        redis.opsForValue().set(redisKey, result, Duration.ofHours(1));
+
+        return result;
+    }
+}
+```
+
+## 成本-性能平衡实践
+
+### 案例：电商订单数据
+
+```
+场景：
+- 每天 100 万订单
+- 订单保留 2 年
+- 需要支持用户查询历史订单
+
+数据量估算：
+- 每条订单：1KB
+- 每天 1GB
+- 2 年 730GB
+
+存储成本（按冷热分层）：
+- 热数据（30 天）：30GB → $15/月
+- 温数据（90 天）：90GB → $9/月
+- 冷数据（665 天）：610GB → $12/月
+- 总计：$36/月
+
+vs 不分层：
+- 全部热存储：730GB × $0.5 = $365/月
+- 节省：90%
+```
+
+```java
+// 分层存储实现
+public class OrderStorage {
+    // 热存储：Redis Cluster（30 天内数据）
+    private final RedisTemplate<String, Order> hotStorage;
+
+    // 温存储：MySQL（30-120 天）
+    private final OrderRepository warmStorage;
+
+    // 冷存储：对象存储 + ES 索引（120 天以上）
+    private final S3Client coldStorage;
+    private final ElasticsearchClient coldIndex;
+
+    public Order getOrder(Long orderId, Long userId) {
+        Order order = hotStorage.opsForHash().get("orders:" + userId, orderId.toString());
+        if (order != null) {
+            return order;
+        }
+
+        order = warmStorage.findByIdAndUserId(orderId, userId);
+        if (order != null) {
+            // 回填热缓存
+            hotStorage.opsForHash().put("orders:" + userId,
+                orderId.toString(), order);
+            return order;
+        }
+
+        // 查询冷数据索引
+        SearchResponse response = coldIndex.search(s -> s
+            .index("orders-cold")
+            .query(q -> q.bool(b -> b
+                .must(m -> m.term(t -> t.field("id").value(orderId)))
+                .must(m -> m.term(t -> t.field("userId").value(userId))))));
+
+        if (response.hits().hits().isEmpty()) {
+            return null;
+        }
+
+        // 从对象存储获取完整数据
+        OrderArchiveMeta meta = response.hits().hits().get(0).source();
+        return coldStorage.getObject(GetObjectRequest.builder()
+            .bucket("orders-archive")
+            .key(meta.getS3Key())
+            .build());
+    }
+}
+```
+
+## 总结
+
+存储成本和查询性能的权衡是数据架构设计的核心问题。
+
+**核心要点**：
+
+- 存储成本：热 > 温 > 冷
+- 查询性能：内存 > SSD > HDD > 对象存储
+- 没有两全其美的方案，只有适合的权衡
+
+**优化策略**：
+
+| 策略 | 成本节省 | 性能影响 | 复杂度 |
+|---|---|---|---|
+| 冷热分离 | 60-90% | 可能变慢 | 中 |
+| 数据压缩 | 50-70% | 解压开销 | 低 |
+| TTL 清理 | 按比例 | 无影响 | 低 |
+| 预计算 | 无 | 大幅提升 | 中 |
+| 分层缓存 | 无 | 大幅提升 | 高 |
+
+**实践建议**：
+
+- 先分析数据访问模式
+- 识别冷数据比例
+- 设计合理的分层策略
+- 监控成本和性能的平衡点

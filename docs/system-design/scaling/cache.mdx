@@ -1,0 +1,475 @@
+---
+title: 缓存扩展策略
+description: 从单机缓存到分布式缓存的演进
+---
+
+# 缓存扩展策略
+
+你的系统缓存命中率只有 30%，大量请求打到数据库。优化后命中率到 80%，但还是不够——因为热点数据太多，单机 Redis 内存满了。
+
+缓存扩展正是为了解决这个问题：**让缓存容量和性能随业务增长**。
+
+## 缓存扩展策略图谱
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    缓存扩展策略图谱                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  单机 Redis ──▶ Redis Cluster ──▶ 多级缓存 ──▶ 缓存服务化         │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  本地缓存                                                   │   │
+│  │  Caffeine/Guava Cache                                     │   │
+│  │  优点：零网络开销                                          │   │
+│  │  缺点：内存有限、不共享                                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                            │                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  分布式缓存                                                 │   │
+│  │  Redis/Memcached                                           │   │
+│  │  优点：共享、大容量                                        │   │
+│  │  缺点：网络开销                                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                            │                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  多级缓存                                                   │   │
+│  │  L1 (本地) + L2 (分布式)                                   │   │
+│  │  兼顾性能和容量                                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 策略一：本地缓存
+
+### 适用场景
+
+```
+本地缓存适用场景：
+- 热点数据高度集中
+- 数据变更频率低
+- 不需要跨实例共享
+- 对延迟极度敏感（微秒级）
+```
+
+### 实现
+
+```java
+// Caffeine：高性能本地缓存
+@Configuration
+public class CaffeineConfig {
+    @Bean
+    public Cache<String, User> userCache() {
+        return Caffeine.newBuilder()
+            .maximumSize(10_000)          // 最大条目数
+            .expireAfterWrite(10, TimeUnit.MINUTES)  // 写入后过期
+            .expireAfterAccess(5, TimeUnit.MINUTES)   // 访问后过期
+            .refreshAfterWrite(5, TimeUnit.MINUTES)  // 刷新（异步重载）
+            .recordStats()                // 开启统计
+            .build();
+    }
+
+    @Bean
+    public LoadingCache<String, Product> productCache() {
+        return Caffeine.newBuilder()
+            .maximumSize(50_000)
+            .expireAfterWrite(30, TimeUnit.SECONDS)
+            .refreshAfterWrite(10, TimeUnit.SECONDS)
+            .recordStats()
+            .build(key -> productService.loadFromDb(key));
+    }
+}
+
+// 使用
+@Service
+public class ProductService {
+    @Autowired
+    private LoadingCache<String, Product> productCache;
+
+    public Product getProduct(String productId) {
+        // 自动加载、缓存、刷新
+        return productCache.get(productId);
+    }
+
+    // 手动失效
+    public void updateProduct(Product product) {
+        productCache.invalidate(product.getId());
+    }
+}
+```
+
+### 常见问题
+
+```
+本地缓存的常见问题：
+
+1. 内存占用
+   - 限制最大条目数
+   - 选择合适的淘汰策略
+
+2. 数据一致性问题
+   - 本地缓存无法感知其他实例的更新
+   - 解决方案：短过期时间 + 主动失效
+
+3. 缓存雪崩
+   - 同时过期导致大量回源
+   - 解决方案：过期时间随机偏移
+```
+
+## 策略二：Redis 集群
+
+### Redis Cluster 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Redis Cluster 架构                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  16384 个 slot，分散在多个节点                                  │
+│                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                     │
+│  │ Master 0 │  │ Master 1 │  │ Master 2 │                     │
+│  │ Slots:    │  │ Slots:    │  │ Slots:    │                     │
+│  │ 0-5460   │  │5461-10922│  │10923-16383│                   │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘                     │
+│        │              │              │                            │
+│        ▼              ▼              ▼                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                     │
+│  │ Slave 0  │  │ Slave 1  │  │ Slave 2  │                     │
+│  └──────────┘  └──────────┘  └──────────┘                     │
+│                                                                  │
+│  自动故障转移：Master 宕机 → Slave 提升                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```java
+// Redis Cluster 客户端
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+
+        // 序列化配置
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
+
+        template.afterPropertiesSet();
+        return template;
+    }
+}
+
+// 使用
+@Service
+public class CacheService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public void cacheOrder(Order order) {
+        redisTemplate.opsForValue().set(
+            "order:" + order.getId(),
+            order,
+            Duration.ofHours(1)
+        );
+    }
+
+    public Order getOrder(Long orderId) {
+        return (Order) redisTemplate.opsForValue().get("order:" + orderId);
+    }
+}
+```
+
+### 集群扩展
+
+```
+Redis Cluster 扩展步骤：
+
+1. 新增节点
+   - 启动新 Master/Slave
+
+2. 迁移 slot
+   - resharding：移动 slot 到新节点
+
+3. 客户端重定向
+   - MOVED 错误自动重定向
+
+4. 在线扩容
+   - 不停服、不丢数据
+```
+
+## 策略三：多级缓存
+
+### 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    多级缓存架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  请求 ──▶ L1 Cache ──▶ L2 Cache ──▶ Database                    │
+│           (本地)      (Redis)                                    │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ L1：本地缓存 Caffeine                                       │   │
+│  │  - 命中率高的热点数据                                       │   │
+│  │  - 毫秒级响应                                             │   │
+│  │  - 内存有限，TTL 短                                       │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                            │                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ L2：分布式缓存 Redis                                        │   │
+│  │  - 共享缓存                                               │   │
+│  │  - 毫秒级响应                                             │   │
+│  │  - 容量大                                                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                            │                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ Database                                                    │   │
+│  │  - 兜底数据源                                              │   │
+│  │  - 秒级响应                                               │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```java
+// 多级缓存
+@Service
+public class MultiLevelCacheService {
+    // L1：本地缓存
+    private final Cache<String, Product> l1Cache = Caffeine.newBuilder()
+        .maximumSize(10_000)
+        .expireAfterWrite(1, TimeUnit.MINUTES)
+        .build();
+
+    // L2：Redis
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+
+    private static final String L2_PREFIX = "cache:product:";
+    private static final Duration L2_TTL = Duration.ofMinutes(30);
+
+    public Product getProduct(String productId) {
+        // L1 查询
+        Product product = l1Cache.getIfPresent(productId);
+        if (product != null) {
+            return product;
+        }
+
+        // L2 查询
+        product = (Product) redisTemplate.opsForValue().get(L2_PREFIX + productId);
+        if (product != null) {
+            // 回填 L1
+            l1Cache.put(productId, product);
+            return product;
+        }
+
+        // 数据库查询
+        product = productRepository.findById(productId);
+        if (product != null) {
+            // 回填 L1 和 L2
+            l1Cache.put(productId, product);
+            redisTemplate.opsForValue().set(L2_PREFIX + productId, product, L2_TTL);
+        }
+
+        return product;
+    }
+
+    public void invalidate(String productId) {
+        // 失效所有层级
+        l1Cache.invalidate(productId);
+        redisTemplate.delete(L2_PREFIX + productId);
+    }
+
+    public void update(Product product) {
+        // 更新数据库
+        productRepository.save(product);
+        // 失效缓存
+        invalidate(product.getId());
+    }
+}
+```
+
+### 缓存一致性问题
+
+```
+多级缓存一致性问题：
+
+L1 更新 ──▶ Redis 未更新 ──▶ 其他实例 L1 未更新
+
+解决方案：
+
+方案 1：Cache Aside + 延迟双删
+- 更新时删除缓存
+- 延迟后再删除一次
+
+方案 2：订阅 Redis Keyspace Notifications
+- 监听 Redis 变更
+- 主动失效本地缓存
+
+方案 3：不做强一致
+- 接受短暂不一致
+- 依赖短 TTL 自动过期
+```
+
+```java
+// 方案 1：延迟双删
+public void update(Product product) {
+    // 1. 更新数据库
+    productRepository.save(product);
+
+    // 2. 删除缓存（第一次）
+    redisTemplate.delete(L2_PREFIX + product.getId());
+
+    // 3. 延迟后再删除一次（异步）
+    CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS)
+        .execute(() -> {
+            redisTemplate.delete(L2_PREFIX + product.getId());
+        });
+}
+
+// 方案 2：Redis 发布订阅
+@PostConstruct
+public void subscribeToInvalidation() {
+    redisTemplate.getConnectionFactory()
+        .getConnection()
+        .pubSubCommands()
+        .psubscribe(new PatternTopic("__keyevent@0__:del"), (pattern, channel, message) -> {
+            String key = message.toString();
+            if (key.startsWith(L2_PREFIX)) {
+                // 失效本地缓存
+                String productId = key.substring(L2_PREFIX.length());
+                l1Cache.invalidate(productId);
+            }
+        });
+}
+```
+
+## 策略四：热点数据处理
+
+### 热点 Key 发现
+
+```
+热点 Key 识别：
+
+1. 客户端统计
+   - 记录每个 key 的访问次数
+   - 超过阈值标记为热点
+
+2. Redis MONITOR
+   - 实时监控所有命令
+   - 消耗资源，不适合生产
+
+3. Redis 慢查询日志
+   - 识别频繁访问的 key
+
+4. 独立热点探测服务
+   - Proxy 层统计
+   - 客户端上报
+```
+
+### 热点 Key 解决方案
+
+```
+热点 Key 解决方案：
+
+1. 热点 Key 本地缓存
+   - Redis 返回后缓存到本地
+   - 大幅减少 Redis 压力
+
+2. 热点 Key 多副本
+   - 复制到多个 slot
+   - 分散读取压力
+
+3. 热点 Key 自动识别 + 隔离
+   - 探测服务识别热点
+   - 特殊处理（如大 Value 拆分）
+```
+
+```java
+// 热点数据处理
+@Service
+public class HotKeyCacheService {
+    private final ConcurrentHashMap<String, Cache<Object, Object>> hotKeyCaches = new ConcurrentHashMap<>();
+    private final int HOT_KEY_THRESHOLD = 1000;  // 每秒访问次数
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private HotKeyDetector hotKeyDetector;
+
+    public Object get(String key) {
+        // 检查是否为热点 key
+        if (hotKeyDetector.isHotKey(key)) {
+            // 热点 key 使用本地缓存
+            Cache<Object, Object> cache = hotKeyCaches.computeIfAbsent(key, k ->
+                Caffeine.newBuilder()
+                    .maximumSize(1000)
+                    .expireAfterWrite(10, TimeUnit.SECONDS)
+                    .build()
+            );
+
+            Object value = cache.getIfPresent(key);
+            if (value != null) {
+                return value;
+            }
+
+            // 加载到本地缓存
+            value = redisTemplate.opsForValue().get(key);
+            if (value != null) {
+                cache.put(key, value);
+            }
+            return value;
+        }
+
+        // 普通 key 直接走 Redis
+        return redisTemplate.opsForValue().get(key);
+    }
+}
+```
+
+## 缓存容量规划
+
+```
+缓存容量估算：
+
+数据量 = 热点数据条数 × 每条大小 × 安全系数
+
+示例：
+- 热点商品：100 万
+- 每条商品数据：2 KB
+- 安全系数：1.5
+- 总容量：100万 × 2KB × 1.5 = 3 GB
+
+Redis 容量规划：
+- 数据容量 × 1.3（Redis 自身开销）
+- 预留 30% 内存
+- 建议：使用容量的 70%
+```
+
+## 总结
+
+缓存扩展是从单机缓存到多级缓存的演进过程。
+
+**核心要点**：
+
+- 本地缓存：高性能，内存有限
+- Redis 集群：共享，大容量
+- 多级缓存：兼顾性能和容量
+- 热点处理：识别热点，特殊对待
+
+**策略建议**：
+
+- 先单机 Redis，再多级缓存
+- 热点数据本地缓存 + 异步同步
+- 做好容量规划
+- 监控命中率，及时优化

@@ -1,0 +1,471 @@
+---
+title: 网络调优
+description: 网络层面的性能瓶颈识别与优化
+---
+
+# 网络调优
+
+你的服务响应时间忽高忽低，监控显示网络延迟异常。
+
+网络是分布式系统的生命线，网络瓶颈会导致整个系统性能下降。
+
+## 网络性能指标
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    网络性能关键指标                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 延迟（Latency）                                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  定义：请求发出到收到响应的时间                       │   │
+│  │                                                         │   │
+│  │  组成：                                                │   │
+│  │  - 网络延迟：数据传输时间                            │   │
+│  │  - 处理延迟：服务端处理时间                          │   │
+│  │  - 队列延迟：请求等待时间                            │   │
+│  │                                                         │   │
+│  │  目标：                                                │   │
+│  │  - 内网调用：< 10ms                                  │   │
+│  │  - 跨机房调用：< 50ms                                 │   │
+│  │  - 跨境调用：< 200ms                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 吞吐（Throughput）                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  定义：单位时间内能处理的请求数                       │   │
+│  │                                                         │   │
+│  │  影响因素：                                            │   │
+│  │  - 带宽                                               │   │
+│  │  - 连接数                                              │   │
+│  │  - 并发能力                                           │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 错误率（Error Rate）                                  │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  定义：请求失败的比例                                  │   │
+│  │                                                         │   │
+│  │  常见错误：                                            │   │
+│  │  - 连接超时                                            │   │
+│  │  - 读写超时                                           │   │
+│  │  - 连接被拒绝                                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 网络问题诊断
+
+```bash
+# 1. 延迟测试
+ping -c 100 target-server
+# RTT min/avg/max/mdev = 0.5/1.2/2.1/0.3 ms
+
+# 2. 带宽测试
+iperf3 -c target-server
+# [ID] Interval           Transfer     Bandwidth
+# [  4]   0.00-10.00  sec  1.15 GBytes   985 Mbits/sec
+
+# 3. 连接追踪
+netstat -an | grep ESTABLISHED | wc -l
+netstat -an | grep TIME_WAIT | wc -l
+
+# 4. 网络状态
+ss -s
+# Total: 125 (kernel 135)
+# TCP:   45 (estab 20, closed 5, orphaned 0, synrecv 0, timewait 10)
+
+# 5. 抓包分析
+tcpdump -i eth0 -w capture.pcap
+tcpdump -r capture.pcap | grep "flags [SYN]"  # 观察连接建立
+```
+
+## HTTP 连接优化
+
+```java
+// HTTP 客户端连接池优化
+@Configuration
+public class HttpClientConfig {
+    @Bean
+    public CloseableHttpClient httpClient() {
+        PoolingHttpClientConnectionManager cm = new PoolingHttpClientConnectionManager();
+
+        // 最大连接数
+        cm.setMaxTotal(200);
+        // 每个路由最大连接数
+        cm.setDefaultMaxPerRoute(50);
+        // 空闲连接保活时间
+        cm.closeIdleConnections(30, TimeUnit.SECONDS);
+
+        RequestConfig config = RequestConfig.custom()
+            // 连接超时
+            .setConnectTimeout(3000, TimeUnit.MILLISECONDS)
+            // 读取超时
+            .setSocketTimeout(5000, TimeUnit.MILLISECONDS)
+            // 连接请求超时
+            .setConnectionRequestTimeout(2000, TimeUnit.MILLISECONDS)
+            // 重试次数
+            .setRetryEnabled(true)
+            .setMaxRetries(3)
+            .build();
+
+        return HttpClients.custom()
+            .setConnectionManager(cm)
+            .setDefaultRequestConfig(config)
+            // 连接复用
+            .setKeepAliveStrategy((response, context) -> {
+                Header header = response.getFirstHeader("Keep-Alive");
+                if (header != null) {
+                    return header.getValue();
+                }
+                return Duration.ofSeconds(30).toMillis();
+            })
+            .build();
+    }
+}
+
+// RestTemplate 使用连接池
+@Bean
+public RestTemplate restTemplate(CloseableHttpClient httpClient) {
+    return new RestTemplateBuilder()
+        .setConnectTimeout(Duration.ofSeconds(3))
+        .setReadTimeout(Duration.ofSeconds(5))
+        .build();
+}
+```
+
+## 连接超时配置
+
+```yaml
+# 服务间调用的超时配置
+feign:
+  client:
+    config:
+      default:
+        connectTimeout: 2000      # 连接超时 2s
+        readTimeout: 5000        # 读取超时 5s
+        loggerLevel: basic
+
+# Ribbon 配置
+ribbon:
+  ConnectTimeout: 2000
+  ReadTimeout: 5000
+  MaxAutoRetries: 2
+  MaxAutoRetriesNextServer: 3
+
+# Dubbo 配置
+dubbo:
+  provider:
+    timeout: 3000
+  consumer:
+    timeout: 3000
+    check: false
+```
+
+```java
+// 重试与超时策略
+@Configuration
+public class RetryConfig {
+    @Bean
+    public RetryTemplate retryTemplate() {
+        RetryTemplate template = new RetryTemplate();
+
+        // 指数退避
+        ExponentialBackOffPolicy policy = new ExponentialBackOffPolicy();
+        policy.setInitialInterval(1000);
+        policy.setMultiplier(2.0);
+        policy.setMaxInterval(10000);
+        policy.setMaxElapsedTime(30000);
+        template.setBackOffPolicy(policy);
+
+        // 重试条件
+        Map<Class<? extends Throwable>, Boolean> retryableExceptions =
+            new HashMap<>();
+        retryableExceptions.put(ConnectTimeoutException.class, true);
+        retryableExceptions.put(SocketTimeoutException.class, true);
+        retryableExceptions.put(ServiceUnavailableException.class, true);
+
+        SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy(3, retryableExceptions);
+        template.setRetryPolicy(retryPolicy);
+
+        return template;
+    }
+}
+
+// 使用重试模板
+@Service
+public class NetworkCallService {
+    @Autowired private RetryTemplate retryTemplate;
+
+    public Response callWithRetry(String url) {
+        return retryTemplate.execute(context -> {
+            // 可设置每次重试的上下文
+            context.setAttribute("attempt",
+                RetrySynchronizationManager.getContext().getRetryCount());
+            return httpClient.get(url);
+        });
+    }
+}
+```
+
+## 连接池问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    连接池问题分析                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 问题一：连接泄漏                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  症状：                                                │   │
+│  │  - 连接数持续增长                                      │   │
+│  │  - 最终达到上限                                        │   │
+│  │                                                         │   │
+│  │  原因：                                                │   │
+│  │  - 异常时未释放连接                                    │   │
+│  │  - finally 块缺失                                     │   │
+│  │                                                         │   │
+│  │  解决：                                                │   │
+│  │  - 使用 try-with-resources                           │   │
+│  │  - 监控连接使用情况                                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 问题二：连接 TIME_WAIT 堆积                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  症状：                                                │   │
+│  │  - TIME_WAIT 状态连接数过多                          │   │
+│  │  - 无法建立新连接                                    │   │
+│  │                                                         │   │
+│  │  原因：                                                │   │
+│  │  - 短连接模式，频繁创建和关闭                       │   │
+│  │  - 2MSL 等待时间长                                   │   │
+│  │                                                         │   │
+│  │  解决：                                                │   │
+│  │  - 启用连接池复用                                    │   │
+│  │  - 调整内核参数：net.ipv4.tcp_tw_reuse              │   │
+│  │  - 使用 HTTP/2                                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// 正确使用连接：try-with-resources
+@Service
+public class ConnectionLeakPrevention {
+    @Autowired private DataSource dataSource;
+
+    // 正确做法
+    public void queryCorrect() {
+        // try-with-resources 自动关闭
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                process(rs);
+            }
+        } catch (SQLException e) {
+            log.error("Query failed", e);
+        }
+    }
+
+    // 错误做法
+    public void queryWrong() {
+        Connection conn = null;
+        try {
+            conn = dataSource.getConnection();
+            // ...
+        } catch (SQLException e) {
+            // [!code error] 异常时连接未关闭
+            log.error("Query failed", e);
+        }
+        // [!code error] 如果上面抛异常，这行不会执行
+        if (conn != null) {
+            conn.close();
+        }
+    }
+}
+```
+
+## 内核参数调优
+
+```bash
+# /etc/sysctl.conf 网络优化参数
+
+# 1. TIME_WAIT 复用
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+
+# 2. 连接队列
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# 3. 文件描述符
+fs.file-max = 2097152
+
+# 4. TCP 缓冲区
+net.core.rmem_default = 262144
+net.core.rmem_max = 16777216
+net.core.wmem_default = 262144
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# 5. 开启 BBR
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# 生效配置
+sysctl -p
+```
+
+## HTTP/2 与连接复用
+
+```yaml
+# Nginx HTTP/2 配置
+server {
+    listen 443 ssl http2;
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    # HTTP/2 特性
+    http2_max_concurrent_streams 128;
+    http2_recv_buffer_size 256k;
+}
+
+# Tomcat HTTP/2 配置
+server:
+  port: 8443
+  ssl:
+    enabled: true
+    key-store: classpath:keystore.jks
+    key-store-password: password
+  protocol: HTTP/1.1
+```
+
+```java
+// OkHttp HTTP/2 + 连接池
+public class OkHttpConfig {
+    @Bean
+    public OkHttpClient okHttpClient() {
+        return new OkHttpClient.Builder()
+            // 连接池
+            .connectionPool(new ConnectionPool(
+                50,              // 最大空闲连接数
+                5, TimeUnit.MINUTES,  // 空闲时间
+            ))
+            // HTTP/2
+            .protocols(Arrays.asList(
+                Protocol.HTTP_2,
+                Protocol.HTTP_1_1
+            ))
+            // 连接超时
+            .connectTimeout(2, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.SECONDS)
+            // 重试
+            .retryOnConnectionFailure(true)
+            .build();
+    }
+}
+```
+
+## 网络监控
+
+```java
+// 网络指标采集
+@Service
+public class NetworkMonitoring {
+    // TCP 连接统计
+    public Map<String, Long> getTcpStats() {
+        Map<String, Long> stats = new HashMap<>();
+
+        try {
+            String output = exec("ss -s");
+            // 解析 ss 输出
+            // ESTAB: 100
+            // TimeWait: 50
+            // ...
+        } catch (IOException e) {
+            log.error("Failed to get TCP stats", e);
+        }
+
+        return stats;
+    }
+
+    // 应用层延迟监控
+    public class LatencyMonitor {
+        private final MeterRegistry registry;
+
+        public LatencyMonitor(MeterRegistry registry) {
+            this.registry = registry;
+        }
+
+        public <T> T monitoredCall(String operation, Callable<T> callable) {
+            Timer.Sample sample = Timer.start(registry);
+
+            try {
+                T result = callable.call();
+
+                // 记录成功
+                sample.stop(Timer.builder(operation)
+                    .tag("status", "success")
+                    .register(registry));
+
+                return result;
+
+            } catch (Exception e) {
+                // 记录失败
+                Timer.builder(operation)
+                    .tag("status", "error")
+                    .tag("exception", e.getClass().getSimpleName())
+                    .register(registry)
+                    .record(sample);
+
+                throw e;
+            }
+        }
+    }
+}
+```
+
+## 总结
+
+网络是分布式系统的生命线。
+
+**关键指标**：
+
+- 延迟：内网 < 10ms、跨机房 < 50ms
+- 吞吐：带宽利用率 < 80%
+- 错误率：< 0.1%
+
+**常见问题**：
+
+- 连接超时：合理配置超时参数
+- 连接泄漏：try-with-resources
+- TIME_WAIT 堆积：连接复用、内核调参
+
+**优化手段**：
+
+- HTTP/2：多路复用
+- 连接池：连接复用
+- 超时 + 重试：提高容错
+- 内核参数：系统层面优化
+
+**核心认知**：网络优化的关键是减少不必要的网络调用（本地缓存）、提高网络调用效率（连接复用）、提高容错能力（超时重试）。

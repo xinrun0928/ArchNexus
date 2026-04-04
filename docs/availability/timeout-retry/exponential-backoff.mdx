@@ -1,0 +1,427 @@
+---
+title: 指数退避
+description: 指数退避算法的原理与实现
+---
+
+# 指数退避
+
+你的系统故障了，但所有客户端都在同时重试，结果是雪上加霜。
+
+问题出在哪？**没有使用指数退避**。
+
+指数退避是让重试「错峰」的关键策略。
+
+## 什么是指数退避
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    指数退避原理                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  固定间隔的问题：                                               │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  服务故障                                               │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  所有客户端在 1s 后同时重试                            │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  服务再次被压垮                                         │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  所有客户端在 1s 后再次同时重试                        │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  恶性循环！                                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  指数退避的优势：                                               │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  服务故障                                               │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  客户端 A: 1s 后重试                                   │   │
+│  │  客户端 B: 2s 后重试                                   │   │
+│  │  客户端 C: 4s 后重试                                   │   │
+│  │  客户端 D: 8s 后重试                                   │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  重试错峰，服务逐渐恢复                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 指数退避公式
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    指数退避公式                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  基本公式：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  interval = min(initial_interval × multiplier^attempt, max_interval)  │   │
+│  │                                                         │   │
+│  │  其中：                                                  │   │
+│  │  - interval：本次重试间隔                              │   │
+│  │  - initial_interval：初始间隔                          │   │
+│  │  - multiplier：倍数                                     │   │
+│  │  - attempt：重试次数                                    │   │
+│  │  - max_interval：最大间隔                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  示例：initial_interval=1s, multiplier=2, max_interval=60s      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  第 1 次重试：interval = 1s                            │   │
+│  │  第 2 次重试：interval = 2s                            │   │
+│  │  第 3 次重试：interval = 4s                            │   │
+│  │  第 4 次重试：interval = 8s                            │   │
+│  │  第 5 次重试：interval = 16s                           │   │
+│  │  第 6 次重试：interval = 32s                           │   │
+│  │  第 7 次重试：interval = 60s（最大限制）              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 抖动（Jitter）
+
+### 为什么需要抖动
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    抖动的重要性                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  问题：即使使用指数退避，多个客户端仍可能同时到达相同的间隔值：  │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  客户端 A：1s → 2s → 4s → 8s                         │   │
+│  │  客户端 B：1s → 2s → 4s → 8s                         │   │
+│  │  客户端 C：1s → 2s → 4s → 8s                         │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  在 8s 时仍然会同时重试！                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  解决：添加随机抖动                                           │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  客户端 A：1s → 2s → 4s → 8s                         │   │
+│  │  客户端 B：1s → 3s → 5s → 7s                         │   │
+│  │  客户端 C：1s → 2s → 6s → 9s                         │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  重试时间分散，不会同时到达                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 抖动类型
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    抖动类型                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 均匀抖动（Equal Jitter）                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  jitter = random(0, interval)                         │   │
+│  │  actual_interval = interval + jitter                   │   │
+│  │                                                         │   │
+│  │  示例：interval=4s                                    │   │
+│  │  jitter = random(0, 4) = 1~2s                       │   │
+│  │  actual = 4 + 1~2 = 5~6s                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  2. 全面抖动（Full Jitter）                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  jitter = random(0, interval)                         │   │
+│  │  actual_interval = jitter                              │   │
+│  │                                                         │   │
+│  │  示例：interval=4s                                    │   │
+│  │  jitter = random(0, 4) = 0~4s                        │   │
+│  │  actual = 0~4s                                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  3.  decorrelated Jitter（推荐）                               │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  last_interval = min(max, random(last_interval*3, max)) │   │
+│  │                                                         │   │
+│  │  优点：间隔更加分散，避免聚簇                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 指数退避实现
+
+### 基本实现
+
+```java
+// 指数退避实现
+public class ExponentialBackoff {
+    private final long initialInterval;    // 初始间隔（毫秒）
+    private final double multiplier;      // 倍数
+    private final long maxInterval;       // 最大间隔（毫秒）
+    private final Random random;          // 随机数生成器
+
+    public ExponentialBackoff(
+            long initialInterval,
+            double multiplier,
+            long maxInterval) {
+        this.initialInterval = initialInterval;
+        this.multiplier = multiplier;
+        this.maxInterval = maxInterval;
+        this.random = new Random();
+    }
+
+    // 计算下一次重试的间隔
+    public long nextInterval(int attempt) {
+        long interval = (long)(initialInterval * Math.pow(multiplier, attempt - 1));
+        return Math.min(interval, maxInterval);
+    }
+
+    // 计算带抖动的下一次重试间隔
+    public long nextIntervalWithJitter(int attempt) {
+        long interval = nextInterval(attempt);
+        // 均匀抖动：增加 0~interval 的随机值
+        long jitter = (long)(random.nextDouble() * interval);
+        return Math.min(interval + jitter, maxInterval);
+    }
+
+    // Full Jitter（推荐）
+    public long nextIntervalFullJitter(int attempt) {
+        long interval = nextInterval(attempt);
+        // 全面抖动：随机 0~interval
+        return (long)(random.nextDouble() * interval);
+    }
+
+    // decorrelated Jitter
+    private long lastInterval = 0;
+    public long nextIntervalDecorrelated(int attempt) {
+        if (lastInterval == 0) {
+            lastInterval = initialInterval;
+        }
+        long interval = (long)(lastInterval * 3 * random.nextDouble());
+        lastInterval = Math.min(Math.max(interval, initialInterval), maxInterval);
+        return lastInterval;
+    }
+}
+```
+
+### 使用示例
+
+```java
+// 使用指数退避
+@Service
+public class BackoffRetryService {
+    private final ExponentialBackoff backoff;
+
+    public BackoffRetryService() {
+        this.backoff = new ExponentialBackoff(1000, 2, 60000);
+    }
+
+    public String callWithRetry(String param) {
+        int maxAttempts = 5;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return remoteService.call(param);
+            } catch (Exception e) {
+                if (attempt == maxAttempts) {
+                    throw e;
+                }
+
+                // 计算下次重试间隔
+                long interval = backoff.nextIntervalFullJitter(attempt);
+                log.info("重试 {} 失败，等待 {}ms 后重试", attempt, interval);
+
+                try {
+                    Thread.sleep(interval);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("重试被中断", ie);
+                }
+            }
+        }
+
+        throw new RuntimeException("重试耗尽");
+    }
+}
+```
+
+## Spring Retry 指数退避
+
+### 注解配置
+
+```java
+// Spring Retry 指数退避配置
+@Configuration
+@EnableRetry
+public class SpringRetryBackoffConfig {
+    @Bean
+    public RetryTemplate retryTemplate() {
+        RetryTemplate template = new RetryTemplate();
+
+        // 指数退避策略
+        ExponentialBackOffPolicy backOff = new ExponentialBackOffPolicy();
+        backOff.setInitialInterval(1000);           // 初始间隔 1 秒
+        backOff.setMultiplier(2.0);                 // 2 倍增长
+        backOff.setMaxInterval(60000);              // 最大 60 秒
+
+        // 添加抖动
+        backOff.setMaxElapsedTime(300000);          // 最大总时间 5 分钟
+
+        template.setBackOffPolicy(backOff);
+
+        // 重试策略
+        SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy();
+        retryPolicy.setMaxAttempts(5);
+        template.setRetryPolicy(retryPolicy);
+
+        return template;
+    }
+}
+
+// 注解方式
+@Service
+public class AnnotationBackoffService {
+
+    @Retryable(
+        value = Exception.class,
+        maxAttempts = 3,
+        backoff = @Backoff(
+            delay = 1000,
+            multiplier = 2.0,
+            maxDelay = 60000
+        )
+    )
+    public String callService(String param) {
+        return remoteService.call(param);
+    }
+}
+```
+
+### 自定义退避
+
+```java
+// 自定义退避策略
+@Configuration
+public class CustomBackoffConfig {
+
+    @Bean
+    public RetryTemplate customRetryTemplate() {
+        RetryTemplate template = new RetryTemplate();
+
+        // 自定义退避策略（带抖动）
+        RetryTemplate wrapper = new RetryTemplate();
+        wrapper.setBackOffPolicy(new ExponentialBackOffPolicy() {{
+            setInitialInterval(1000);
+            setMultiplier(2);
+            setMaxInterval(60000);
+        }});
+
+        return template;
+    }
+}
+
+// 使用 Sleuth/Brave 的追踪上下文传播
+@Configuration
+public class TracingRetryConfig {
+    @Bean
+    public RetryTemplate tracingRetryTemplate(
+            RetryTemplate retryTemplate,
+            Tracing tracing) {
+
+        return RetryTemplate.builder()
+            .customizers(retry -> retry
+                .contextSnapshotter(
+                    RetryContextSnapshotterFunction.of(
+                        tracing.tracing()::publish)))
+            .build();
+    }
+}
+```
+
+## Resilience4j 指数退避
+
+### 配置
+
+```java
+// Resilience4j 指数退避
+@Configuration
+public class Resilience4jBackoffConfig {
+    @Bean
+    public RetryRegistry retryRegistry() {
+        RetryConfig config = RetryConfig.custom()
+            .maxAttempts(5)
+            .intervalFunction(IntervalFunction.ofExponentialBackoff(1000, 2))
+            .intervalBiFunction((waitInterval, retryContext) -> {
+                // 自定义退避
+                long jitter = (long)(Math.random() * waitInterval);
+                return waitInterval + jitter;
+            })
+            .build();
+
+        return RetryRegistry.of(config);
+    }
+}
+```
+
+```yaml
+# YAML 配置
+resilience4j:
+  retry:
+    instances:
+      default:
+        maxAttempts: 5
+        waitDuration: 1000
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        exponentialBackoffMaxDuration: 60s
+        retryExceptions:
+          - java.net.SocketTimeoutException
+          - feign.FeignException$ServiceUnavailable
+        ignoreExceptions:
+          - feign.FeignException$BadRequest
+```
+
+## 总结
+
+指数退避是避免重试风暴的关键策略。
+
+**核心公式**：`interval = min(initial × multiplier^attempt, max)`
+
+**抖动类型**：
+
+- 均匀抖动：interval + random(0, interval)
+- 全面抖动：random(0, interval)
+- decorrelated：与上次间隔相关，更分散
+
+**推荐配置**：
+
+- 初始间隔：1 秒
+- 倍数：2
+- 最大间隔：30-60 秒
+- 最大重试次数：3-5 次

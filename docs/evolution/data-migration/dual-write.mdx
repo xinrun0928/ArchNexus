@@ -1,0 +1,363 @@
+---
+title: 双写方案
+description: 数据迁移中的双写同步策略
+---
+
+# 双写方案
+
+你的系统需要不停服迁移，但新旧库数据怎么保持同步？
+
+问题出在哪？**双写方案没有正确实现**。
+
+双写是实现不停服迁移的核心方案。
+
+## 双写原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    双写原理                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  「写入时同时写入新旧库，通过比对确保一致性」          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │           应用层                                         │   │
+│  │              │                                          │   │
+│  │         ┌────┴────┐                                 │   │
+│  │         │           │                                │   │
+│  │         ▼           ▼                                │   │
+│  │    ┌────────┐ ┌────────┐                       │   │
+│  │    │ 旧库   │ │ 新库   │                       │   │
+│  │    └────────┘ └────────┘                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 双写流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    双写流程                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 1：开启双写                                      │   │
+│  │                                                         │   │
+│  │  应用写入同时写入新旧库                                │   │
+│  │  新库只写，不读                                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 2：数据校验                                      │   │
+│  │                                                         │   │
+│  │  校验新旧库数据一致性                                  │   │
+│  │  修复不一致的数据                                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 3：灰度读                                        │   │
+│  │                                                         │   │
+│  │  先让少量流量读取新库                                  │   │
+│  │  观察无问题后逐步放大                                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 4：全量切换                                      │   │
+│  │                                                         │   │
+│  │  全部流量切换到新库                                    │   │
+│  │  关闭双写                                              │   │
+│  │  下线旧库                                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 双写实现
+
+### 应用层双写
+
+```java
+// 应用层双写
+@Service
+public class UserService {
+    @Autowired
+    private UserRepositoryOld oldUserRepository;
+
+    @Autowired
+    private UserRepositoryNew newUserRepository;
+
+    @Transactional
+    public User createUser(UserCreateRequest request) {
+        User user = new User();
+        user.setUsername(request.getUsername());
+        user.setEmail(request.getEmail());
+
+        try {
+            // 1. 先写旧库
+            User oldUser = oldUserRepository.save(user);
+
+            // 2. 再写新库
+            User newUser = convertToNewEntity(oldUser);
+            newUserRepository.save(newUser);
+
+            return oldUser;
+        } catch (Exception e) {
+            // 双写失败的处理
+            log.error("双写失败, 用户名: {}", request.getUsername(), e);
+
+            // 记录失败日志，后续补偿
+            compensateService.recordFailure("user", "create", user);
+            throw e;
+        }
+    }
+
+    private UserNew convertToNewEntity(User old) {
+        UserNew newUser = new UserNew();
+        newUser.setId(old.getId());
+        newUser.setUsername(old.getUsername());
+        newUser.setEmail(old.getEmail());
+        newUser.setCreatedAt(old.getCreatedAt());
+        return newUser;
+    }
+}
+```
+
+### 中间件层双写
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    中间件层双写                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │           应用层                                         │   │
+│  │              │                                          │   │
+│  │              ▼                                          │   │
+│  │    ┌──────────────────┐                               │   │
+│  │    │   双写中间件    │                               │   │
+│  │    │  (ShardingSphere │                               │   │
+│  │    │   /Canal)       │                               │   │
+│  │    └────────┬─────────┘                               │   │
+│  │              │                                          │   │
+│  │         ┌────┴────┐                                 │   │
+│  │         │           │                                │   │
+│  │         ▼           ▼                                │   │
+│  │    ┌────────┐ ┌────────┐                       │   │
+│  │    │ 旧库   │ │ 新库   │                       │   │
+│  │    └────────┘ └────────┘                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  优点：应用代码无侵入                                           │
+│  缺点：需要额外的中间件支持                                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Canal 双写实现
+
+```yaml
+# Canal 配置
+canal:
+  server:
+    port: 11111
+  destination: example
+  instance:
+    Canalmq:
+      - hz.n1:2181
+```
+
+```java
+// Canal 监听器实现双写
+@Service
+public class Canal双写Listener {
+    @Autowired
+    private JdbcTemplate newJdbcTemplate;
+
+    @Autowired
+    private UserMapper newUserMapper;
+
+    public void onMessage(List<CanalEntry.Entry> entries) {
+        for (CanalEntry.Entry entry : entries) {
+            if (entry.getEntryType() == CanalEntry.EntryType.ROWDATA) {
+                CanalEntry.RowChange rowChange = CanalEntry.RowChange.parseFrom(
+                    entry.getStoreValue());
+
+                for (CanalEntry.RowData rowData : rowChange.getRowDatasList()) {
+                    String tableName = entry.getHeader().getTableName();
+
+                    if ("users".equals(tableName)) {
+                        processUserChange(rowChange.getEventType(), rowData);
+                    }
+                }
+            }
+        }
+    }
+
+    private void processUserChange(CanalEntry.EventType eventType, CanalEntry.RowData rowData) {
+        if (eventType == CanalEntry.EventType.INSERT ||
+            eventType == CanalEntry.EventType.UPDATE) {
+
+            UserNew user = extractUser(rowData.getAfterColumnsList());
+
+            if (eventType == CanalEntry.EventType.INSERT) {
+                newUserMapper.insert(user);
+            } else {
+                newUserMapper.updateById(user);
+            }
+        } else if (eventType == CanalEntry.EventType.DELETE) {
+            Long userId = extractId(rowData.getBeforeColumnsList());
+            newUserMapper.deleteById(userId);
+        }
+    }
+}
+```
+
+## 双写冲突处理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    双写冲突处理                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 冲突场景                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  场景 1：并发写入                                      │   │
+│  │  ┌─────────────────────────────────────────────────┐  │   │
+│  │  │                                                 │  │   │
+│  │  │  线程 A：写入旧库成功，写新库失败              │  │   │
+│  │  │  线程 B：读取旧库，读到的是旧数据              │  │   │
+│  │  │                                                 │  │   │
+│  │  └─────────────────────────────────────────────────┘  │   │
+│  │                                                         │   │
+│  │  场景 2：主键冲突                                     │   │
+│  │  ┌─────────────────────────────────────────────────┐  │   │
+│  │  │                                                 │  │   │
+│  │  │  旧库 ID = 100，新库 ID = 200                  │  │   │
+│  │  │  双写时 ID 不一致                              │  │   │
+│  │  │                                                 │  │   │
+│  │  └─────────────────────────────────────────────────┘  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 冲突解决方案
+
+```java
+// 冲突解决 - 使用唯一业务标识
+@Service
+public class Idempotent双写Service {
+    @Autowired
+    private JdbcTemplate oldJdbcTemplate;
+
+    @Autowired
+    private JdbcTemplate newJdbcTemplate;
+
+    // 使用业务主键（username）进行幂等写入
+    public void writeWithIdempotency(User user) {
+        // 1. 写入旧库
+        oldJdbcTemplate.update("""
+            INSERT INTO users (username, email, status)
+            VALUES (?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+            email = VALUES(email),
+            status = VALUES(status)
+            """,
+            user.getUsername(),
+            user.getEmail(),
+            user.getStatus());
+
+        // 2. 写入新库
+        newJdbcTemplate.update("""
+            INSERT INTO users (username, email, status)
+            VALUES (?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+            email = VALUES(email),
+            status = VALUES(status)
+            """,
+            user.getUsername(),
+            user.getEmail(),
+            user.getStatus());
+    }
+}
+
+// 补偿服务
+@Service
+public class 双写补偿Service {
+    @Autowired
+    private JdbcTemplate oldJdbcTemplate;
+
+    @Autowired
+    private JdbcTemplate newJdbcTemplate;
+
+    // 定期检查并修复不一致
+    @Scheduled(fixedDelay = 60000)  // 每分钟
+    public void checkAndFix() {
+        // 1. 查询旧库数据
+        List<User> oldUsers = oldJdbcTemplate.query(
+            "SELECT * FROM users WHERE updated_at > ?",
+            new Object[]{lastCheckTime},
+            new UserRowMapper());
+
+        // 2. 对比新库
+        for (User oldUser : oldUsers) {
+            User newUser = newJdbcTemplate.queryForObject(
+                "SELECT * FROM users WHERE username = ?",
+                new Object[]{oldUser.getUsername()},
+                new UserRowMapper());
+
+            // 3. 如果不一致，修复
+            if (!equals(oldUser, newUser)) {
+                fixData(oldUser);
+            }
+        }
+
+        lastCheckTime = System.currentTimeMillis();
+    }
+}
+```
+
+## 总结
+
+双写是实现不停服迁移的核心方案。
+
+**原理**：写入时同时写入新旧库。
+
+**流程**：
+
+- 开启双写：新库只写不读
+- 数据校验：确保一致
+- 灰度读：逐步切换流量
+- 全量切换：关闭双写
+
+**实现方式**：
+
+- 应用层双写：代码侵入
+- 中间件双写：无侵入
+
+**冲突处理**：
+
+- 使用业务主键做幂等
+- 定期补偿不一致数据
+
+**核心认知**：双写的核心是「先写后读」，在数据完全同步之前，只写新库不读新库，确保业务不受影响。

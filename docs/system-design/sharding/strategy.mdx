@@ -1,0 +1,437 @@
+---
+title: 分库分表策略
+description: 数据水平拆分策略与实践
+---
+
+# 分库分表策略
+
+你的订单表已经 1 亿条数据了，查询越来越慢。分库分表势在必行。
+
+但分库分表不是简单的「拆开就完事了」——分片键怎么选、跨分片查询怎么办、数据迁移怎么做，每一步都是坑。
+
+## 分库分表的本质
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    分库分表的本质                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  什么是分库分表？                                               │
+│  ────────────────────                                          │
+│  把一张表的数据，按某种规则拆分到多张表（或多个库）中               │
+│                                                                  │
+│  ┌───────────┐    ┌───────────┐    ┌───────────┐              │
+│  │  t_order_0 │    │  t_order_1 │    │  t_order_2 │              │
+│  │  1-3333万 │    │ 3333万-6666│    │ 6666万-1亿│              │
+│  └───────────┘    └───────────┘    └───────────┘              │
+│                                                                  │
+│  分库分表解决什么问题？                                         │
+│  ────────────────────────                                      │
+│  • 单表数据量上限（MySQL 单表建议 < 2000 万）                   │
+│  • 单库连接数上限                                               │
+│  • 单库磁盘空间上限                                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 分库分表策略
+
+### 1. 哈希分片（Hash Sharding）
+
+```
+原理：根据分片键的哈希值决定数据分布
+
+示例：user_id % 4 = 0 → t_order_0
+      user_id % 4 = 1 → t_order_1
+      user_id % 4 = 2 → t_order_2
+      user_id % 4 = 3 → t_order_3
+
+优点：数据均匀分布
+缺点：扩缩容时需要迁移大量数据
+```
+
+```java
+public class HashShardingStrategy implements ShardingStrategy {
+    private final int shardingCount;
+
+    public HashShardingStrategy(int shardingCount) {
+        this.shardingCount = shardingCount;
+    }
+
+    @Override
+    public String getTargetTable(String tableName, Object shardingValue) {
+        long hash = hash(shardingValue);
+        int index = (int) (Math.abs(hash) % shardingCount);
+        return tableName + "_" + index;
+    }
+
+    private long hash(Object value) {
+        if (value instanceof Long) {
+            return (Long) value;
+        }
+        return value.toString().hashCode();
+    }
+}
+```
+
+### 2. 范围分片（Range Sharding）
+
+```
+原理：根据分片键的值范围决定数据分布
+
+示例：id 1-1000万 → t_order_0
+      id 1000万-2000万 → t_order_1
+      id 2000万-3000万 → t_order_2
+
+优点：扩缩容时只需调整范围
+缺点：可能产生热点（如最新数据都在一个表）
+```
+
+```java
+public class RangeShardingStrategy implements ShardingStrategy {
+    private final long[] ranges;
+
+    public RangeShardingStrategy(long[] ranges) {
+        this.ranges = ranges;  // [10000000, 20000000, 30000000]
+    }
+
+    @Override
+    public String getTargetTable(String tableName, Object shardingValue) {
+        long value = Long.parseLong(shardingValue.toString());
+        int index = Arrays.binarySearch(ranges, value);
+        if (index < 0) {
+            index = -(index + 1);
+        }
+        return tableName + "_" + index;
+    }
+}
+```
+
+### 3. 时间分片（Time Sharding）
+
+```
+原理：根据时间字段决定数据分布
+
+示例：2024-01 → t_order_202401
+      2024-02 → t_order_202402
+      2024-03 → t_order_202403
+
+优点：按时间归档，查询按时间过滤天然支持
+缺点：历史数据查询可能跨多个分片
+```
+
+```java
+public class TimeShardingStrategy implements ShardingStrategy {
+    private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyyMM");
+
+    @Override
+    public String getTargetTable(String tableName, Object shardingValue) {
+        if (shardingValue instanceof LocalDateTime) {
+            LocalDateTime dateTime = (LocalDateTime) shardingValue;
+            return tableName + "_" + dateTime.format(FORMATTER);
+        }
+        if (shardingValue instanceof String) {
+            String str = (String) shardingValue;
+            return tableName + "_" + str.replace("-", "").substring(0, 6);
+        }
+        throw new IllegalArgumentException("不支持的时间格式");
+    }
+}
+```
+
+### 4. 地理位置分片（Geo Sharding）
+
+```
+原理：根据地理位置决定数据分布
+
+示例：华北 → t_order_north
+      华南 → t_order_south
+      华东 → t_order_east
+
+优点：按地域就近访问
+缺点：需要业务支持地域拆分
+```
+
+```java
+public class GeoShardingStrategy implements ShardingStrategy {
+    private static final Map<String, String> REGION_MAP = Map.of(
+        "north", "t_order_north",
+        "south", "t_order_south",
+        "east", "t_order_east",
+        "west", "t_order_west"
+    );
+
+    @Override
+    public String getTargetTable(String tableName, Object shardingValue) {
+        String region = shardingValue.toString().toLowerCase();
+        return REGION_MAP.getOrDefault(region, "t_order_default");
+    }
+}
+```
+
+## 分库分表中间件
+
+### ShardingSphere
+
+```yaml
+# ShardingSphere 配置
+spring:
+  shardingsphere:
+    datasource:
+      names: ds-0,ds-1
+      ds-0:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://localhost:3306/order_0
+        username: root
+        password: root
+      ds-1:
+        type: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://localhost:3306/order_1
+        username: root
+        password: root
+
+    rules:
+      sharding:
+        tables:
+          t_order:
+            actual-data-nodes: ds-${0..1}.t_order_${0..1}
+            table-strategy:
+              standard:
+                sharding-column: user_id
+                sharding-algorithm-name: user_id_mod
+            key-generate-strategy:
+              column: order_id
+              key-generator-name: snowflake
+
+        sharding-algorithms:
+          user_id_mod:
+            type: INLINE
+            props:
+              algorithm-expression: t_order_${user_id % 2}
+```
+
+### MyCat
+
+```xml
+<!-- MyCat 分片配置 -->
+<mycat:schema name="order_db" checkSQLschema="false" sqlMaxLimit="100">
+    <mycat:table name="t_order" dataNode="dnOrder$0-3"
+        rule="mod-long" />
+</mycat:schema>
+
+<mycat:dataNode name="dnOrder$0-3" dataHost="localhost"
+    database="order_db" />
+
+<mycat:rule>
+    <mycat:tableRule name="mod-long">
+        <mycat:ruleFragment name="order_id" function="hash" />
+    </mycat:tableRule>
+</mycat:rule>
+```
+
+## 分库分表后的挑战
+
+### 挑战一：跨分片查询
+
+```
+问题：统计全量数据需要查询所有分片
+
+┌─────────┐  ┌─────────┐  ┌─────────┐
+│ 分片 0 │  │ 分片 1 │  │ 分片 2 │
+│  100万  │  │  100万  │  │  100万  │
+└────┬────┘  └────┬────┘  └────┬────┘
+     │            │            │
+     └────────────┼────────────┘
+                  ▼
+           ┌───────────┐
+           │ 聚合结果 │
+           └───────────┘
+```
+
+```java
+// 跨分片查询：并发查询 + 聚合
+public class CrossShardQueryService {
+    @Autowired
+    private List<JdbcTemplate> jdbcTemplates;
+
+    public long getTotalOrderCount() {
+        // 并发查询所有分片
+        List<CompletableFuture<Long>> futures = jdbcTemplates.stream()
+            .map(template -> CompletableFuture.supplyAsync(() -> {
+                Long count = template.queryForObject(
+                    "SELECT COUNT(*) FROM t_order", Long.class);
+                return count != null ? count : 0L;
+            }))
+            .collect(Collectors.toList());
+
+        // 聚合结果
+        return futures.stream()
+            .mapToLong(CompletableFuture::join)
+            .sum();
+    }
+
+    public Map<String, Object> getOrderStatistics() {
+        List<OrderStatistics> allStats = jdbcTemplates.stream()
+            .map(template -> CompletableFuture.supplyAsync(() ->
+                template.queryForObject(
+                    "SELECT status, COUNT(*) as cnt, SUM(amount) as total " +
+                    "FROM t_order GROUP BY status",
+                    (rs, rowNum) -> {
+                        // 映射结果
+                    }))
+            .flatMap(f -> Stream.of(f.join()))
+            .collect(Collectors.toList());
+
+        // 聚合统计
+        return aggregateStatistics(allStats);
+    }
+}
+```
+
+### 挑战二：分布式 ID
+
+```
+问题：分片后自增 ID 不连续
+
+解决方案：分布式 ID 生成器
+- 雪花算法（Snowflake）
+- UUID
+- 数据库号段
+```
+
+```java
+// 雪花算法
+public class SnowflakeIdGenerator {
+    private final long workerId;
+    private final long datacenterId;
+    private long sequence = 0L;
+    private final long twepoch = 1288834974657L;
+
+    public SnowflakeIdGenerator(long workerId, long datacenterId) {
+        this.workerId = workerId;
+        this.datacenterId = datacenterId;
+    }
+
+    public synchronized long nextId() {
+        long timestamp = timeGen();
+
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("Clock moved backwards");
+        }
+
+        if (lastTimestamp == timestamp) {
+            sequence = (sequence + 1) & 4095;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0;
+        }
+
+        lastTimestamp = timestamp;
+
+        return ((timestamp - twepoch) << 22)
+            | (datacenterId << 17)
+            | (workerId << 12)
+            | sequence;
+    }
+}
+```
+
+### 挑战三：排序分页
+
+```
+问题：分页查询需要从所有分片获取数据再排序
+
+示例：查询第 1000 页，每页 20 条
+1. 每个分片查询第 1000 页的数据
+2. 汇总到内存
+3. 内存中排序
+4. 返回第 1000 页
+
+问题：越往后分页，数据量越大
+```
+
+```java
+// 分页优化：使用游标分页
+public class CursorPagination {
+    // 错误：偏移量分页
+    public Page<Order> getOrdersByPage(Long lastId, int pageSize) {
+        // 深分页问题：每个分片都扫描前 1000*20 条
+        return jdbcTemplate.query(
+            "SELECT * FROM t_order WHERE id > ? ORDER BY id LIMIT ?",
+            (rs, rowNum) -> mapRow(rs),
+            lastId, pageSize * 1000  // [!code warning]
+        );
+    }
+
+    // 正确：游标分页
+    public Page<Order> getOrdersByCursor(Long lastId, int pageSize) {
+        // 只扫描 pageSize 条
+        return jdbcTemplate.query(
+            "SELECT * FROM t_order WHERE id > ? ORDER BY id LIMIT ?",
+            (rs, rowNum) -> mapRow(rs),
+            lastId, pageSize
+        );
+    }
+}
+```
+
+## 分库分表最佳实践
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    分库分表最佳实践                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 分片键选择                                                  │
+│     ────────────                                                │
+│     • 选择查询条件中经常出现的字段                               │
+│     • 选择数据分布均匀的字段                                     │
+│     • 避免选择有热点倾向的字段                                  │
+│                                                                  │
+│  2. 分片数量规划                                                │
+│     ────────────                                                │
+│     • 预估数据量，选择合适的分片数                              │
+│     • 留有余量，便于扩容                                        │
+│     • 分片数最好是 2 的幂次方                                  │
+│                                                                  │
+│  3. SQL 限制                                                   │
+│     ────────────                                                │
+│     • 必须带上分片键                                            │
+│     • 避免跨分片聚合                                            │
+│     • 深分页使用游标分页                                        │
+│                                                                  │
+│  4. 数据迁移                                                   │
+│     ────────────                                                │
+│     • 提前规划好分片规则                                        │
+│     • 预留扩容窗口                                              │
+│     • 使用双写 + 灰度切换                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+分库分表是解决大数据量存储的有效手段。
+
+**核心要点**：
+
+- 哈希分片：数据均匀，扩缩容困难
+- 范围分片：扩缩容简单，可能热点
+- 时间分片：适合日志、订单等按时间查询
+- 地理分片：适合按地域查询
+
+**挑战**：
+
+- 跨分片查询
+- 分布式 ID
+- 深分页问题
+- 数据迁移
+
+**建议**：
+
+- 先考虑其他优化（索引、缓存、读写分离）
+- 确需分库分表时，一次到位
+- 预留扩缩容能力

@@ -1,0 +1,622 @@
+---
+title: 事件驱动架构
+description: 基于事件异步通信的架构模式
+---
+
+# 事件驱动架构
+
+你正在设计一个电商下单系统，流程是：创建订单 → 扣减库存 → 扣款 → 创建物流 → 发送通知。按照传统做法，这是一串同步调用，每一步都要等上一步完成。
+
+问题是：**同步调用链条越长，系统越脆弱——任何一个环节出问题，整个链条都失败**。
+
+事件驱动架构正是为了解决这个问题：**不要「通知我做什么」，而是「告诉我发生了什么」**。
+
+## 问题背景
+
+### 同步调用的脆弱性
+
+```java
+// 错误示例：长链条同步调用
+public class OrderService {
+    public OrderResult createOrder(OrderRequest request) {
+        // 1. 创建订单（同步）
+        Order order = orderRepository.create(request);
+
+        // 2. 扣减库存（同步，依赖库存服务）
+        inventoryService.deduct(order.getItems());  // [!code warning]
+
+        // 3. 扣款（同步，依赖支付服务）
+        paymentService.charge(order.getUserId(), order.getAmount());  // [!code warning]
+
+        // 4. 创建物流（同步，依赖物流服务）
+        logisticsService.create(order);  // [!code warning]
+
+        // 5. 发送通知（同步，依赖通知服务）
+        notificationService.send(order);  // [!code warning]
+
+        return OrderResult.success(order);
+    }
+}
+```
+
+问题分析：
+
+- **紧耦合**：订单服务依赖所有下游服务
+- **单点故障**：任何一个服务不可用，整个流程失败
+- **性能瓶颈**：每步都要等，最慢的步骤决定整体延迟
+- **扩展困难**：加新步骤要改核心代码
+
+## 事件驱动架构的核心
+
+```
+核心思想：
+┌─────────────────────────────────────────────────────────────────┐
+│                      事件驱动架构                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  同步模式：                                                      │
+│  ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐             │
+│  │ 订单   │ → │ 库存   │ → │ 支付   │ → │ 物流   │             │
+│  │ 服务   │   │ 服务   │   │ 服务   │   │ 服务   │             │
+│  └────────┘   └────────┘   └────────┘   └────────┘             │
+│      │            │            │            │                    │
+│      └────────────┴────────────┴────────────┘                    │
+│                     同步等待                                      │
+│                                                                  │
+│  事件驱动：                                                      │
+│  ┌────────┐                              ┌────────┐             │
+│  │ 订单   │ ──▶ [OrderCreated] ──▶ ───▶ │ 库存   │             │
+│  │ 服务   │                              │ 服务   │             │
+│  └────────┘                              └────────┘             │
+│      │                                                                 │
+│      │ ──▶ [OrderCreated] ──▶ ───▶ ┌────────┐             │
+│                                      │ 支付   │             │
+│                                      │ 服务   │             │
+│                                      └────────┘             │
+│      │ ──▶ [OrderCreated] ──▶ ───▶ ┌────────┐             │
+│                                      │ 物流   │             │
+│                                      │ 服务   │             │
+│                                      └────────┘             │
+│      │                                                                 │
+│      │ ──▶ [OrderCreated] ──▶ ───▶ ┌────────┐             │
+│                                      │ 通知   │             │
+│                                      │ 服务   │             │
+│                                      └────────┘             │
+│                                                                  │
+│  各服务独立处理，互不等待                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键特点**：
+
+1. **异步通信**：生产者发布事件，消费者异步处理
+2. **松耦合**：生产者和消费者不需要知道彼此
+3. **可扩展**：可以随时增加新的消费者
+4. **容错性**：一个服务失败不影响其他服务
+
+## 代码实现
+
+### 最简版本：事件总线
+
+```java
+// ===== 事件基础设施 =====
+
+// 事件基类
+public abstract class DomainEvent {
+    private final String eventId;
+    private final long occurredAt;
+    private final String aggregateId;
+
+    protected DomainEvent(String aggregateId) {
+        this.eventId = UUID.randomUUID().toString();
+        this.occurredAt = System.currentTimeMillis();
+        this.aggregateId = aggregateId;
+    }
+
+    public String getEventId() { return eventId; }
+    public long getOccurredAt() { return occurredAt; }
+    public String getAggregateId() { return aggregateId; }
+}
+
+// 领域事件
+public class OrderCreatedEvent extends DomainEvent {
+    private final Order order;
+    private final CustomerId customerId;
+    private final Money totalAmount;
+
+    public OrderCreatedEvent(Order order) {
+        super(order.getId().getValue());
+        this.order = order;
+        this.customerId = order.getCustomerId();
+        this.totalAmount = order.getTotalAmount();
+    }
+
+    public Order getOrder() { return order; }
+    public CustomerId getCustomerId() { return customerId; }
+    public Money getTotalAmount() { return totalAmount; }
+}
+
+public class OrderPaidEvent extends DomainEvent {
+    private final OrderId orderId;
+    private final PaymentId paymentId;
+
+    public OrderPaidEvent(OrderId orderId, PaymentId paymentId) {
+        super(orderId.getValue());
+        this.orderId = orderId;
+        this.paymentId = paymentId;
+    }
+}
+
+// 事件总线
+public interface EventBus {
+    void publish(DomainEvent event);
+    <T extends DomainEvent> void subscribe(Class<T> eventType, EventHandler<T> handler);
+}
+
+public class SimpleEventBus implements EventBus {
+    private final Map<Class<?>, List<EventHandler<?>>> handlers = new ConcurrentHashMap<>();
+
+    @Override
+    public void publish(DomainEvent event) {
+        List<EventHandler<?>> handlers = this.handlers.get(event.getClass());
+        if (handlers != null) {
+            for (EventHandler<?> handler : handlers) {
+                try {
+                    ((EventHandler<DomainEvent>) handler).handle(event);
+                } catch (Exception e) {
+                    log.error("事件处理失败: {}", event.getEventId(), e);
+                    // 发送到死信队列
+                }
+            }
+        }
+    }
+
+    @Override
+    public <T extends DomainEvent> void subscribe(Class<T> eventType, EventHandler<T> handler) {
+        handlers.computeIfAbsent(eventType, k -> new CopyOnWriteArrayList<>()).add(handler);
+    }
+}
+```
+
+```java
+// ===== 事件处理器 =====
+
+// 库存处理
+@Component
+public class InventoryEventHandler {
+    @Autowired
+    private InventoryService inventoryService;
+
+    @EventListener
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        // 扣减库存
+        inventoryService.deduct(event.getOrder().getItems());
+        log.info("库存已扣减: orderId={}", event.getOrder().getId());
+    }
+}
+
+// 支付处理
+@Component
+public class PaymentEventHandler {
+    @Autowired
+    private PaymentService paymentService;
+
+    @EventListener
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        // 自动扣款
+        try {
+            PaymentResult result = paymentService.charge(
+                event.getCustomerId(),
+                event.getTotalAmount()
+            );
+
+            if (result.isSuccess()) {
+                eventBus.publish(new OrderPaidEvent(event.getOrder().getId(), result.getPaymentId()));
+            }
+        } catch (Exception e) {
+            log.error("支付失败: orderId={}", event.getOrder().getId(), e);
+            // 发送支付失败事件
+            eventBus.publish(new OrderPaymentFailedEvent(event.getOrder().getId(), e.getMessage()));
+        }
+    }
+}
+
+// 物流处理
+@Component
+public class LogisticsEventHandler {
+    @Autowired
+    private LogisticsService logisticsService;
+
+    @EventListener
+    public void handleOrderPaid(OrderPaidEvent event) {
+        // 创建物流
+        logisticsService.create(event.getOrderId());
+        log.info("物流已创建: orderId={}", event.getOrderId());
+    }
+}
+
+// 通知处理
+@Component
+public class NotificationEventHandler {
+    @Autowired
+    private NotificationService notificationService;
+
+    @EventListener
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        // 发送订单创建通知
+        notificationService.sendOrderConfirmation(event.getOrder());
+    }
+
+    @EventListener
+    public void handleOrderPaid(OrderPaidEvent event) {
+        // 发送支付成功通知
+        notificationService.sendPaymentConfirmation(event.getOrderId());
+    }
+}
+```
+
+### 生产版本：消息队列
+
+```java
+// ===== Kafka 实现 =====
+
+// 事件发布器
+@Service
+public class KafkaEventPublisher implements EventBus {
+
+    @Autowired
+    private KafkaTemplate<String, DomainEvent> kafkaTemplate;
+
+    @Override
+    public void publish(DomainEvent event) {
+        String topic = getTopicForEvent(event);
+        kafkaTemplate.send(topic, event.getAggregateId(), event);
+    }
+
+    private String getTopicForEvent(DomainEvent event) {
+        // 根据事件类型确定 topic
+        if (event instanceof OrderCreatedEvent) {
+            return "order-events";
+        } else if (event instanceof PaymentSucceededEvent) {
+            return "payment-events";
+        }
+        return "general-events";
+    }
+}
+
+// 事件消费者
+@Service
+public class OrderEventConsumer {
+
+    @Autowired
+    private InventoryService inventoryService;
+    @Autowired
+    private PaymentService paymentService;
+
+    @KafkaListener(topics = "order-events", groupId = "order-processor")
+    public void handleOrderCreated(ConsumerRecord<String, OrderCreatedEvent> record) {
+        OrderCreatedEvent event = record.value();
+
+        // 异步处理
+        CompletableFuture.runAsync(() -> {
+            try {
+                inventoryService.deduct(event.getOrder().getItems());
+            } catch (Exception e) {
+                // 处理失败，发送到重试队列
+                sendToRetryQueue(event);
+            }
+        });
+    }
+
+    @KafkaListener(topics = "payment-events", groupId = "payment-processor")
+    public void handlePaymentSucceeded(ConsumerRecord<String, PaymentSucceededEvent> record) {
+        PaymentSucceededEvent event = record.value();
+        // 处理支付成功后续逻辑
+    }
+}
+```
+
+### 事件溯源 + 事件驱动
+
+```java
+// 聚合根发布事件
+public class Order {
+    private List<DomainEvent> domainEvents = new ArrayList<>();
+
+    public void confirm() {
+        if (this.status != OrderStatus.PENDING) {
+            throw new IllegalStateException("只有待确认订单可以确认");
+        }
+        this.status = OrderStatus.CONFIRMED;
+
+        // 发布领域事件
+        domainEvents.add(new OrderConfirmedEvent(this.id));
+    }
+
+    public void cancel() {
+        this.status = OrderStatus.CANCELLED;
+        domainEvents.add(new OrderCancelledEvent(this.id));
+    }
+
+    public List<DomainEvent> getDomainEvents() {
+        List<DomainEvent> events = new ArrayList<>(domainEvents);
+        domainEvents.clear();
+        return events;
+    }
+}
+
+// 应用服务处理事件
+@Service
+@Transactional
+public class OrderApplicationService {
+
+    @Autowired
+    private OrderRepository orderRepository;
+    @Autowired
+    private EventBus eventBus;
+
+    public void confirmOrder(String orderId) {
+        Order order = orderRepository.findById(OrderId.of(orderId));
+        order.confirm();
+        orderRepository.save(order);
+
+        // 发布聚合根产生的事件
+        for (DomainEvent event : order.getDomainEvents()) {
+            eventBus.publish(event);
+        }
+    }
+}
+```
+
+## 事件驱动架构的变体
+
+### 发布-订阅模式
+
+```
+┌─────────────┐
+│  Publisher  │
+└──────┬──────┘
+       │
+       ▼
+┌─────────────────┐
+│    Message      │
+│     Broker      │
+└──────┬──────────┘
+       │
+       ├──────────┐
+       │          │
+       ▼          ▼
+┌──────────┐ ┌──────────┐
+│Consumer A│ │Consumer B│
+└──────────┘ └──────────┘
+
+特点：每个消费者都能收到所有消息
+```
+
+### 发布-订阅过滤模式
+
+```
+┌─────────────┐
+│  Publisher  │
+└──────┬──────┘
+       │
+       ▼
+┌─────────────────┐
+│    Message      │
+│     Broker      │
+│  (带过滤)       │
+└──────┬──────────┘
+       │
+       ├───▶ [order.created] ──▶ Consumer A
+       │
+       ├───▶ [payment.*] ───────▶ Consumer B
+       │
+       └───▶ [*] ───────────────▶ Consumer C
+
+特点：消费者只收到感兴趣的消息
+```
+
+### CQRS + 事件驱动
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 CQRS + Event Sourcing                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   Command Side:                                                  │
+│   ┌────────────┐    ┌────────────┐    ┌────────────┐           │
+│   │  Command   │───▶│   Domain   │───▶│   Event    │           │
+│   │            │    │            │    │   Store    │           │
+│   └────────────┘    └────────────┘    └──────┬─────┘           │
+│                                               │                  │
+│                                               ▼                  │
+│   Query Side:                                ┌────────────┐    │
+│   ┌────────────┐    ┌────────────┐           │   Event    │    │
+│   │   Query    │◀───│   Read     │◀──────────│   Bus      │    │
+│   │   Handler  │    │   Model    │           │            │    │
+│   └────────────┘    └────────────┘           └────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 事件驱动架构的优势与挑战
+
+### 优势
+
+| 优势 | 说明 |
+|---|---|
+| 松耦合 | 生产者和消费者不直接依赖 |
+| 可扩展 | 可以随时增加消费者 |
+| 容错性 | 一个服务失败不影响其他 |
+| 性能 | 异步处理，提高吞吐量 |
+| 审计性 | 完整的事件日志 |
+
+### 挑战
+
+| 挑战 | 说明 |
+|---|---|
+| 复杂度 | 事件流难以追踪和调试 |
+| 最终一致 | 不是强一致 |
+| 幂等性 | 事件可能重复消费 |
+| 顺序性 | 事件可能乱序到达 |
+| 消息丢失 | 需要处理消息可靠性 |
+
+## 常见问题
+
+### 问题一：事件重复消费
+
+```java
+// 错误：不处理重复消费
+@KafkaListener(topics = "order-events")
+public void handleOrderCreated(OrderCreatedEvent event) {
+    // 直接扣减库存
+    inventoryService.deduct(event.getOrder().getItems());  // [!code warning]
+}
+
+// 正确：幂等处理
+@KafkaListener(topics = "order-events")
+public void handleOrderCreated(OrderCreatedEvent event) {
+    // 检查是否已处理（使用事件 ID）
+    if (processedEventRepository.exists(event.getEventId())) {
+        log.info("事件已处理，跳过: {}", event.getEventId());
+        return;
+    }
+
+    // 业务处理
+    inventoryService.deduct(event.getOrder().getItems());
+
+    // 标记事件已处理
+    processedEventRepository.save(event.getEventId());
+}
+```
+
+### 问题二：事件顺序
+
+```java
+// 问题：事件可能乱序
+// OrderCreated -> OrderPaid -> OrderCancelled
+
+// 解决方案 1：使用分区保证顺序
+@KafkaListener(topics = "order-events", containerFactory = "kafkaListenerContainerFactory")
+public void handleOrderCreated(ConsumerRecord<String, OrderCreatedEvent> record) {
+    // Kafka 保证同一 key 的消息在同一分区有序
+    // 使用 orderId 作为 key，保证同一订单的事件有序
+}
+
+// 解决方案 2：在消费者端排序
+public void handleEvents(List<OrderCreatedEvent> events) {
+    // 按时间戳排序
+    events.sort(Comparator.comparing(DomainEvent::getOccurredAt));
+
+    for (OrderCreatedEvent event : events) {
+        processEvent(event);
+    }
+}
+```
+
+### 问题三：死信处理
+
+```java
+// 错误：不处理失败
+public void handleEvent(OrderCreatedEvent event) {
+    inventoryService.deduct(event.getOrder().getItems());
+}
+
+// 正确：重试 + 死信
+public void handleEvent(OrderCreatedEvent event) {
+    try {
+        inventoryService.deduct(event.getOrder().getItems());
+    } catch (Exception e) {
+        if (isRetryable(e)) {
+            throw e;  // 重试
+        } else {
+            // 发送到死信队列
+            sendToDeadLetterQueue(event, e);
+        }
+    }
+}
+```
+
+## 事件驱动架构的实际应用
+
+### 实时数据同步
+
+```java
+// 监听业务事件，同步数据到搜索引擎
+@Component
+public class SearchIndexEventHandler {
+    @Autowired
+    private ElasticsearchTemplate elasticsearchTemplate;
+
+    @KafkaListener(topics = "product-events")
+    public void handleProductEvent(ProductEvent event) {
+        if (event instanceof ProductCreatedEvent) {
+            ProductCreatedEvent e = (ProductCreatedEvent) event;
+            ProductDocument doc = toDocument(e.getProduct());
+            elasticsearchTemplate.save(doc);
+        } else if (event instanceof ProductUpdatedEvent) {
+            // 更新索引
+        } else if (event instanceof ProductDeletedEvent) {
+            // 删除索引
+        }
+    }
+}
+```
+
+### 实时分析
+
+```java
+// 统计计算
+@Component
+public class AnalyticsEventHandler {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @KafkaListener(topics = "order-events")
+    public void handleOrderEvent(OrderCreatedEvent event) {
+        String key = "analytics:daily:" + LocalDate.now();
+
+        // 原子递增
+        redisTemplate.opsForHash().increment(key, "orderCount", 1);
+        redisTemplate.opsForHash().increment(key, "orderAmount", event.getTotalAmount().getCents());
+    }
+}
+```
+
+## 总结
+
+事件驱动架构通过异步事件通信，实现了系统的松耦合、高可扩展性和容错性。
+
+**核心要点**：
+
+- 生产者发布事件，不关心谁处理
+- 消费者异步处理事件
+- 事件是不可变的，只增不减
+- 需要处理幂等性和顺序性
+
+**优势**：
+
+- 松耦合
+- 高可扩展
+- 容错性强
+- 支持实时处理
+
+**挑战**：
+
+- 复杂度高
+- 最终一致
+- 调试困难
+- 需要幂等处理
+
+**适用场景**：
+
+- 微服务间通信
+- 需要高可扩展的系统
+- 实时数据处理
+- 需要审计日志的系统
+
+**不适用场景**：
+
+- 需要强一致性的业务
+- 简单的同步调用场景
+- 团队不熟悉异步编程

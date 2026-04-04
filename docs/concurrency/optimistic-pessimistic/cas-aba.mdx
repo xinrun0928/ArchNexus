@@ -1,0 +1,279 @@
+---
+title: CAS 原理与 ABA 问题
+description: Compare-And-Swap 的实现原理与 ABA 问题的解决方案
+---
+
+# CAS 原理与 ABA 问题
+
+CAS 是乐观锁在硬件层面的实现，是无锁编程的基础。
+
+Compare-And-Swap（CAS）是现代 CPU 提供的一种原子指令，Java 的 `Atomic*` 系列类就是基于 CAS 实现的。
+
+## CAS 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CAS 原理                                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  CAS 操作：                                             │   │
+│  │                                                         │   │
+│  │  1. 读取内存值 V                                     │   │
+│  │  2. 比较 V 和期望值 A                               │   │
+│  │  3. 如果相等，将 V 更新为新值 B                    │   │
+│  │  4. 返回操作是否成功                               │   │
+│  │                                                         │   │
+│  │  伪代码：                                             │   │
+│  │                                                         │   │
+│  │  boolean CAS(int* addr, int old, int new) {          │   │
+│  │      if (*addr == old) {                             │   │
+│  │          *addr = new;                                │   │
+│  │          return true;                                 │   │
+│  │      }                                                │   │
+│  │      return false;                                    │   │
+│  │  }                                                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## CAS 的 Java 实现
+
+```java
+// AtomicInteger 基于 CAS 实现
+public class AtomicInteger {
+    private volatile int value;
+
+    public final int get() {
+        return value;
+    }
+
+    public final int incrementAndGet() {
+        for (;;) {
+            int current = get();
+            int next = current + 1;
+            // CAS 操作
+            if (compareAndSet(current, next)) {
+                return next;
+            }
+            // CAS 失败，自旋重试
+        }
+    }
+
+    public final boolean compareAndSet(int expect, int update) {
+        return unsafe.compareAndSwapInt(this, valueOffset, expect, update);
+    }
+}
+```
+
+## ABA 问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ABA 问题                                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  ABA 问题：                                            │   │
+│  │  线程 T1 读取值 A → 线程 T2 改为 B → 线程 T2 改回 A   │   │
+│  │  → 线程 T1 看到值还是 A，认为没有变化               │   │
+│  │  → 但实际上中间发生了两次修改                        │   │
+│  │                                                         │   │
+│  │  示例：                                               │   │
+│  │                                                         │   │
+│  │  栈：[A] → [B] → [C]                               │   │
+│  │                                                         │   │
+│  │  T1: pop() → 读到 A                                │   │
+│  │  T2: pop() → 读到 A → push(D) → push(A)          │   │
+│  │  T1: CAS(A, B) → 成功！                            │   │
+│  │                                                         │   │
+│  │  结果：D 和 C 被丢失了！                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 栈的 ABA 问题示例
+
+```java
+// 有问题的简单栈
+public class SimpleStack {
+    private AtomicReference<Node> top = new AtomicReference<>();
+
+    public void push(int value) {
+        Node newNode = new Node(value);
+        Node oldTop;
+        do {
+            oldTop = top.get();
+            newNode.next = oldTop;
+        } while (!top.compareAndSet(oldTop, newNode));  // [!code warning] ABA 问题
+    }
+
+    public int pop() {
+        Node oldTop;
+        Node newTop;
+        do {
+            oldTop = top.get();
+            if (oldTop == null) {
+                throw new EmptyStackException();
+            }
+            newTop = oldTop.next;
+        } while (!top.compareAndSet(oldTop, newTop));  // [!code warning] ABA 问题
+
+        return oldTop.value;
+    }
+}
+```
+
+## 解决 ABA 问题
+
+### 方案一：版本号（Unsafe）
+
+```java
+// 带版本号的原子引用
+public class AtomicStampedReference<T> {
+    private static class Pair<T> {
+        final T reference;
+        final int stamp;
+        Pair(T reference, int stamp) {
+            this.reference = reference;
+            this.stamp = stamp;
+        }
+    }
+
+    private final AtomicReference<Pair<T>> ref;
+    private final AtomicInteger stamp;
+
+    public AtomicStampedReference(T initialRef, int initialStamp) {
+        ref = new AtomicReference<>(new Pair<>(initialRef, initialStamp));
+        stamp = new AtomicInteger(initialStamp);
+    }
+
+    public boolean compareAndSet(T expectedReference, T newReference,
+                                int expectedStamp, int newStamp) {
+        Pair<T> current = ref.get();
+        return expectedReference == current.reference &&
+               expectedStamp == current.stamp &&
+               (newReference == current.reference ||
+                ref.compareAndSet(current,
+                    new Pair<>(newReference, newStamp)));
+    }
+}
+
+// 使用版本号解决 ABA 问题
+public class SafeStack<T> {
+    private final AtomicStampedReference<Node<T>> top =
+        new AtomicStampedReference<>(null, 0);
+
+    public void push(T value) {
+        Node<T> newNode = new Node<>(value);
+        int[] stamp = new int[1];
+
+        while (true) {
+            Node<T> oldTop = top.get(stamp);
+            newNode.next = oldTop;
+            int newStamp = stamp[0] + 1;
+
+            if (top.compareAndSet(oldTop, newNode,
+                                 stamp[0], newStamp)) {
+                return;
+            }
+        }
+    }
+}
+```
+
+### 方案二：Double CAS
+
+```java
+// 双重检查
+public class DoubleCASStack<T> {
+    private final AtomicReference<Node<T>> top = new AtomicReference<>();
+
+    public boolean push(T value) {
+        Node<T> newNode = new Node<>(value);
+
+        while (true) {
+            Node<T> oldTop = top.get();
+            newNode.next = oldTop;
+
+            // 第一次 CAS
+            if (top.compareAndSet(oldTop, newNode)) {
+                // 第二次 CAS：检查中间是否被修改
+                if (top.get() == newNode) {
+                    return true;  // 成功
+                }
+                // 被修改了，重试
+            }
+        }
+    }
+}
+```
+
+### Java 8 的解决方案：StampedLock
+
+```java
+// StampedLock 使用版本戳
+public class StampedLockExample {
+    private final StampedLock stampedLock = new StampedLock();
+    private int balance = 0;
+
+    // 乐观读：带版本检查
+    public int read() {
+        long stamp = stampedLock.tryOptimisticRead();
+        int currentBalance = balance;
+
+        // 检查读期间是否有写操作
+        if (!stampedLock.validate(stamp)) {
+            // 有写操作，获取读锁重读
+            stamp = stampedLock.readLock();
+            try {
+                currentBalance = balance;
+            } finally {
+                stampedLock.unlockRead(stamp);
+            }
+        }
+
+        return currentBalance;
+    }
+
+    // 写操作会自动递增版本
+    public void write(int value) {
+        long stamp = stampedLock.writeLock();
+        try {
+            balance = value;
+        } finally {
+            stampedLock.unlockWrite(stamp);
+        }
+    }
+}
+```
+
+## 总结
+
+CAS 是无锁编程的核心，ABA 问题需要用版本号解决。
+
+**CAS 原理**：
+
+- 读取 → 比较 → 更新
+- 失败时自旋重试
+- 硬件级原子操作
+
+**ABA 问题**：
+
+- 值从 A 变为 B 再变回 A
+- CAS 无法检测中间的修改
+- 可能导致数据丢失
+
+**解决方案**：
+
+- 版本号：`AtomicStampedReference`
+- Double CAS：双重检查
+- 避免方案：换用其他数据结构
+
+**核心认知**：ABA 问题的本质是"值相同不代表没变化"。需要用额外的标记（版本号、时间戳）来记录变化。

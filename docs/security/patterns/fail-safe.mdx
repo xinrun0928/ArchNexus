@@ -1,0 +1,422 @@
+---
+title: 失效安全
+description: 系统故障时的安全降级策略
+---
+
+# 失效安全
+
+你的系统在故障时直接返回错误页面，攻击者利用这个错误页面收集了系统信息。
+
+问题出在哪？**没有遵循失效安全原则**。
+
+失效安全确保系统在故障时不会泄露敏感信息或允许未授权操作。
+
+## 什么是失效安全
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    失效安全的定义                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  失效安全（Fail Safe）：                               │   │
+│  │                                                         │   │
+│  │  「系统在发生错误或故障时，应该默认拒绝访问，            │   │
+│  │    而不是默认允许操作」                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  失效安全 vs 失效开放：                               │   │
+│  │                                                         │   │
+│  │  失效开放（Fail Open）：                               │   │
+│  │  认证服务故障 → 允许访问（危险！）                  │   │
+│  │                                                         │   │
+│  │  失效安全（Fail Safe）：                               │   │
+│  │  认证服务故障 → 拒绝访问（正确！）                  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 失效安全原则
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    失效安全原则                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 原则一：默认拒绝                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  不确定的请求 → 默认拒绝                           │   │
+│  │  认证失败 → 默认拒绝                               │   │
+│  │  授权未知 → 默认拒绝                               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 原则二：错误信息不泄露敏感信息                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  不显示：堆栈信息、内部路径、版本号              │   │
+│  │  只显示：通用错误信息                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 原则三：资源耗尽时拒绝新请求                         │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  连接池满 → 拒绝请求，拒绝比超时更安全          │   │
+│  │  内存不足 → 拒绝请求，防止雪崩                  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 原则四：超时处理为拒绝                               │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  服务响应超时 → 视为不可用，向上传播失败       │   │
+│  │  外部依赖超时 → 返回错误，不返回假数据      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 访问控制的失效安全
+
+```java
+// 访问控制的失效安全
+@Configuration
+@EnableWebSecurity
+public class FailSafeAccessControl {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        return http
+            .authorizeHttpRequests(auth -> auth
+                // 默认配置：所有请求默认拒绝
+                .anyRequest().authenticated()
+            )
+            // 认证失败：重定向到登录页
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint((request, response, authException) -> {
+                    // 不泄露认证失败原因
+                    response.sendRedirect("/login?error=auth_failed");
+                })
+                // 授权失败：返回 403
+                .accessDeniedHandler((request, response, accessDeniedException) -> {
+                    // 不泄露权限不足的详细信息
+                    response.setStatus(HttpStatus.FORBIDDEN.value());
+                    response.setContentType("application/json");
+                    response.getWriter().write(
+                        "{\"error\":\"Access denied\"}"
+                    );
+                })
+            )
+            .build();
+    }
+}
+
+// Service 层权限检查
+@Service
+public class FailSafeAuthorization {
+
+    @Autowired
+    private AuthorizationService authorizationService;
+
+    public Response doAction(Long userId, String action) {
+        try {
+            // 显式检查权限
+            boolean hasPermission = authorizationService.checkPermission(
+                userId, action
+            );
+
+            // 权限未知时默认拒绝
+            if (!hasPermission) {
+                return Response.error("Access denied");
+            }
+
+            return Response.success();
+
+        } catch (AuthorizationException e) {
+            // 授权服务异常时默认拒绝（失效安全！）
+            return Response.error("Authorization service unavailable");
+        }
+    }
+}
+```
+
+## 认证服务的失效安全
+
+```java
+// 认证服务故障时的失效安全
+@Service
+public class FailSafeAuthentication {
+
+    @Autowired
+    private AuthenticationService authenticationService;
+
+    public AuthenticationResult authenticate(String username, String password) {
+        try {
+            return authenticationService.authenticate(username, password);
+
+        } catch (AuthenticationUnavailableException e) {
+            // 认证服务不可用时：失效安全，拒绝认证
+            // 而不是允许通过（失效开放）
+            throw new AuthenticationException(
+                "Authentication service is temporarily unavailable"
+            );
+        }
+    }
+
+    // Session 验证
+    public boolean validateSession(String sessionId) {
+        try {
+            Session session = sessionRepository.findById(sessionId);
+
+            // Session 不存在或已过期：视为无效
+            if (session == null || session.isExpired()) {
+                return false;
+            }
+
+            return true;
+
+        } catch (SessionStoreException e) {
+            // Session 存储故障时：失效安全，拒绝访问
+            return false;
+        }
+    }
+}
+```
+
+## 资源保护的失效安全
+
+```java
+// 资源耗尽时的失效安全
+@Service
+public class ResourceProtectionService {
+
+    private final AtomicInteger activeRequests = new AtomicInteger(0);
+    private static final int MAX_CONCURRENT_REQUESTS = 1000;
+
+    // 请求限流
+    public Response handleRequest(Request request) {
+        int current = activeRequests.get();
+
+        // 资源耗尽时：拒绝请求（失效安全）
+        if (current >= MAX_CONCURRENT_REQUESTS) {
+            return Response.status(503)
+                .body("Service is overloaded, please try again later");
+        }
+
+        // 限流阈值
+        if (current >= MAX_CONCURRENT_REQUESTS * 0.8) {
+            // 接近阈值时开始限流
+            if (!request.hasPriority()) {
+                return Response.status(429)
+                    .body("Too many requests");
+            }
+        }
+
+        try {
+            activeRequests.incrementAndGet();
+            return processRequest(request);
+        } finally {
+            activeRequests.decrementAndGet();
+        }
+    }
+
+    // 连接池耗尽
+    public <T> T executeWithConnection(ConnectionCallback<T> callback) {
+        try {
+            return jdbcTemplate.execute(callback);
+        } catch (CannotGetJdbcConnectionException e) {
+            // 连接池耗尽时：失效安全，拒绝操作
+            throw new ServiceUnavailableException(
+                "Database connection is temporarily unavailable"
+            );
+        }
+    }
+}
+```
+
+## 超时处理的失效安全
+
+```java
+// 超时处理的失效安全
+@Service
+public class FailSafeTimeoutHandling {
+
+    @Autowired
+    private RestTemplate restTemplate;
+
+    public ExternalResponse callExternalService(Request request) {
+        try {
+            // 设置合理的超时
+            ResponseEntity<ExternalResponse> response = restTemplate.exchange(
+                "https://external-service/api",
+                HttpMethod.POST,
+                new HttpEntity<>(request),
+                ExternalResponse.class
+            );
+
+            return response.getBody();
+
+        } catch (RestClientException e) {
+            // 超时：失效安全，向上传播失败
+            throw new ServiceUnavailableException(
+                "External service timeout"
+            );
+        }
+    }
+
+    // 熔断器模式
+    @CircuitBreaker(name = "externalService", fallbackMethod = "fallback")
+    public Response callExternalServiceWithCircuitBreaker(Request request) {
+        return restTemplate.postForObject(
+            "https://external-service/api",
+            request,
+            Response.class
+        );
+    }
+
+    // 熔断器触发时的降级方法
+    public Response fallback(Request request, Exception e) {
+        // 外部服务不可用：返回降级响应
+        // 而不是返回缓存的旧数据（可能已过期）
+        return Response.error("Service temporarily unavailable");
+    }
+}
+```
+
+## 错误信息处理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    错误信息的失效安全                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 内部错误（不应暴露给用户）：                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ✗ java.sql.SQLException: Connection refused         │   │
+│  │  ✗ /app/src/main/java/...: NullPointerException    │   │
+│  │  ✗ org.springframework.beans.factory.BeanCreation... │   │
+│  │                                                         │   │
+│  │  ✓ 系统内部错误，请稍后重试                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 安全相关错误（不泄露细节）：                         │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ✗ 密码错误                                          │   │
+│  │  ✓ 用户名或密码错误                                  │   │
+│  │                                                         │   │
+│  │  ✗ 用户不存在                                        │   │
+│  │  ✓ 用户名或密码错误                                  │   │
+│  │                                                         │   │
+│  │  ✗ Token 已过期                                      │   │
+│  │  ✓ 请重新登录                                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 内部日志（记录详细信息，供排查）：                     │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  log.error("Authentication failed for user: {}",      │   │
+│  │             username, ex);                            │   │
+│  │                                                         │   │
+│  │  log.error("Stack trace: {}", ExceptionUtils.         │   │
+│  │             getFullStackTrace(ex));                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// 全局异常处理
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(SQLException.class)
+    public ResponseEntity<ErrorResponse> handleSqlException(SQLException e) {
+        // 记录详细日志
+        log.error("Database error", e);
+
+        // 返回通用错误（不泄露敏感信息）
+        return ResponseEntity.status(500)
+            .body(new ErrorResponse(
+                "DATABASE_ERROR",
+                "Database operation failed"
+            ));
+    }
+
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<ErrorResponse> handleAuthException(
+            AuthenticationException e) {
+        // 不泄露是用户名错还是密码错
+        return ResponseEntity.status(401)
+            .body(new ErrorResponse(
+                "AUTH_FAILED",
+                "Invalid credentials"
+            ));
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(
+            AccessDeniedException e) {
+        return ResponseEntity.status(403)
+            .body(new ErrorResponse(
+                "ACCESS_DENIED",
+                "You do not have permission to access this resource"
+            ));
+    }
+
+    // 敏感操作日志（不上报给用户）
+    @ExceptionHandler(SuspiciousActivityException.class)
+    public ResponseEntity<ErrorResponse> handleSuspiciousActivity(
+            SuspiciousActivityException e) {
+        // 记录安全告警
+        securityAlertService.sendAlert(e.getAlert());
+
+        // 返回模糊错误
+        return ResponseEntity.status(403)
+            .body(new ErrorResponse(
+                "ACCESS_DENIED",
+                "Request blocked"
+            ));
+    }
+}
+```
+
+## 总结
+
+失效安全确保系统在故障时不会泄露信息或允许未授权操作。
+
+**核心原则**：
+
+- 默认拒绝，而不是默认允许
+- 错误信息不泄露敏感细节
+- 资源耗尽时拒绝新请求
+- 超时视为失败
+
+**实施要点**：
+
+- 认证失败：不泄露是用户名错还是密码错
+- 授权失败：不泄露需要什么权限
+- 服务故障：返回错误，不返回降级数据
+- 超时处理：向上传播失败，不静默忽略
+
+**核心认知**：失效安全的反面是「失效开放」——系统故障时默认允许访问。这在安全场景中极其危险。宁可让用户暂时无法使用，也不要让攻击者趁虚而入。

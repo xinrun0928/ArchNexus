@@ -1,0 +1,480 @@
+---
+title: 安全监控与审计
+description: 日志记录、入侵检测与应急响应
+---
+
+# 安全监控与审计
+
+你的系统被人入侵了，但第二天才发现。
+
+问题出在哪？**没有安全监控**。
+
+安全监控是最后一道防线，也是发现问题的关键。
+
+## 安全监控体系
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    安全监控体系                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  ┌─────────────────────────────────────────────┐   │   │
+│  │  │           日志收集层                         │   │   │
+│  │  │  应用日志、系统日志、安全设备日志           │   │   │
+│  │  └─────────────────┬───────────────────────────┘   │   │
+│  │                    │                                 │   │
+│  │                    ▼                                 │   │
+│  │  ┌─────────────────────────────────────────────┐   │   │
+│  │  │           SIEM 平台                          │   │   │
+│  │  │  日志聚合、关联分析、异常检测               │   │   │
+│  │  └─────────────────┬───────────────────────────┘   │   │
+│  │                    │                                 │   │
+│  │                    ▼                                 │   │
+│  │  ┌─────────────────────────────────────────────┐   │   │
+│  │  │           告警通知层                         │   │   │
+│  │  │  邮件、短信、钉钉、企业微信                 │   │   │
+│  │  └─────────────────────────────────────────────┘   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 安全日志记录
+
+```java
+// 安全事件日志服务
+@Service
+public class SecurityEventLogger {
+
+    @Autowired
+    private SecurityEventRepository eventRepository;
+
+    @Autowired
+    private SecurityAlertService alertService;
+
+    // 登录事件
+    public void logLogin(LoginEvent event) {
+        SecurityEvent log = new SecurityEvent();
+        log.setType(EventType.LOGIN);
+        log.setUserId(event.getUserId());
+        log.setUsername(event.getUsername());
+        log.setIp(event.getIp());
+        log.setUserAgent(event.getUserAgent());
+        log.setSuccess(event.isSuccess());
+        log.setTimestamp(LocalDateTime.now());
+
+        eventRepository.save(log);
+
+        // 失败登录告警
+        if (!event.isSuccess()) {
+            checkFailedLoginPattern(event);
+        }
+    }
+
+    // 敏感操作事件
+    public void logSensitiveAction(SensitiveActionEvent event) {
+        SecurityEvent log = new SecurityEvent();
+        log.setType(EventType.SENSITIVE_ACTION);
+        log.setUserId(event.getUserId());
+        log.setAction(event.getAction());
+        log.setResourceType(event.getResourceType());
+        log.setResourceId(event.getResourceId());
+        log.setIp(event.getIp());
+        log.setTimestamp(LocalDateTime.now());
+
+        eventRepository.save(log);
+    }
+
+    // 权限变更事件
+    public void logPermissionChange(PermissionChangeEvent event) {
+        SecurityEvent log = new SecurityEvent();
+        log.setType(EventType.PERMISSION_CHANGE);
+        log.setActorUserId(event.getActorUserId());
+        log.setTargetUserId(event.getTargetUserId());
+        log.setAction(event.getAction());
+        log.setOldValue(event.getOldValue());
+        log.setNewValue(event.getNewValue());
+        log.setTimestamp(LocalDateTime.now());
+
+        eventRepository.save(log);
+
+        // 管理员操作告警
+        alertService.sendAlert(AlertLevel.HIGH,
+            "Permission change by admin: " + event);
+    }
+
+    // 检测暴力破解模式
+    private void checkFailedLoginPattern(LoginEvent event) {
+        long failedCount = eventRepository.countFailedLogins(
+            event.getUsername(),
+            Duration.ofMinutes(15)
+        );
+
+        if (failedCount > 5) {
+            alertService.sendAlert(AlertLevel.HIGH,
+                "Brute force detected for user: " + event.getUsername());
+        }
+    }
+}
+
+// AOP 自动记录安全事件
+@Aspect
+@Component
+public class SecurityEventAspect {
+
+    @Autowired
+    private SecurityEventLogger eventLogger;
+
+    @Around("@annotation(SensitiveOperation)")
+    public Object aroundSensitiveOperation(ProceedingJoinPoint point) throws Throwable {
+        // 获取当前用户
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+        try {
+            Object result = point.proceed();
+
+            // 记录成功操作
+            eventLogger.logSensitiveAction(new SensitiveActionEvent(
+                auth.getUserId(),
+                getMethodName(point),
+                getResourceType(point),
+                getResourceId(point)
+            ));
+
+            return result;
+
+        } catch (Exception e) {
+            // 记录失败操作
+            eventLogger.logSensitiveAction(new SensitiveActionEvent(
+                auth.getUserId(),
+                getMethodName(point),
+                getResourceType(point),
+                getResourceId(point),
+                e.getMessage()
+            ));
+            throw e;
+        }
+    }
+}
+
+// 敏感操作注解
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface SensitiveOperation {
+    String resourceType();
+    String action();
+}
+```
+
+## SIEM 集成
+
+```yaml
+# ELK Stack 安全日志配置
+
+# Filebeat 收集应用日志
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/archnexus/security-*.log
+    fields:
+      log_type: security
+    fields_under_root: true
+
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/archnexus/access-*.log
+    fields:
+      log_type: access
+    fields_under_root: true
+
+# 输出到 Elasticsearch
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+  index: "archnexus-%{+yyyy.MM.dd}"
+
+# Kibana 安全仪表板配置
+# security-dashboard.ndjson
+{
+  "objects": [
+    {
+      "id": "failed-login-alerts",
+      "type": "visualization",
+      "attributes": {
+        "title": "Failed Login Attempts",
+        "visState": {
+          "type": "histogram",
+          "aggs": [
+            {"type": "date_histogram", "field": "@timestamp"},
+            {"type": "terms", "field": "username", "size": 10}
+          ]
+        }
+      }
+    },
+    {
+      "id": "suspicious-ip-list",
+      "type": "search",
+      "attributes": {
+        "title": "Suspicious IP Addresses",
+        "query": {
+          "query": "event.type:sensitive_action AND event.success:false",
+          "language": "kuery"
+        }
+      }
+    }
+  ]
+}
+```
+
+## 入侵检测规则
+
+```yaml
+# Sigma 规则示例：检测暴力破解
+
+title: Windows Failed Logins Multiple
+logsource:
+  product: windows
+  service: security
+detection:
+  selection:
+    EventID: 4625
+  timeframe: 5m
+  condition: selection | count() by IpAddress > 10
+fields:
+  - IpAddress
+  - AccountName
+  - WorkstationName
+level: high
+
+---
+# 检测 SQL 注入
+title: SQL Injection Attempt
+logsource:
+  product: nginx
+detection:
+  selection:
+    uri: '*union*select*'
+  timeframe: 1m
+  condition: selection | count() by src_ip > 5
+level: high
+
+---
+# 检测异常数据访问
+title: Bulk Data Export
+logsource:
+  application: archnexus
+detection:
+  selection:
+    action: 'data.export'
+    record_count: '>1000'
+  condition: selection
+level: medium
+```
+
+## 告警通知
+
+```java
+// 安全告警服务
+@Service
+public class SecurityAlertService {
+
+    @Autowired
+    private AlertChannelFactory alertChannelFactory;
+
+    public void sendAlert(AlertLevel level, String message) {
+        Alert alert = new Alert();
+        alert.setLevel(level);
+        alert.setMessage(message);
+        alert.setTimestamp(LocalDateTime.now());
+
+        // 根据级别选择通知方式
+        switch (level) {
+            case CRITICAL:
+                // 严重告警：电话 + 短信 + 钉钉
+                sendPhoneCall(alert);
+                sendSms(alert);
+                sendDingTalk(alert);
+                break;
+
+            case HIGH:
+                // 高危告警：短信 + 钉钉
+                sendSms(alert);
+                sendDingTalk(alert);
+                break;
+
+            case MEDIUM:
+                // 中危告警：钉钉
+                sendDingTalk(alert);
+                break;
+
+            case LOW:
+                // 低危告警：邮件
+                sendEmail(alert);
+                break;
+        }
+
+        // 保存告警记录
+        alertRepository.save(alert);
+    }
+
+    // 告警收敛：防止告警风暴
+    @Cacheable(value = "alert-convergence", key = "#alert.getFingerprint()")
+    public boolean shouldSend(Alert alert) {
+        // 5 分钟内同类告警已发送过，不再发送
+        return true;
+    }
+}
+```
+
+## 应急响应
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    应急响应流程                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 阶段一：准备（日常）                                  │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 制定应急响应计划                                 │   │
+│  │  - 建立应急响应团队                                 │   │
+│  │  - 准备应急响应工具                                 │   │
+│  │  - 定期演练                                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 阶段二：检测与分析（发生安全事件时）                 │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  1. 确认安全事件存在                                 │   │
+│  │  2. 确定事件范围和影响                             │   │
+│  │  3. 收集证据                                        │   │
+│  │  4. 分析攻击手法                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 阶段三：遏制（止血）                                 │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 隔离受影响的系统                                │   │
+│  │  - 阻断攻击者访问                                  │   │
+│  │  - 封禁恶意账号                                    │   │
+│  │  - 暂停相关服务                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 阶段四：根除与恢复                                   │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 清除恶意软件                                    │   │
+│  │  - 修复漏洞                                        │   │
+│  │  - 恢复系统和服务                                  │   │
+│  │  - 验证恢复正常                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 阶段五：事后总结                                     │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 编写事件报告                                    │   │
+│  │  - 复盘分析                                        │   │
+│  │  - 改进措施                                        │   │
+│  │  - 更新应急响应计划                                │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// 应急响应自动化
+@Service
+public class IncidentResponseService {
+
+    @Autowired
+    private SecurityAlertService alertService;
+
+    @Autowired
+    private AutoBlockService blockService;
+
+    // 自动响应：检测到攻击自动封禁
+    @Async
+    @Transactional
+    public void autoRespondToAttack(AttackEvent event) {
+        // 1. 立即封禁 IP
+        blockService.blockIp(event.getIp(),
+            Duration.ofHours(24),
+            "Automatic block: " + event.getReason()
+        );
+
+        // 2. 锁定相关账号
+        if (event.getUserId() != null) {
+            userService.lockAccount(event.getUserId(), "Security event");
+        }
+
+        // 3. 发送告警
+        alertService.sendAlert(AlertLevel.CRITICAL,
+            String.format("Attack detected and auto-blocked: IP=%s, User=%s, Reason=%s",
+                event.getIp(), event.getUserId(), event.getReason())
+        );
+
+        // 4. 创建事件记录
+        createIncidentRecord(event);
+    }
+
+    // 手动响应：大规模攻击
+    @Transactional
+    public void handleMassiveAttack(AttackReport report) {
+        // 1. 启动应急响应团队
+        startIncidentResponse(report);
+
+        // 2. 启用 WAF 紧急模式
+        wafService.enableEmergencyMode();
+
+        // 3. 开启限流
+        rateLimitService.enableStrictMode();
+
+        // 4. 切换到备份 IP
+        dnsService.switchToBackupIp();
+
+        // 5. 通知所有相关人员
+        notifyAllStakeholders(report);
+    }
+}
+```
+
+## 总结
+
+安全监控是最后一道防线。
+
+**监控体系**：
+
+- 日志收集：集中收集所有安全相关日志
+- SIEM：关联分析、异常检测
+- 告警：分级通知、及时响应
+
+**关键监控项**：
+
+- 登录事件：失败次数、异常位置
+- 敏感操作：数据导出、权限变更
+- 网络流量：异常访问、DDoS
+- 系统资源：CPU、内存异常
+
+**应急响应**：
+
+- 准备：制定计划、准备工具、定期演练
+- 检测：确认事件、收集证据
+- 遏制：隔离系统、阻断攻击
+- 恢复：清除威胁、验证恢复
+- 复盘：总结改进
+
+**核心认知**：没有绝对安全的系统，再好的防护也可能被突破。安全监控的目标是：尽早发现、快速响应、最小损失。

@@ -1,0 +1,356 @@
+---
+title: 数据库调优
+description: 数据库性能瓶颈的识别与优化实战
+---
+
+# 数据库调优
+
+你的查询从 10ms 变成了 500ms，数据库 CPU 100%，用户体验急剧下降。
+
+数据库是最常见的性能瓶颈来源。优化数据库往往能带来数量级的性能提升。
+
+## 性能瓶颈识别
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    数据库性能瓶颈来源                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 查询慢：全表扫描、缺少索引                         │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  症状：                                                │   │
+│  │  - 查询时间随数据量线性增长                          │   │
+│  │  - EXPLAIN 显示全表扫描                              │   │
+│  │  - 索引列做函数运算                                  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. 连接耗尽：连接池配置不当                          │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  症状：                                                │   │
+│  │  - 频繁出现连接超时                                  │   │
+│  │  - 连接数接近或等于 max_connections                 │   │
+│  │  - 大量连接处于 Sleep 状态                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 锁竞争：事务过长、锁粒度大                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  症状：                                                │   │
+│  │  - 大量事务处于等待状态                              │   │
+│  │  - 死锁频繁出现                                      │   │
+│  │  - 延迟忽高忽低                                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 4. 资源饱和：CPU、IO、内存                          │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  症状：                                                │   │
+│  │  - CPU 使用率持续 100%                             │   │
+│  │  - 磁盘 IO 等待高                                    │   │
+│  │  - 缓冲池命中率低                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 慢查询分析
+
+```sql
+-- 查看慢查询日志
+SHOW VARIABLES LIKE 'slow_query_log';
+SHOW VARIABLES LIKE 'long_query_time';
+
+-- 设置慢查询阈值为 1 秒
+SET GLOBAL long_query_time = 1;
+
+-- 查看慢查询统计
+SHOW GLOBAL STATUS LIKE 'Slow_queries';
+
+-- 分析慢查询
+EXPLAIN
+SELECT u.*, o.*
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+WHERE u.status = 'active'
+  AND o.created_at > '2024-01-01';
+
+-- 详细分析
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+### 常见慢查询模式
+
+```sql
+-- 问题 1：SELECT *
+SELECT * FROM users WHERE id = 1;  -- [!code error]
+-- 正确：只查询需要的字段
+SELECT id, name, email FROM users WHERE id = 1;
+
+-- 问题 2：隐式类型转换（索引失效）
+SELECT * FROM orders WHERE order_no = 12345;  -- [!code error]
+-- order_no 是 VARCHAR，传入数字导致全表扫描
+-- 正确：使用字符串
+SELECT * FROM orders WHERE order_no = '12345';
+
+-- 问题 3：LIKE 开头通配符
+SELECT * FROM users WHERE name LIKE '%张%';  -- [!code error]
+-- 正确：使用全文索引或搜索引擎
+SELECT * FROM users WHERE MATCH(name) AGAINST('张');
+
+-- 问题 4：OR 条件导致索引失效
+SELECT * FROM orders WHERE user_id = 1 OR status = 'pending';  -- [!code error]
+-- 正确：拆分为 UNION
+SELECT * FROM orders WHERE user_id = 1
+UNION ALL
+SELECT * FROM orders WHERE status = 'pending' AND user_id IS NULL;
+```
+
+## 索引优化
+
+```sql
+-- 创建复合索引：遵循最左前缀原则
+CREATE INDEX idx_user_status_created ON orders(user_id, status, created_at);
+
+-- 查询时注意顺序
+-- 命中索引
+SELECT * FROM orders WHERE user_id = 1;                        -- [!code highlight]
+SELECT * FROM orders WHERE user_id = 1 AND status = 'pending';  -- [!code highlight]
+
+-- 部分命中索引
+SELECT * FROM orders WHERE user_id = 1 AND created_at > '2024-01-01';
+
+-- 不命中索引
+SELECT * FROM orders WHERE status = 'pending';  -- [!code error]
+SELECT * FROM orders WHERE created_at > '2024-01-01';  -- [!code error]
+```
+
+```java
+// 索引优化实战
+@Service
+public class IndexOptimizationService {
+
+    // 识别缺失索引
+    public List<MissingIndex> findMissingIndexes() {
+        // MySQL 提供的索引建议
+        String sql = """
+            SELECT
+                TABLE_SCHEMA,
+                TABLE_NAME,
+                NON_UNIQUE,
+                INDEX_NAME,
+                SEQ_IN_INDEX,
+                COLUMN_NAME,
+                CARDINALITY,
+                SUB_PART
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
+            """;
+
+        // 通过慢查询日志识别缺失索引
+        // pt-query-digest / MySQL Workbench 可以自动分析
+        return jdbcTemplate.query(sql, new MissingIndexRowMapper());
+    }
+
+    // 添加索引
+    public void addIndex(String table, String column) {
+        jdbcTemplate.execute(
+            String.format("CREATE INDEX idx_%s ON %s(%s)", column, table, column)
+        );
+    }
+}
+```
+
+## SQL 优化实战
+
+```java
+// 分页优化：深度分页问题
+@Service
+public class PaginationOptimizationService {
+    @Autowired private JdbcTemplate jdbcTemplate;
+
+    // 问题：深度分页导致性能急剧下降
+    // SELECT * FROM orders LIMIT 1000000, 10;
+    // MySQL 需要扫描前 1000010 行，然后丢弃前 1000000 行
+
+    // 优化 1：使用游标分页
+    public List<Order> cursorPagination(Long lastId, int pageSize) {
+        String sql = """
+            SELECT * FROM orders
+            WHERE id > ?
+            ORDER BY id
+            LIMIT ?
+            """;
+        return jdbcTemplate.query(sql,
+            new Object[]{lastId, pageSize},
+            orderMapper);
+    }
+
+    // 优化 2：覆盖索引 + 子查询
+    public List<Order> coveringIndexPagination(int offset, int pageSize) {
+        String sql = """
+            SELECT o.*
+            FROM orders o
+            INNER JOIN (
+                SELECT id FROM orders
+                ORDER BY id
+                LIMIT ? OFFSET ?
+            ) AS t ON o.id = t.id
+            """;
+        return jdbcTemplate.query(sql,
+            new Object[]{pageSize, offset},
+            orderMapper);
+    }
+
+    // 优化 3：限制返回字段
+    public List<OrderSummary> simplePagination(int page, int pageSize) {
+        int offset = (page - 1) * pageSize;
+        String sql = """
+            SELECT id, user_id, total_amount, created_at
+            FROM orders
+            ORDER BY id
+            LIMIT ? OFFSET ?
+            """;
+        return jdbcTemplate.query(sql,
+            new Object[]{pageSize, offset},
+            orderSummaryMapper);
+    }
+}
+
+// N+1 查询问题
+@Service
+public class N1QueryProblemService {
+    @Autowired private JdbcTemplate jdbcTemplate;
+
+    // 问题：循环内查询
+    @Transactional(readOnly = true)
+    public List<OrderDTO> getOrdersBad(Long userId) {
+        // 查询订单
+        List<Order> orders = orderRepository.findByUserId(userId);
+
+        // N+1 问题：循环内查询用户信息
+        return orders.stream()
+            .map(order -> {
+                User user = userRepository.findById(order.getUserId())
+                    .orElseThrow();  // [!code error]
+                return new OrderDTO(order, user);
+            })
+            .collect(Collectors.toList());
+    }
+
+    // 优化：JOIN 查询
+    @Transactional(readOnly = true)
+    public List<OrderDTO> getOrdersGood(Long userId) {
+        String sql = """
+            SELECT o.id, o.total_amount, o.created_at,
+                   u.id as user_id, u.name as user_name
+            FROM orders o
+            LEFT JOIN users u ON o.user_id = u.id
+            WHERE o.user_id = ?
+            """;
+        return jdbcTemplate.query(sql,
+            new Object[]{userId},
+            orderDTOMapper);
+    }
+
+    // 优化：批量查询
+    @Transactional(readOnly = true)
+    public List<OrderDTO> getOrdersBatch(Long userId) {
+        // 先查询订单
+        List<Order> orders = orderRepository.findByUserId(userId);
+        if (orders.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 批量查询用户
+        List<Long> userIds = orders.stream()
+            .map(Order::getUserId)
+            .distinct()
+            .collect(Collectors.toList());
+
+        Map<Long, User> userMap = userRepository.findByIds(userIds)
+            .stream()
+            .collect(Collectors.toMap(User::getId, u -> u));
+
+        // 组装结果
+        return orders.stream()
+            .map(order -> new OrderDTO(order, userMap.get(order.getUserId())))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 连接池优化
+
+```yaml
+# HikariCP 连接池配置
+spring:
+  datasource:
+    hikari:
+      # 连接池大小：CPU 核心数 * 2 + 磁盘数
+      maximum-pool-size: 20
+      # 最小空闲连接
+      minimum-idle: 5
+      # 连接超时
+      connection-timeout: 30000
+      # 空闲超时
+      idle-timeout: 600000
+      # 最大生命周期
+      max-lifetime: 1800000
+      # 连接测试
+      connection-test-query: SELECT 1
+```
+
+```java
+// 连接池监控
+@Service
+public class ConnectionPoolMonitoring {
+    @Autowired
+    private DataSource dataSource;
+
+    public void monitorConnectionPool() {
+        if (dataSource instanceof HikariDataSource) {
+            HikariDataSource hikari = (HikariDataSource) dataSource;
+
+            HikariPoolMXBean pool = hikari.getHikariPoolMXBean();
+
+            log.info("连接池状态：");
+            log.info("活跃连接: {}", pool.getActiveConnections());
+            log.info("空闲连接: {}", pool.getIdleConnections());
+            log.info("等待连接线程: {}", pool.getThreadsAwaitingConnection());
+            log.info("总连接数: {}", pool.getTotalConnections());
+        }
+    }
+}
+```
+
+## 总结
+
+数据库调优是性能优化的关键环节。
+
+**常见瓶颈**：
+
+- 查询慢：全表扫描、缺少索引
+- 连接耗尽：连接池配置不当
+- 锁竞争：事务过长、锁粒度大
+- 资源饱和：CPU、IO、内存
+
+**优化方法**：
+
+- 慢查询分析：EXPLAIN、慢查询日志
+- 索引优化：复合索引最左前缀
+- SQL 优化：避免 SELECT *、N+1、深度分页
+- 连接池：合理配置大小和超时
+
+**核心认知**：数据库优化是投入产出比最高的优化方向。很多性能问题，通过优化几条 SQL 就能解决。

@@ -1,0 +1,370 @@
+---
+title: 自动降级 vs 手动降级
+description: 两种降级模式的选择与实践
+---
+
+# 自动降级 vs 手动降级
+
+你的系统在故障时，要么没有降级（用户看到错误），要么降级太慢（故障已经扩散了）。
+
+问题出在哪？**没有选择合适的降级模式**。
+
+## 降级模式对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    降级模式对比                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    自动降级                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │ 优点：                                                  │   │
+│  │ ✓ 响应快，故障时立即降级                              │   │
+│  │ ✓ 减少人工干预，降低故障影响                          │   │
+│  │ ✓ 适合已知的、可预测的故障场景                      │   │
+│  │                                                         │   │
+│  │ 缺点：                                                  │   │
+│  │ ✗ 可能误判，导致不必要的降级                         │   │
+│  │ ✗ 降级策略可能不完美                                │   │
+│  │ ✗ 自动化系统本身可能出问题                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    手动降级                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │ 优点：                                                  │   │
+│  │ ✓ 决策可控，可根据情况灵活处理                      │   │
+│  │ ✓ 不会误判                                             │   │
+│  │ ✓ 适合复杂的、需要人工判断的场景                      │   │
+│  │                                                         │   │
+│  │ 缺点：                                                  │   │
+│  │ ✗ 响应慢，需要人工介入                               │   │
+│  │ ✗ 需要值班人员具备决策能力                            │   │
+│  │ ✗ 夜间/节假日可能无人响应                           │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 自动降级
+
+### 实现方式
+
+```java
+// 基于指标的自动降级
+@Service
+public class AutoDegradationService {
+    private final Map<String, Boolean> featureStatus = new ConcurrentHashMap<>();
+    private final Map<String, DegradeConfig> configs = new ConcurrentHashMap<>();
+
+    // 配置降级条件
+    public void configure(String feature, DegradeConfig config) {
+        configs.put(feature, config);
+    }
+
+    // 自动检查并降级
+    @Scheduled(fixedRate = 5000)
+    public void checkAndDegrade() {
+        for (Map.Entry<String, DegradeConfig> entry : configs.entrySet()) {
+            String feature = entry.getKey();
+            DegradeConfig config = entry.getValue();
+
+            // 检查指标
+            double errorRate = getErrorRate(feature);
+            double latency = getLatency(feature);
+
+            // 触发降级
+            if (errorRate > config.getErrorRateThreshold() ||
+                latency > config.getLatencyThreshold()) {
+                if (featureStatus.getOrDefault(feature, true)) {
+                    degrade(feature);
+                }
+            } else {
+                // 恢复
+                if (!featureStatus.getOrDefault(feature, true)) {
+                    recover(feature);
+                }
+            }
+        }
+    }
+
+    private void degrade(String feature) {
+        featureStatus.put(feature, false);
+        log.warn("自动降级: {}", feature);
+        notificationService.alert("功能降级: " + feature);
+    }
+
+    private void recover(String feature) {
+        featureStatus.put(feature, true);
+        log.info("自动恢复: {}", feature);
+    }
+
+    // 获取指标
+    private double getErrorRate(String feature) {
+        return metricsService.getErrorRate(feature);
+    }
+
+    private double getLatency(String feature) {
+        return metricsService.getLatency(feature);
+    }
+}
+
+// 降级配置
+@Data
+public class DegradeConfig {
+    private double errorRateThreshold = 0.1;      // 10% 错误率触发降级
+    private double latencyThreshold = 1000;       // 1000ms 延迟触发降级
+    private int degradeDuration = 300;            // 降级持续 5 分钟
+    private int recoveryDuration = 60;            // 恢复持续 1 分钟
+}
+```
+
+### Sentinel 降级规则
+
+```java
+// Sentinel 降级规则
+@Configuration
+public class SentinelDegradeConfig {
+    @Bean
+    public DegradeRuleManager degradeRuleManager() {
+        List<DegradeRule> rules = new ArrayList<>();
+
+        // 基于错误率的降级
+        DegradeRule rule1 = new DegradeRule("userService")
+            .setGrade(CircuitBreakerStrategy.ERROR_RATIO)
+            .setCount(0.3)                      // 30% 错误率
+            .setTimeWindow(10);                   // 10 秒窗口
+
+        // 基于慢调用的降级
+        DegradeRule rule2 = new DegradeRule("orderService")
+            .setGrade(CircuitBreakerStrategy.SLOW_REQUEST_RATIO)
+            .setCount(0.5)                      // 50% 慢调用
+            .setSlowRatioThreshold(2000)         // 超过 2 秒算慢调用
+            .setTimeWindow(10);
+
+        rules.add(rule1);
+        rules.add(rule2);
+
+        DegradeRuleManager.loadRules(rules);
+        return DegradeRuleManager.getInstance();
+    }
+}
+```
+
+## 手动降级
+
+### 命令行降级
+
+```bash
+# 命令行降级工具
+#!/bin/bash
+
+# 降级功能
+degrade() {
+    feature=$1
+    curl -X POST "http://admin-api/degrade" \
+        -H "Content-Type: application/json" \
+        -d '{"feature":"'$feature'","action":"degrade"}'
+    echo "功能已降级: $feature"
+}
+
+# 恢复功能
+recover() {
+    feature=$1
+    curl -X POST "http://admin-api/degrade" \
+        -H "Content-Type: application/json" \
+        -d '{"feature":"'$feature'","action":"recover"}'
+    echo "功能已恢复: $feature"
+}
+
+# 查看状态
+status() {
+    curl "http://admin-api/degrade/status"
+}
+
+# 使用
+degrade recommendation
+recover recommendation
+status
+```
+
+### 管理后台降级
+
+```java
+// 降级管理接口
+@RestController
+@RequestMapping("/admin/degrade")
+public class DegradeController {
+    private final Map<String, Boolean> featureStatus = new ConcurrentHashMap<>();
+
+    // 降级
+    @PostMapping
+    public ResponseEntity<String> degrade(@RequestBody DegradeRequest request) {
+        featureStatus.put(request.getFeature(), false);
+        log.info("手动降级: {}, 原因: {}", request.getFeature(), request.getReason());
+        auditLog.log("DEGRADE", request.getFeature(), request.getReason());
+        return ResponseEntity.ok("降级成功");
+    }
+
+    // 恢复
+    @PostMapping("/recover")
+    public ResponseEntity<String> recover(@RequestBody DegradeRequest request) {
+        featureStatus.put(request.getFeature(), true);
+        log.info("手动恢复: {}", request.getFeature());
+        auditLog.log("RECOVER", request.getFeature(), request.getReason());
+        return ResponseEntity.ok("恢复成功");
+    }
+
+    // 查看状态
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, Boolean>> getStatus() {
+        return ResponseEntity.ok(featureStatus);
+    }
+
+    // 批量操作
+    @PostMapping("/batch")
+    public ResponseEntity<String> batchDegrade(@RequestBody BatchDegradeRequest request) {
+        for (String feature : request.getFeatures()) {
+            featureStatus.put(feature, request.isDegrade());
+        }
+        auditLog.log("BATCH_" + (request.isDegrade() ? "DEGRADE" : "RECOVER"),
+            String.join(",", request.getFeatures()), request.getReason());
+        return ResponseEntity.ok("批量操作成功");
+    }
+}
+```
+
+### 预定义降级预案
+
+```java
+// 降级预案
+@Service
+public class DegradePlaybookService {
+    private final Map<String, Playbook> playbooks = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void init() {
+        // 预案 1：推荐服务降级
+        playbooks.put("recommendation", new Playbook(
+            "recommendation",
+            "推荐服务不可用",
+            List.of(
+                new Action("disable", "recommendation", "关闭推荐功能"),
+                new Action("config", "recommendation.default", "使用默认推荐")
+            ),
+            List.of(
+                new Action("enable", "recommendation", "恢复推荐功能")
+            )
+        ));
+
+        // 预案 2：评论服务降级
+        playbooks.put("comment", new Playbook(
+            "comment",
+            "评论服务不可用",
+            List.of(
+                new Action("disable", "comment", "关闭评论功能"),
+                new Action("show", "comment.default", "显示默认评论")
+            ),
+            List.of(
+                new Action("enable", "comment", "恢复评论功能")
+            )
+        ));
+
+        // 预案 3：库存服务降级
+        playbooks.put("inventory", new Playbook(
+            "inventory",
+            "库存服务不可用",
+            List.of(
+                new Action("config", "inventory.always-available", "默认有货")
+            ),
+            List.of(
+                new Action("config", "inventory.live", "恢复实时库存")
+            )
+        ));
+    }
+
+    // 执行预案
+    public void executePlaybook(String name) {
+        Playbook playbook = playbooks.get(name);
+        if (playbook != null) {
+            for (Action action : playbook.getDegradeActions()) {
+                executeAction(action);
+            }
+            playbook.setExecuted(true);
+            auditLog.log("PLAYBOOK_EXECUTE", name, playbook.getDescription());
+        }
+    }
+
+    // 回滚预案
+    public void rollbackPlaybook(String name) {
+        Playbook playbook = playbooks.get(name);
+        if (playbook != null) {
+            for (Action action : playbook.getRecoverActions()) {
+                executeAction(action);
+            }
+            playbook.setExecuted(false);
+            auditLog.log("PLAYBOOK_ROLLBACK", name, playbook.getDescription());
+        }
+    }
+}
+```
+
+## 降级模式选择
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    降级模式选择                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  自动降级适用场景：                                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ✓ 故障检测明确、触发条件清晰                          │   │
+│  │ ✓ 需要快速响应，不允许人工延迟                       │   │
+│  │ ✓ 已知的、可预测的故障模式                           │   │
+│  │ ✓ 24/7 运行的服务                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  手动降级适用场景：                                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ✓ 故障场景复杂，需要人工判断                        │   │
+│  │ ✓ 降级决策影响重大，需要审批                       │   │
+│  │ ✓ 降级策略经常变化                                 │   │
+│  │ ✓ 非核心服务或有明确值班人员的服务                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  混合模式（推荐）：                                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ✓ 自动降级作为第一道防线                            │   │
+│  │ ✓ 手动降级作为精细化控制                            │   │
+│  │ ✓ 预案系统作为降级指南                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+自动降级和手动降级各有优劣，应根据场景选择。
+
+**自动降级**：
+
+- 优点：响应快、减少人工干预
+- 缺点：可能误判
+- 适用：明确的、可预测的故障
+
+**手动降级**：
+
+- 优点：可控、灵活
+- 缺点：响应慢、需要人工
+- 适用：复杂的、需要判断的故障
+
+**推荐模式**：
+
+- 自动降级作为第一道防线
+- 手动降级作为精细化控制
+- 预定义降级预案

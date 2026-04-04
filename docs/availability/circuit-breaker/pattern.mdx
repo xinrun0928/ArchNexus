@@ -1,0 +1,331 @@
+---
+title: 熔断器模式
+description: 防止故障扩散的核心设计模式
+---
+
+# 熔断器模式
+
+你的系统因为一个依赖服务故障，导致整个系统都崩溃了。
+
+问题出在哪？**没有熔断机制，故障在系统间扩散**。
+
+熔断器正是解决这个问题的方案：**当故障达到阈值时，快速失败，防止故障扩散**。
+
+## 熔断器的原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    熔断器原理                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  熔断器 = 自动化的「保险丝」：                                  │
+│                                                                  │
+│  正常状态：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ 熔断器（关闭）──▶ 服务                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  故障状态：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ 熔断器（打开）──▶ 快速失败                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  半开状态：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ 熔断器（半开）──▶ 尝试服务                │   │
+│  │                     │                                   │   │
+│  │                     ▼                                   │   │
+│  │              成功？→ 关闭 / 失败？→ 打开              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 熔断器状态机
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    熔断器状态机                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                    ┌──────────┐                                 │
+│                    │  CLOSED  │ ← 正常状态                      │
+│                    │  (关闭)  │                                 │
+│                    └────┬─────┘                                 │
+│                         │                                          │
+│               失败次数 > 阈值                                    │
+│                         │                                          │
+│                         ▼                                          │
+│                    ┌──────────┐                                 │
+│                    │  OPEN    │ ← 熔断状态                      │
+│                    │  (打开)  │                                 │
+│                    └────┬─────┘                                 │
+│                         │                                          │
+│               等待时间到期                                       │
+│                         │                                          │
+│                         ▼                                          │
+│                    ┌──────────┐                                 │
+│                    │HALF_OPEN │ ← 半开状态                      │
+│                    │  (半开)  │                                 │
+│                    └────┬─────┘                                 │
+│                         │                                          │
+│              ┌────────┴────────┐                               │
+│              ▼                 ▼                                │
+│         成功次数 > 阈值     失败                                 │
+│              │                 │                                │
+│              ▼                 ▼                                │
+│        ┌──────────┐      ┌──────────┐                          │
+│        │  CLOSED  │      │   OPEN   │                          │
+│        └──────────┘      └──────────┘                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 熔断器实现
+
+### 基本实现
+
+```java
+// 熔断器实现
+public class CircuitBreaker {
+    private final AtomicReference<State> state = new AtomicReference<>(State.CLOSED);
+    private final AtomicInteger failureCount = new AtomicInteger(0);
+    private final AtomicInteger successCount = new AtomicInteger(0);
+    private volatile long lastFailureTime;
+
+    private final int failureThreshold;      // 失败阈值
+    private final int successThreshold;     // 成功阈值（半开状态）
+    private final Duration openDuration;    // 打开持续时间
+
+    public enum State { CLOSED, OPEN, HALF_OPEN }
+
+    public CircuitBreaker(int failureThreshold, int successThreshold, Duration openDuration) {
+        this.failureThreshold = failureThreshold;
+        this.successThreshold = successThreshold;
+        this.openDuration = openDuration;
+    }
+
+    public <T> T execute(Supplier<T> supplier) throws ServiceUnavailableException {
+        State currentState = state.get();
+
+        // 状态检查
+        if (currentState == State.OPEN) {
+            if (Duration.ofMillis(System.currentTimeMillis() - lastFailureTime)
+                    .compareTo(openDuration) > 0) {
+                // 等待时间到期，切换到半开状态
+                state.set(State.HALF_OPEN);
+            } else {
+                throw new ServiceUnavailableException("服务暂时不可用");
+            }
+        }
+
+        try {
+            T result = supplier.get();
+            onSuccess();
+            return result;
+        } catch (Exception e) {
+            onFailure();
+            throw e;
+        }
+    }
+
+    private void onSuccess() {
+        State currentState = state.get();
+
+        if (currentState == State.HALF_OPEN) {
+            // 半开状态下，成功的次数
+            if (successCount.incrementAndGet() >= successThreshold) {
+                // 连续成功次数达标，关闭熔断器
+                state.set(State.CLOSED);
+                failureCount.set(0);
+                successCount.set(0);
+            }
+        } else if (currentState == State.CLOSED) {
+            // 关闭状态下，重置失败计数
+            failureCount.set(0);
+        }
+    }
+
+    private void onFailure() {
+        lastFailureTime = System.currentTimeMillis();
+
+        if (state.get() == State.HALF_OPEN) {
+            // 半开状态下失败，重新打开
+            state.set(State.OPEN);
+        } else if (state.get() == State.CLOSED) {
+            // 关闭状态下，增加失败计数
+            if (failureCount.incrementAndGet() >= failureThreshold) {
+                // 失败次数达到阈值，打开熔断器
+                state.set(State.OPEN);
+            }
+        }
+    }
+}
+```
+
+### Spring Cloud 熔断器
+
+```java
+// Spring Cloud 熔断器配置
+@Configuration
+public class CircuitBreakerConfig {
+    @Bean
+    public CircuitBreakerFactory circuitBreakerFactory() {
+        return new Resilience4jCircuitBreakerFactory();
+    }
+}
+
+// 使用熔断器
+@Service
+public class OrderService {
+    private final CircuitBreaker circuitBreaker;
+
+    public OrderService(CircuitBreakerFactory factory) {
+        this.circuitBreaker = factory.create("paymentService");
+    }
+
+    public PaymentResult pay(Order order) {
+        return circuitBreaker.run(
+            () -> paymentClient.pay(order),
+            throwable -> fallback(throwable)
+        );
+    }
+
+    private PaymentResult fallback(Throwable throwable) {
+        log.warn("支付服务调用失败，使用降级策略: {}", throwable.getMessage());
+        // 返回降级结果
+        return PaymentResult.degraded("支付服务暂时不可用");
+    }
+}
+```
+
+### Resilience4j 熔断器
+
+```java
+// Resilience4j 熔断器配置
+@Configuration
+public class Resilience4jConfig {
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50)                      // 50% 失败率触发熔断
+            .slowCallRateThreshold(80)                     // 80% 慢调用触发熔断
+            .slowCallDurationThreshold(Duration.ofSeconds(3))  // 3 秒算慢调用
+            .waitDurationInOpenState(Duration.ofSeconds(30))  // 熔断 30 秒后尝试半开
+            .slidingWindowType(SlidingWindowType.COUNT_BASED)  // 基于调用次数
+            .slidingWindowSize(10)                        // 滑动窗口 10 次
+            .minimumNumberOfCalls(5)                      // 最少 5 次调用才计算
+            .permittedNumberOfCallsInHalfOpenState(3)    // 半开状态允许 3 次调用
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)  // 自动切换
+            .build();
+
+        return CircuitBreakerRegistry.of(config);
+    }
+}
+
+// 使用
+@Service
+public class ProtectedService {
+    private final CircuitBreaker circuitBreaker;
+
+    public ProtectedService(CircuitBreakerRegistry registry) {
+        this.circuitBreaker = registry.circuitBreaker("backendService");
+    }
+
+    public String callBackend() {
+        return circuitBreaker.executeSupplier(() ->
+            restTemplate.getForObject("http://backend/api", String.class));
+    }
+}
+```
+
+## 熔断器配置
+
+### 配置参数
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    熔断器配置参数                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. failureRateThreshold                                       │
+│     - 失败率阈值                                               │
+│     - 默认：50%                                                │
+│     - 建议：40-60%                                             │
+│                                                                  │
+│  2. slowCallRateThreshold                                      │
+│     - 慢调用率阈值                                             │
+│     - 默认：100%                                               │
+│     - 建议：50-80%                                             │
+│                                                                  │
+│  3. slowCallDurationThreshold                                  │
+│     - 慢调用阈值                                               │
+│     - 默认：60s                                                │
+│     - 建议：2-5s                                               │
+│                                                                  │
+│  4. waitDurationInOpenState                                    │
+│     - 熔断持续时间                                             │
+│     - 默认：60s                                                │
+│     - 建议：30-60s                                             │
+│                                                                  │
+│  5. slidingWindowSize                                         │
+│     - 滑动窗口大小                                             │
+│     - 默认：100                                                │
+│     - 建议：10-100                                             │
+│                                                                  │
+│  6. minimumNumberOfCalls                                      │
+│     - 最小调用数                                               │
+│     - 达到这个数量才计算失败率                                 │
+│     - 建议：5-10                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 监控熔断器状态
+
+```java
+// 熔断器状态监控
+@Service
+public class CircuitBreakerMonitor {
+    @Autowired
+    private CircuitBreakerRegistry registry;
+
+    @Scheduled(fixedRate = 60000)
+    public void monitorCircuitBreakers() {
+        for (String name : registry.getCircuitBreakers().names()) {
+            CircuitBreaker cb = registry.circuitBreaker(name);
+
+            CircuitBreakerMetrics metrics = cb.getMetrics();
+            System.out.println("CircuitBreaker: " + name);
+            System.out.println("  State: " + cb.getState());
+            System.out.println("  Failure Rate: " + metrics.getFailureRate());
+            System.out.println("  Slow Call Rate: " + metrics.getSlowCallRate());
+            System.out.println("  Number of Calls: " + metrics.getNumberOfSuccessfulCalls());
+        }
+    }
+}
+```
+
+## 总结
+
+熔断器是防止故障扩散的核心机制。
+
+**状态机**：
+
+- 关闭：正常调用
+- 打开：快速失败
+- 半开：尝试恢复
+
+**配置要点**：
+
+- 失败率阈值
+- 慢调用阈值
+- 熔断持续时间
+- 滑动窗口大小
+
+**实践要点**：
+
+- 配合降级策略使用
+- 监控熔断器状态
+- 渐进调整参数
+- 持续测试

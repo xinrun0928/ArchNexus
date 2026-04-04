@@ -1,0 +1,641 @@
+---
+title: 微内核架构
+description: 核心系统 + 插件模块的架构模式
+---
+
+# 微内核架构
+
+你正在开发一个 IDE，核心功能是文本编辑。但用户还需要：代码高亮、调试器、版本控制、代码格式化……如果把这些都塞进核心，系统会越来越臃肿，每次更新都要全量发布。
+
+问题是：**核心功能和扩展功能，稳定性要求不同**。
+
+微内核架构正是为了解决这个问题：**把最稳定的内核保持精简，把变化的功能作为插件**。
+
+## 问题背景
+
+### 单体架构的困境
+
+```java
+// 错误示例：所有功能都耦合在一起
+public class TextEditor {
+    public void openFile(String path) {
+        // 核心：文件打开
+        File file = open(path);
+
+        // 功能 1：代码高亮（可能经常变）
+        SyntaxHighlighter highlighter = new JavaHighlighter();
+        String highlighted = highlighter.highlight(file);
+
+        // 功能 2：调试器（可能经常变）
+        Debugger debugger = new JavaDebugger();
+        debugger.attach(file);
+
+        // 功能 3：版本控制（可能经常变）
+        GitClient git = new GitClient();
+        git.showDiff(file);
+
+        // 功能 4：代码格式化（可能经常变）
+        Formatter formatter = new GoogleJavaFormatter();
+        formatter.format(file);
+
+        // ... 越加越多
+    }
+}
+```
+
+问题分析：
+
+- **紧耦合**：所有功能依赖核心
+- **难以扩展**：加新功能要改核心
+- **难以测试**：测试要加载所有功能
+- **版本发布**：任何改动都要全量发布
+
+## 微内核架构的核心
+
+```
+核心思想：
+┌─────────────────────────────────────────────────────────────────┐
+│                       微内核架构                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                         ┌─────────────────┐                     │
+│                         │      Core       │                     │
+│                         │   (核心系统)    │                     │
+│                         │                 │                     │
+│                         │  - 插件加载器  │                     │
+│                         │  - 插件注册表  │                     │
+│                         │  - 核心 API    │                     │
+│                         │  - 最小功能集  │                     │
+│                         └────────┬────────┘                     │
+│                                  │                               │
+│            ┌─────────────────────┼─────────────────────┐        │
+│            │                     │                     │        │
+│     ┌──────▼──────┐       ┌──────▼──────┐       ┌──────▼──────┐│
+│     │   Plugin A   │       │   Plugin B   │       │   Plugin C   ││
+│     │  (插件 A)    │       │  (插件 B)    │       │  (插件 C)    ││
+│     │              │       │              │       │              ││
+│     │  代码高亮    │       │   调试器     │       │  版本控制    ││
+│     └──────────────┘       └──────────────┘       └──────────────┘│
+│                                                                  │
+│  核心系统只关注最核心的功能                                       │
+│  插件独立开发、独立部署、独立热更新                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键概念**：
+
+1. **Core（核心系统）**：包含系统运行所需的最小功能集
+2. **Plugin（插件）**：独立的功能模块，通过接口接入核心
+3. **Plugin Manager（插件管理器）**：负责插件的加载、卸载、管理
+
+## 代码实现
+
+### 最简版本：基础框架
+
+```java
+// ===== Core: 插件接口定义 =====
+
+// 插件接口：所有插件必须实现
+public interface Plugin {
+    // 插件标识
+    String getId();
+
+    // 插件名称
+    String getName();
+
+    // 插件版本
+    String getVersion();
+
+    // 插件描述
+    String getDescription();
+
+    // 初始化
+    void initialize(PluginContext context);
+
+    // 销毁
+    void destroy();
+}
+
+// 插件上下文：插件可以访问核心功能
+public interface PluginContext {
+    // 获取核心服务
+    <T extends CoreService> T getService(Class<T> serviceClass);
+
+    // 获取配置
+    String getConfig(String key);
+
+    // 日志
+    void log(String message);
+}
+
+// 核心服务接口
+public interface CoreService {
+    // 核心提供的基础服务
+}
+```
+
+```java
+// ===== Core: 插件管理器 =====
+
+public class PluginManager {
+    private final Map<String, Plugin> plugins = new ConcurrentHashMap<>();
+    private final PluginRegistry registry;
+    private final ClassLoader parentClassLoader;
+
+    public PluginManager(PluginRegistry registry) {
+        this.registry = registry;
+        this.parentClassLoader = getClass().getClassLoader();
+    }
+
+    // 加载插件
+    public void loadPlugin(PluginDescriptor descriptor) throws Exception {
+        // 1. 检查插件是否已加载
+        if (plugins.containsKey(descriptor.getId())) {
+            throw new PluginAlreadyLoadedException(descriptor.getId());
+        }
+
+        // 2. 检查依赖
+        checkDependencies(descriptor);
+
+        // 3. 创建类加载器（隔离）
+        ClassLoader pluginClassLoader = createPluginClassLoader(descriptor);
+
+        // 4. 加载插件类
+        Class<?> pluginClass = pluginClassLoader.loadClass(descriptor.getMainClass());
+
+        // 5. 实例化并初始化
+        Plugin plugin = (Plugin) pluginClass.getDeclaredConstructor().newInstance();
+        plugin.initialize(new DefaultPluginContext(this));
+
+        // 6. 注册插件
+        plugins.put(descriptor.getId(), plugin);
+        registry.register(descriptor.getId(), plugin);
+
+        log.info("插件加载成功: {} v{}", plugin.getName(), plugin.getVersion());
+    }
+
+    // 卸载插件
+    public void unloadPlugin(String pluginId) {
+        Plugin plugin = plugins.remove(pluginId);
+        if (plugin != null) {
+            plugin.destroy();
+            registry.unregister(pluginId);
+            log.info("插件卸载: {}", pluginId);
+        }
+    }
+
+    // 获取插件
+    public Plugin getPlugin(String pluginId) {
+        return plugins.get(pluginId);
+    }
+
+    // 获取所有插件
+    public List<Plugin> getAllPlugins() {
+        return new ArrayList<>(plugins.values());
+    }
+
+    private ClassLoader createPluginClassLoader(PluginDescriptor descriptor) {
+        // 为每个插件创建独立的类加载器
+        URL[] urls = descriptor.getJarPaths();
+        return new URLClassLoader(urls, parentClassLoader);
+    }
+}
+
+// 插件描述
+public class PluginDescriptor {
+    private String id;
+    private String name;
+    private String version;
+    private String mainClass;
+    private List<String> dependencies;
+    private URL[] jarPaths;
+
+    // getters and setters
+}
+```
+
+### 生产版本：完整的核心系统
+
+```java
+// ===== Core: 核心 API =====
+
+// 核心服务：文件系统
+public interface FileSystemService extends CoreService {
+    FileContent readFile(String path);
+    void writeFile(String path, FileContent content);
+    List<FileInfo> listFiles(String directory);
+    boolean exists(String path);
+}
+
+// 核心服务：事件总线
+public interface EventBus extends CoreService {
+    void publish(Event event);
+    void subscribe(String topic, EventHandler handler);
+    void unsubscribe(String topic, EventHandler handler);
+}
+
+// 核心服务：配置管理
+public interface ConfigurationService extends CoreService {
+    String get(String key, String defaultValue);
+    void set(String key, String value);
+    Map<String, String> getAll();
+    void save();
+}
+
+// 核心服务：日志
+public interface LoggingService extends CoreService {
+    void debug(String message);
+    void info(String message);
+    void warn(String message);
+    void error(String message, Throwable ex);
+}
+```
+
+```java
+// ===== Core: 事件系统 =====
+
+// 事件
+public abstract class Event {
+    private final String topic;
+    private final long timestamp;
+
+    protected Event(String topic) {
+        this.topic = topic;
+        this.timestamp = System.currentTimeMillis();
+    }
+
+    public String getTopic() { return topic; }
+    public long getTimestamp() { return timestamp; }
+}
+
+// 事件处理器
+public interface EventHandler<T extends Event> {
+    void handle(T event);
+    Class<T> getEventType();
+}
+
+// 事件总线实现
+public class DefaultEventBus implements EventBus {
+    private final Map<String, List<EventHandler<?>>> handlers = new ConcurrentHashMap<>();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
+
+    @Override
+    public void publish(Event event) {
+        List<EventHandler<?>> handlers = this.handlers.get(event.getTopic());
+        if (handlers != null) {
+            for (EventHandler<?> handler : handlers) {
+                if (handler.getEventType().isInstance(event)) {
+                    executor.execute(() -> {
+                        try {
+                            ((EventHandler<Event>) handler).handle(event);
+                        } catch (Exception e) {
+                            log.error("事件处理失败", e);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    @Override
+    public void subscribe(String topic, EventHandler handler) {
+        handlers.computeIfAbsent(topic, k -> new CopyOnWriteArrayList<>()).add(handler);
+    }
+}
+```
+
+### 插件示例：语法高亮插件
+
+```java
+// ===== Plugin: 语法高亮插件 =====
+
+public class SyntaxHighlightPlugin implements Plugin {
+    private PluginContext context;
+    private FileSystemService fileSystem;
+
+    @Override
+    public String getId() {
+        return "com.example.syntax-highlight";
+    }
+
+    @Override
+    public String getName() {
+        return "语法高亮插件";
+    }
+
+    @Override
+    public String getVersion() {
+        return "1.0.0";
+    }
+
+    @Override
+    public String getDescription() {
+        return "提供代码语法高亮功能";
+    }
+
+    @Override
+    public void initialize(PluginContext context) {
+        this.context = context;
+        this.fileSystem = context.getService(FileSystemService.class);
+
+        // 注册文件类型
+        registerFileType(".java", new JavaHighlighter());
+        registerFileType(".js", new JavaScriptHighlighter());
+        registerFileType(".py", new PythonHighlighter());
+
+        // 订阅事件
+        context.getService(EventBus.class).subscribe("file.opened", this::onFileOpened);
+    }
+
+    @Override
+    public void destroy() {
+        // 清理资源
+    }
+
+    private void onFileOpened(FileOpenedEvent event) {
+        String extension = getExtension(event.getFileName());
+        Highlighter highlighter = highlighterMap.get(extension);
+        if (highlighter != null) {
+            FileContent content = fileSystem.readFile(event.getFilePath());
+            HighlightedContent highlighted = highlighter.highlight(content);
+            context.publish(new FileHighlightedEvent(highlighted));
+        }
+    }
+}
+
+// 插件描述文件
+// META-INF/plugin.json
+{
+    "id": "com.example.syntax-highlight",
+    "name": "语法高亮插件",
+    "version": "1.0.0",
+    "mainClass": "com.example.plugins.SyntaxHighlightPlugin",
+    "dependencies": [
+        "com.example.core-api"
+    ],
+    "description": "提供代码语法高亮功能"
+}
+```
+
+### 插件开发框架
+
+```java
+// 插件基类：简化插件开发
+public abstract class AbstractPlugin implements Plugin {
+
+    protected PluginContext context;
+
+    @Override
+    public void initialize(PluginContext context) {
+        this.context = context;
+        onInit();
+    }
+
+    // 子类重写
+    protected void onInit() {
+    }
+
+    // 获取核心服务
+    protected <T extends CoreService> T getCoreService(Class<T> serviceClass) {
+        return context.getService(serviceClass);
+    }
+
+    // 发布事件
+    protected void publishEvent(Event event) {
+        context.getService(EventBus.class).publish(event);
+    }
+
+    // 日志
+    protected void log(String message) {
+        context.log(message);
+    }
+}
+
+// 使用示例
+public class GitPlugin extends AbstractPlugin {
+
+    @Override
+    protected void onInit() {
+        // 注册 Git 命令
+        getCoreService(CommandService.class).register("git", new GitCommandHandler());
+    }
+}
+```
+
+## 微内核架构的变体
+
+### OSGi 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      OSGi 架构                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              OSGi Framework                               │   │
+│  │                                                          │   │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                │   │
+│  │  │ Bundle  │  │ Bundle  │  │ Bundle  │                │   │
+│  │  │    A    │  │    B    │  │    C    │                │   │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘                │   │
+│  │       │             │             │                      │   │
+│  │       └─────────────┼─────────────┘                      │   │
+│  │                     │                                    │   │
+│  │              Service Registry                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  Bundle：OSGi 中的插件单位                                       │
+│  Service Registry：服务注册中心                                  │
+│  Module Layer：类加载隔离                                        │
+│  Lifecycle Layer：生命周期管理                                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 插件隔离策略
+
+| 隔离级别 | 说明 | 适用场景 |
+|---|---|---|
+| 类加载器隔离 | 每个插件独立类加载器 | 标准插件隔离 |
+| 进程隔离 | 插件在独立进程中运行 | 高安全要求 |
+| 服务网格 | 通过 RPC 调用插件 | 微服务化 |
+
+## 微内核架构的实际应用
+
+### VS Code 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    VS Code 架构                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                      Core (Electron)                            │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  - 文件系统                                              │   │
+│  │  - 窗口管理                                              │   │
+│  │  - 插件加载器                                            │   │
+│  │  - 消息总线                                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│     ┌────────────────────────┼────────────────────────┐        │
+│     │                        │                        │        │
+│  ┌──▼──┐               ┌─────▼─────┐             ┌────▼────┐  │
+│  │ 语言 │               │   调试器   │             │  主题   │  │
+│  │ 服务 │               │   插件    │             │  插件   │  │
+│  └──┬──┘               └─────┬─────┘             └────┬────┘  │
+│     │                         │                        │        │
+│  ┌──▼──┐                 ┌────▼────┐             ┌────▼────┐  │
+│  │ LSP │                 │   DAP   │             │  VSCT   │  │
+│  │     │                 │         │             │         │  │
+│  └─────┘                 └─────────┘             └─────────┘  │
+│                                                                  │
+│  LSP：Language Server Protocol                                   │
+│  DAP：Debug Adapter Protocol                                     │
+│  VSCT：VS Code Theme                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Jenkins 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Jenkins 架构                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                      Jenkins Core                      │   │
+│  │                                                          │   │
+│  │  - 任务调度                                              │   │
+│  │  - 节点管理                                              │   │
+│  │  - 插件加载器                                            │   │
+│  │  - 安全认证                                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│     ┌────────────────────────┼────────────────────────┐        │
+│     │                        │                        │        │
+│  ┌──▼──┐               ┌─────▼─────┐             ┌────▼────┐  │
+│  │ Git │               │    Maven  │             │ Email   │  │
+│  │插件 │               │    插件    │             │  插件   │  │
+│  └──┬──┘               └───────────┘             └─────────┘  │
+│     │                                                          │
+│  ┌──▼──┐                                                      │
+│  │ SVN │                                                      │
+│  │插件 │                                                      │
+│  └─────┘                                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 微内核架构的优势
+
+| 优势 | 说明 |
+|---|---|
+| 稳定性 | 核心保持精简，降低故障风险 |
+| 可扩展性 | 新功能以插件形式添加，不改核心 |
+| 可维护性 | 插件可以独立开发、测试、部署 |
+| 热更新 | 插件可以热加载/卸载 |
+| 定制化 | 用户可以选择需要的插件 |
+
+## 微内核架构的挑战
+
+| 挑战 | 说明 |
+|---|---|
+| 接口设计 | 核心 API 设计困难，需要考虑未来扩展 |
+| 版本兼容 | 插件和核心的版本兼容性 |
+| 性能开销 | 插件间通信、类加载隔离有开销 |
+| 安全隔离 | 恶意插件的风险 |
+
+## 常见问题
+
+### 问题一：核心 API 膨胀
+
+```java
+// 错误：核心 API 越来越臃肿
+public interface CoreService {
+    void doA();
+    void doB();
+    void doC();
+    void doD();
+    // 100+ 方法
+}
+
+// 正确：按功能拆分为多个核心服务
+public interface FileService { }
+public interface NetworkService { }
+public interface SecurityService { }
+public interface LoggingService { }
+```
+
+### 问题二：插件依赖管理
+
+```java
+// 依赖冲突
+// Plugin A 需要 Library X v1.0
+// Plugin B 需要 Library X v2.0
+
+// 解决方案：版本隔离
+public class IsolatedClassLoader extends URLClassLoader {
+    // 每个插件有自己的依赖副本
+}
+```
+
+### 问题三：插件间通信
+
+```java
+// 插件间不应该直接通信
+// 错误：插件 A 直接调用插件 B
+public class PluginA {
+    private PluginB pluginB;  // [!code warning]
+
+    public void doSomething() {
+        pluginB.call();  // 耦合
+    }
+}
+
+// 正确：通过事件总线通信
+public class PluginA {
+    private EventBus eventBus;
+
+    public void doSomething() {
+        eventBus.publish(new SomethingHappenedEvent());
+    }
+}
+
+public class PluginB {
+    private EventBus eventBus;
+
+    public PluginB() {
+        eventBus.subscribe("SomethingHappenedEvent", this::handle);
+    }
+}
+```
+
+## 总结
+
+微内核架构通过将核心功能与扩展功能分离，实现了系统的稳定性和可扩展性。
+
+**核心要点**：
+
+- 核心保持精简，只包含最小功能集
+- 插件独立开发、独立部署
+- 通过接口实现插件与核心的通信
+- 使用类加载器隔离插件
+
+**优势**：
+
+- 核心稳定，故障影响小
+- 插件可热更新
+- 支持定制化
+- 可扩展性强
+
+**挑战**：
+
+- 核心 API 设计困难
+- 版本兼容性管理
+- 插件间隔离
+
+**适用场景**：
+
+- IDE、编辑器等工具软件
+- 需要高度可定制的系统
+- 需要长期演进的系统
+- 平台类产品

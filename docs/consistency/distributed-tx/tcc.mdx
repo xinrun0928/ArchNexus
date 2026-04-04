@@ -1,0 +1,419 @@
+---
+title: TCC 模式
+description: Try-Confirm-Cancel 分布式事务模式
+---
+
+# TCC 模式
+
+你的分布式事务需要强一致性，但 2PC 的性能太差。
+
+问题出在哪？**没有选择合适的分布式事务方案**。
+
+TCC 是高性能分布式事务的常用方案。
+
+## TCC 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TCC 原理                                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  TCC = Try - Confirm - Cancel                                    │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  Try（预留）：                                         │   │
+│  │  - 检查资源是否可用                                   │   │
+│  │  - 预留资源（冻结/锁定）                            │   │
+│  │                                                         │   │
+│  │  Confirm（确认）：                                    │   │
+│  │  - 确认使用预留的资源                               │   │
+│  │  - 真正的业务操作                                   │   │
+│  │                                                         │   │
+│  │  Cancel（取消）：                                     │   │
+│  │  - 释放预留的资源                                   │   │
+│  │  - 回滚业务操作                                     │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## TCC 与 2PC 的对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TCC vs 2PC                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2PC（二阶段提交）                                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Phase 1（准备阶段）：                                 │   │
+│  │  - 协调者询问所有参与者是否可以提交                 │   │
+│  │  - 参与者锁定资源                                    │   │
+│  │                                                         │   │
+│  │  Phase 2（提交阶段）：                               │   │
+│  │  - 协调者根据结果决定提交或回滚                  │   │
+│  │  - 参与者提交或回滚                                 │   │
+│  │                                                         │   │
+│  │  缺点：                                                │   │
+│  │  - 锁定时间长                                        │   │
+│  │  - 性能差                                             │   │
+│  │  - 协调者单点故障                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ TCC（Try-Confirm-Cancel）                               │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Try：                                                  │   │
+│  │  - 预留资源                                            │   │
+│  │                                                         │   │
+│  │  Confirm/Cancel：                                       │   │
+│  │  - 确认或取消                                          │   │
+│  │                                                         │   │
+│  │  优点：                                                │   │
+│  │  - 锁定时间短                                        │   │
+│  │  - 性能好                                             │   │
+│  │  - 可异步执行                                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## TCC 转账示例
+
+### 业务场景
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TCC 转账示例                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  场景：从账户 A 转账 100 元到账户 B                              │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  账户服务 A（扣款方）：                               │   │
+│  │  - Try：检查余额 >= 100，冻结 100 元                 │   │
+│  │  - Confirm：真正扣减 100 元                           │   │
+│  │  - Cancel：解冻 100 元                               │   │
+│  │                                                         │   │
+│  │  账户服务 B（收款方）：                               │   │
+│  │  - Try：检查账户存在                                 │   │
+│  │  - Confirm：增加 100 元                              │   │
+│  │  - Cancel：无操作（因为没有预留）                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### TCC 接口定义
+
+```java
+// TCC 接口
+public interface TccAction {
+    // Try：预留资源
+    boolean tryAction(Context context);
+
+    // Confirm：确认执行
+    boolean confirmAction(Context context);
+
+    // Cancel：取消执行
+    boolean cancelAction(Context context);
+}
+```
+
+### 转账 TCC 实现
+
+```java
+// 转账 TCC 实现
+@Service
+public class TransferTccAction implements TccAction {
+    @Autowired
+    private AccountRepository accountRepository;
+
+    @Override
+    @Transactional
+    public boolean tryAction(Context context) {
+        Long fromAccountId = context.get("fromAccountId", Long.class);
+        Long toAccountId = context.get("toAccountId", Long.class);
+        BigDecimal amount = context.get("amount", BigDecimal.class);
+
+        // 1. 检查并冻结转出账户余额
+        Account fromAccount = accountRepository.findById(fromAccountId);
+        if (fromAccount.getAvailableBalance().compareTo(amount) < 0) {
+            return false;  // 余额不足
+        }
+
+        // 2. 冻结余额（预留资源）
+        fromAccount.setFrozenBalance(fromAccount.getFrozenBalance().add(amount));
+        fromAccount.setAvailableBalance(
+            fromAccount.getAvailableBalance().subtract(amount));
+        accountRepository.save(fromAccount);
+
+        // 3. 记录事务上下文
+        context.set("fromAccountId", fromAccountId);
+        context.set("toAccountId", toAccountId);
+        context.set("amount", amount);
+
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean confirmAction(Context context) {
+        Long fromAccountId = context.get("fromAccountId", Long.class);
+        BigDecimal amount = context.get("amount", BigDecimal.class);
+
+        // 真正扣减冻结的金额
+        Account fromAccount = accountRepository.findById(fromAccountId);
+        fromAccount.setFrozenBalance(
+            fromAccount.getFrozenBalance().subtract(amount));
+        accountRepository.save(fromAccount);
+
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean cancelAction(Context context) {
+        Long fromAccountId = context.get("fromAccountId", Long.class);
+        BigDecimal amount = context.get("amount", BigDecimal.class);
+
+        // 解冻余额
+        Account fromAccount = accountRepository.findById(fromAccountId);
+        fromAccount.setAvailableBalance(
+            fromAccount.getAvailableBalance().add(amount));
+        fromAccount.setFrozenBalance(
+            fromAccount.getFrozenBalance().subtract(amount));
+        accountRepository.save(fromAccount);
+
+        return true;
+    }
+}
+```
+
+## TCC 框架实现
+
+### 框架架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TCC 框架架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │              应用层                                    │   │
+│  │                   │                                    │   │
+│  │                   ▼                                    │   │
+│  │         ┌─────────────────┐                         │   │
+│  │         │   TCC 拦截器    │                         │   │
+│  │         └────────┬────────┘                         │   │
+│  │                  │                                    │   │
+│  │                  ▼                                    │   │
+│  │         ┌─────────────────┐                         │   │
+│  │         │  事务协调者    │                         │   │
+│  │         └────────┬────────┘                         │   │
+│  │                  │                                    │   │
+│  │      ┌──────────┼──────────┐                        │   │
+│  │      ▼          ▼          ▼                         │   │
+│  │   服务 A      服务 B      服务 C                      │   │
+│  │   Try/       Try/       Try/                         │   │
+│  │   Confirm/    Confirm/    Confirm/                    │   │
+│  │   Cancel      Cancel      Cancel                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### TCC 注解
+
+```java
+// TCC 注解
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface TccTransaction {
+    String confirmMethod() default "confirm";
+    String cancelMethod() default "cancel";
+}
+
+// 使用注解
+@Service
+public class TransferService {
+    @TccTransaction(confirmMethod = "confirmTransfer", cancelMethod = "cancelTransfer")
+    public void transfer(Long fromAccountId, Long toAccountId, BigDecimal amount) {
+        // Try 操作
+        transferTccAction.tryAction(fromAccountId, toAccountId, amount);
+    }
+
+    public void confirmTransfer(Long fromAccountId, Long toAccountId, BigDecimal amount) {
+        // Confirm 操作
+        transferTccAction.confirmAction(fromAccountId, amount);
+    }
+
+    public void cancelTransfer(Long fromAccountId, Long toAccountId, BigDecimal amount) {
+        // Cancel 操作
+        transferTccAction.cancelAction(fromAccountId, amount);
+    }
+}
+```
+
+### TCC 协调器
+
+```java
+// TCC 协调器
+@Service
+public class TccCoordinator {
+    @Autowired
+    private TransactionLogRepository transactionLogRepository;
+
+    @Transactional
+    public void coordinate(List<TccParticipant> participants) {
+        String transactionId = UUID.randomUUID().toString();
+
+        // 1. 执行 Try 操作
+        Map<String, Boolean> results = new HashMap<>();
+        for (TccParticipant participant : participants) {
+            boolean tryResult = participant.tryAction();
+            results.put(participant.getId(), tryResult);
+        }
+
+        // 2. 根据 Try 结果决定 Confirm 或 Cancel
+        boolean allSuccess = results.values().stream().allMatch(r -> r);
+
+        if (allSuccess) {
+            // 3. 执行 Confirm
+            for (TccParticipant participant : participants) {
+                try {
+                    participant.confirmAction();
+                } catch (Exception e) {
+                    // Confirm 失败，记录日志，等待补偿
+                    log.error("Confirm failed: {}", participant.getId(), e);
+                    saveCompensateTask(participant);
+                }
+            }
+        } else {
+            // 4. 执行 Cancel
+            for (TccParticipant participant : participants) {
+                try {
+                    participant.cancelAction();
+                } catch (Exception e) {
+                    // Cancel 失败，记录日志，等待补偿
+                    log.error("Cancel failed: {}", participant.getId(), e);
+                    saveCompensateTask(participant);
+                }
+            }
+        }
+
+        // 5. 记录事务日志
+        saveTransactionLog(transactionId, results);
+    }
+}
+```
+
+## TCC 的问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TCC 的问题                                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 空回滚                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Try 没执行，Cancel 就被调用                          │   │
+│  │  解决：记录 Try 状态                                  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. 幂等性                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Try/Confirm/Cancel 可能被重复调用                     │   │
+│  │  解决：使用事务 ID + 状态检查                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 悬挂                                                │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Cancel 比 Confirm 先执行                             │   │
+│  │  解决：Confirm 执行后才允许 Cancel                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 问题解决
+
+```java
+// TCC 状态记录
+@Service
+public class TccStateManager {
+    @Autowired
+    private TccStateRepository stateRepository;
+
+    public void recordTry(String transactionId, String participantId) {
+        TccState state = new TccState();
+        state.setTransactionId(transactionId);
+        state.setParticipantId(participantId);
+        state.setStatus(TccStatus.TRYING);
+        stateRepository.save(state);
+    }
+
+    public boolean tryExecuted(String transactionId, String participantId) {
+        TccState state = stateRepository.findByTransactionAndParticipant(
+            transactionId, participantId);
+        return state != null && state.getStatus() == TccStatus.TRYING;
+    }
+
+    public void updateStatus(String transactionId, String participantId, TccStatus status) {
+        TccState state = stateRepository.findByTransactionAndParticipant(
+            transactionId, participantId);
+        if (state != null) {
+            state.setStatus(status);
+            stateRepository.save(state);
+        }
+    }
+}
+```
+
+## 总结
+
+TCC 是高性能分布式事务的常用方案。
+
+**原理**：
+
+- Try：预留资源
+- Confirm：确认使用
+- Cancel：释放资源
+
+**与 2PC 对比**：
+
+- 锁定时间更短
+- 性能更好
+- 可异步执行
+
+**三大问题**：
+
+- 空回滚：记录 Try 状态
+- 幂等性：状态检查 + 事务 ID
+- 悬挂：状态流转控制
+
+**适用场景**：
+
+- 高并发分布式事务
+- 对性能要求高的场景
+- 资源预留模式可行的业务

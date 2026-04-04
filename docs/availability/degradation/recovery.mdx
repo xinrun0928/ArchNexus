@@ -1,0 +1,434 @@
+---
+title: 降级恢复策略
+description: 如何正确恢复降级的功能
+---
+
+# 降级恢复策略
+
+你的系统降级了，故障恢复了，但降级的功能却恢复不了。
+
+问题出在哪？**没有正确的降级恢复策略**。
+
+降级恢复和降级一样重要，需要精心设计。
+
+## 恢复策略概述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    降级恢复策略                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  降级是紧急措施，恢复需要谨慎：                                  │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  降级：快速响应，保障基本可用                          │   │
+│  │  恢复：渐进谨慎，确保稳定运行                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  恢复策略的核心：                                              │
+│  - 确认故障已解决                                            │
+│  - 渐进恢复，先小流量后全量                                   │
+│  - 监控恢复过程                                              │
+│  - 快速回滚能力                                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 自动恢复
+
+### 基于指标的自动恢复
+
+```java
+// 基于指标的自动恢复
+@Service
+public class AutoRecoveryService {
+    private final Map<String, RecoveryConfig> configs = new ConcurrentHashMap<>();
+    private final Map<String, Integer> consecutiveHealthChecks = new ConcurrentHashMap<>();
+
+    // 配置恢复条件
+    public void configure(String feature, RecoveryConfig config) {
+        configs.put(feature, config);
+    }
+
+    // 健康检查
+    @Scheduled(fixedRate = 5000)
+    public void checkAndRecover() {
+        for (String feature : configs.keySet()) {
+            RecoveryConfig config = configs.get(feature);
+
+            if (isFeatureDegraded(feature)) {
+                if (isFeatureHealthy(feature, config)) {
+                    int consecutive = consecutiveHealthChecks
+                        .getOrDefault(feature, 0) + 1;
+                    consecutiveHealthChecks.put(feature, consecutive);
+
+                    // 连续健康检查达标后恢复
+                    if (consecutive >= config.getMinHealthyChecks()) {
+                        recoverFeature(feature);
+                        consecutiveHealthChecks.remove(feature);
+                    }
+                } else {
+                    consecutiveHealthChecks.put(feature, 0);
+                }
+            }
+        }
+    }
+
+    private boolean isFeatureHealthy(String feature, RecoveryConfig config) {
+        double errorRate = getErrorRate(feature);
+        double latency = getLatency(feature);
+
+        return errorRate < config.getErrorRateThreshold() &&
+               latency < config.getLatencyThreshold();
+    }
+
+    private void recoverFeature(String feature) {
+        // 触发恢复
+        log.info("自动恢复: {}", feature);
+        notificationService.alert("功能恢复: " + feature);
+    }
+}
+
+// 恢复配置
+@Data
+public class RecoveryConfig {
+    private double errorRateThreshold = 0.05;    // 5% 错误率
+    private double latencyThreshold = 500;         // 500ms 延迟
+    private int minHealthyChecks = 3;             // 连续 3 次健康检查后恢复
+    private int checkInterval = 5000;            // 检查间隔 5 秒
+}
+```
+
+### 基于时间的自动恢复
+
+```java
+// 基于时间的自动恢复
+@Service
+public class TimeBasedRecoveryService {
+    private final Map<String, Long> degradeStartTimes = new ConcurrentHashMap<>();
+    private final Map<String, Integer> degradeDurations = new ConcurrentHashMap<>();
+
+    // 降级时记录时间
+    public void degrade(String feature, int durationMinutes) {
+        degradeStartTimes.put(feature, System.currentTimeMillis());
+        degradeDurations.put(feature, durationMinutes);
+        log.info("功能降级: {}, 预计 {} 分钟后自动恢复", feature, durationMinutes);
+    }
+
+    // 定时检查恢复
+    @Scheduled(fixedRate = 10000)
+    public void checkTimeBasedRecovery() {
+        long now = System.currentTimeMillis();
+
+        for (Map.Entry<String, Long> entry : degradeStartTimes.entrySet()) {
+            String feature = entry.getKey();
+            Long startTime = entry.getValue();
+            Integer duration = degradeDurations.get(feature);
+
+            if (duration != null) {
+                long elapsed = now - startTime;
+                if (elapsed >= duration * 60 * 1000) {
+                    // 时间到了，尝试恢复
+                    if (isFeatureHealthy(feature)) {
+                        recover(feature);
+                        degradeStartTimes.remove(feature);
+                        degradeDurations.remove(feature);
+                    }
+                }
+            }
+        }
+    }
+
+    private boolean isFeatureHealthy(String feature) {
+        return getErrorRate(feature) < 0.05 && getLatency(feature) < 500;
+    }
+}
+```
+
+## 手动恢复
+
+### 审批流程
+
+```java
+// 恢复审批流程
+@Service
+public class RecoveryApprovalService {
+    public void requestRecovery(String feature, String reason, String operator) {
+        RecoveryRequest request = new RecoveryRequest();
+        request.setFeature(feature);
+        request.setReason(reason);
+        request.setOperator(operator);
+        request.setRequestTime(LocalDateTime.now());
+        request.setStatus(RequestStatus.PENDING);
+
+        // 发送审批通知
+        approvalService.sendNotification(request);
+
+        // 记录请求
+        auditLog.log("RECOVERY_REQUEST", feature, reason, operator);
+    }
+
+    public void approve(String requestId, String approver) {
+        RecoveryRequest request = getRequest(requestId);
+        request.setStatus(RequestStatus.APPROVED);
+        request.setApprover(approver);
+        request.setApproveTime(LocalDateTime.now());
+
+        // 执行恢复
+        recoveryService.recover(request.getFeature());
+
+        auditLog.log("RECOVERY_APPROVED", requestId, approver);
+    }
+
+    public void reject(String requestId, String approver, String reason) {
+        RecoveryRequest request = getRequest(requestId);
+        request.setStatus(RequestStatus.REJECTED);
+        request.setApprover(approver);
+        request.setRejectReason(reason);
+
+        auditLog.log("RECOVERY_REJECTED", requestId, approver, reason);
+    }
+}
+```
+
+### 恢复审批配置
+
+```java
+// 不同级别的恢复审批
+@Service
+public class RecoveryApprovalConfig {
+    private final Map<String, ApprovalLevel> approvalLevels = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void init() {
+        // 低影响功能：无需审批
+        approvalLevels.put("recommendation", ApprovalLevel.NONE);
+        approvalLevels.put("comment", ApprovalLevel.NONE);
+        approvalLevels.put("statistics", ApprovalLevel.NONE);
+
+        // 中影响功能：组长审批
+        approvalLevels.put("search", ApprovalLevel.TEAM_LEAD);
+        approvalLevels.put("review", ApprovalLevel.TEAM_LEAD);
+
+        // 高影响功能：经理审批
+        approvalLevels.put("order", ApprovalLevel.MANAGER);
+        approvalLevels.put("payment", ApprovalLevel.MANAGER);
+
+        // 关键功能：总监审批
+        approvalLevels.put("core-transaction", ApprovalLevel.DIRECTOR);
+    }
+
+    public boolean needsApproval(String feature) {
+        return approvalLevels.getOrDefault(feature, ApprovalLevel.MANAGER)
+            != ApprovalLevel.NONE;
+    }
+
+    public ApprovalLevel getApprovalLevel(String feature) {
+        return approvalLevels.getOrDefault(feature, ApprovalLevel.MANAGER);
+    }
+}
+
+public enum ApprovalLevel {
+    NONE,          // 无需审批
+    TEAM_LEAD,      // 组长
+    MANAGER,        // 经理
+    DIRECTOR        // 总监
+}
+```
+
+## 渐进恢复
+
+### 灰度恢复
+
+```java
+// 灰度恢复
+@Service
+public class GradualRecoveryService {
+    private final Map<String, Double> recoveryProgress = new ConcurrentHashMap<>();
+
+    // 渐进恢复
+    public void gradualRecover(String feature, int steps) {
+        double stepSize = 100.0 / steps;
+
+        for (int i = 1; i <= steps; i++) {
+            double percent = stepSize * i;
+            setRecoveryPercent(feature, percent);
+
+            if (i < steps) {
+                // 等待观察
+                try {
+                    Thread.sleep(30 * 1000);  // 每步等待 30 秒
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+
+                // 检查健康状态
+                if (!isFeatureHealthy(feature)) {
+                    log.warn("恢复过程发现异常，停止恢复: {}", feature);
+                    return;
+                }
+            }
+        }
+
+        log.info("渐进恢复完成: {}", feature);
+    }
+
+    private void setRecoveryPercent(String feature, double percent) {
+        recoveryProgress.put(feature, percent);
+
+        // 根据百分比调整流量
+        setTrafficPercent(feature, percent);
+    }
+}
+
+// 恢复控制
+@Service
+public class RecoveryController {
+    @Autowired
+    private GradualRecoveryService recoveryService;
+
+    @PostMapping("/recover/{feature}")
+    public ResponseEntity<String> recover(
+            @PathVariable String feature,
+            @RequestParam(defaultValue = "5") int steps) {
+
+        if (!isFeatureDegraded(feature)) {
+            return ResponseEntity.badRequest().body("功能未降级");
+        }
+
+        // 启动渐进恢复
+        recoveryService.gradualRecover(feature, steps);
+
+        return ResponseEntity.ok("恢复启动，步数: " + steps);
+    }
+
+    @PostMapping("/recover/{feature}/rollback")
+    public ResponseEntity<String> rollback(@PathVariable String feature) {
+        recoveryService.rollbackRecovery(feature);
+        return ResponseEntity.ok("回滚完成");
+    }
+}
+```
+
+### 流量恢复
+
+```java
+// 流量恢复策略
+@Service
+public class TrafficRecoveryService {
+    // 恢复步骤配置
+    private static final List<Double> RECOVERY_STEPS = List.of(
+        0.01,  // 1%
+        0.05,  // 5%
+        0.10,  // 10%
+        0.25,  // 25%
+        0.50,  // 50%
+        0.75,  // 75%
+        1.00   // 100%
+    );
+
+    public void recoverWithTraffic(String feature) {
+        for (Double step : RECOVERY_STEPS) {
+            log.info("恢复流量到: {}%", (int)(step * 100));
+
+            // 调整流量比例
+            trafficRouter.setTrafficPercent(feature, step);
+
+            // 观察
+            try {
+                Thread.sleep(60 * 1000);  // 每步等待 1 分钟
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+
+            // 健康检查
+            if (!isHealthy(feature)) {
+                log.warn("健康检查失败，回滚");
+                rollback(feature);
+                return;
+            }
+        }
+
+        log.info("流量恢复完成: {}", feature);
+    }
+}
+```
+
+## 恢复监控
+
+### 恢复过程监控
+
+```java
+// 恢复过程监控
+@Service
+public class RecoveryMonitorService {
+    private final Map<String, RecoveryMetrics> metrics = new ConcurrentHashMap<>();
+
+    public void recordRecovery(String feature, RecoveryResult result) {
+        RecoveryMetrics m = metrics.computeIfAbsent(feature, k -> new RecoveryMetrics());
+        m.record(result);
+
+        // 检查恢复后的健康状态
+        if (result == RecoveryResult.SUCCESS) {
+            monitorHealth(feature);
+        }
+    }
+
+    private void monitorHealth(String feature) {
+        // 持续监控 5 分钟
+        for (int i = 0; i < 60; i++) {  // 5 分钟，每 5 秒一次
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                break;
+            }
+
+            if (!isHealthy(feature)) {
+                log.error("恢复后健康检查失败: {}", feature);
+                alert("恢复后健康检查失败: " + feature);
+            }
+        }
+    }
+}
+
+// 监控告警
+@Service
+public class RecoveryAlertService {
+    public void alert(String message) {
+        // 发送告警
+        smsService.send("告警", message);
+        emailService.send("告警", message);
+        slackService.send("#oncall", message);
+
+        // 记录
+        auditLog.error("RECOVERY_ALERT", message);
+    }
+}
+```
+
+## 总结
+
+降级恢复需要精心设计，确保安全可靠。
+
+**恢复策略**：
+
+- 自动恢复：基于指标/时间
+- 手动恢复：审批流程
+- 渐进恢复：灰度/流量
+
+**恢复原则**：
+
+- 确认故障已解决
+- 渐进谨慎恢复
+- 持续监控健康
+- 快速回滚能力
+
+**关键指标**：
+
+- 连续健康检查次数
+- 恢复耗时
+- 回滚次数

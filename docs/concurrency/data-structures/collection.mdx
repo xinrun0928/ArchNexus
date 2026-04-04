@@ -1,0 +1,283 @@
+---
+title: 并发集合
+description: 线程安全集合的实现原理与使用场景
+---
+
+# 并发集合
+
+JDK 提供了一套完整的并发集合，替代了 `Collections.synchronizedMap()` 等老旧方案。
+
+并发集合在数据结构层面解决了线程安全问题，比在应用层加锁更高效。
+
+## 集合分类
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    并发集合分类                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Map                                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ConcurrentHashMap / ConcurrentSkipListMap          │   │
+│  │  ConcurrentHashMapV8（Java 8+分段锁优化）            │   │
+│  │  ConcurrentSkipListMap（跳表，有序）                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Set                                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ConcurrentHashMap.newKeySet()                        │   │
+│  │  ConcurrentSkipListSet                                │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ List                                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  CopyOnWriteArrayList                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## ConcurrentHashMap
+
+```java
+// ConcurrentHashMap 核心操作
+public class ConcurrentHashMapExample {
+    private final ConcurrentHashMap<String, User> cache =
+        new ConcurrentHashMap<>();
+
+    // 原子操作：computeIfAbsent
+    public User getOrCreate(String userId) {
+        // 原子操作：不存在时才创建
+        return cache.computeIfAbsent(userId, id -> createUser(id));
+    }
+
+    // 原子操作：putIfAbsent
+    public boolean putIfAbsent(String userId, User user) {
+        // 只有不存在时才插入
+        return cache.putIfAbsent(userId, user) == null;
+    }
+
+    // 批量操作
+    public Map<String, User> getUsers(Set<String> userIds) {
+        // 不会抛出 ConcurrentModificationException
+        return cache.getAll(userIds);
+    }
+
+    // 搜索操作
+    public void processExpired() {
+        // 函数式搜索
+        cache.forEach(1, (id, user) -> {
+            if (user.isExpired()) {
+                cache.remove(id);
+            }
+        });
+    }
+}
+```
+
+## 同步 vs 并发对比
+
+```java
+// 性能对比：Collections.synchronizedMap vs ConcurrentHashMap
+public class PerformanceComparison {
+    // 老方案：全局锁
+    private final Map<String, Object> syncMap =
+        Collections.synchronizedMap(new HashMap<>());
+
+    // 新方案：分段锁
+    private final ConcurrentMap<String, Object> concurrentMap =
+        new ConcurrentHashMap<>();
+
+    // 老方案：所有操作串行化
+    public void syncMapOperation(String key, Object value) {
+        synchronized (syncMap) {
+            syncMap.put(key, value);
+            syncMap.get(key);
+        }
+    }
+
+    // 新方案：并发读写
+    public void concurrentMapOperation(String key, Object value) {
+        concurrentMap.put(key, value);
+        concurrentMap.get(key);
+    }
+
+    // 并发度对比
+    // syncMap: 1 个线程同时访问
+    // concurrentMap: 16 个桶分段锁，并发度 16
+}
+```
+
+## 统计聚合
+
+```java
+// ConcurrentHashMap 聚合统计
+public class AggregationExample {
+    private final ConcurrentHashMap<String, AtomicLong> counters =
+        new ConcurrentHashMap<>();
+
+    // 线程安全的计数
+    public void increment(String event) {
+        counters.computeIfAbsent(event, k -> new AtomicLong())
+            .incrementAndGet();
+    }
+
+    // 合并计数器
+    public void mergeCount(String event, long count) {
+        counters.computeIfAbsent(event, k -> new AtomicLong())
+            .addAndGet(count);
+    }
+
+    // 批量统计
+    public Map<String, Long> getStatistics() {
+        Map<String, Long> result = new HashMap<>();
+        counters.forEach(1, (k, v) -> result.put(k, v.get()));
+        return result;
+    }
+
+    // 搜索最高频事件
+    public String getTopEvent() {
+        return counters.search(1, (k, v) ->
+            v.get() == counters.values().stream()
+                .mapToLong(AtomicLong::get).max().orElse(0)
+            ? k : null
+        );
+    }
+}
+```
+
+## 缓存实现
+
+```java
+// 基于 ConcurrentHashMap 的缓存
+@Service
+public class CacheService {
+    private final ConcurrentHashMap<String, CacheEntry> cache =
+        new ConcurrentHashMap<>();
+
+    // 最大容量
+    private static final int MAX_SIZE = 10000;
+
+    // 过期时间
+    private static final long EXPIRE_MILLIS = 5 * 60 * 1000;
+
+    public Object get(String key) {
+        CacheEntry entry = cache.get(key);
+        if (entry == null) {
+            return null;
+        }
+
+        if (System.currentTimeMillis() - entry.createTime > EXPIRE_MILLIS) {
+            cache.remove(key);
+            return null;
+        }
+
+        return entry.value;
+    }
+
+    public void put(String key, Object value) {
+        if (cache.size() >= MAX_SIZE) {
+            // 淘汰最老的条目
+            evictOldest();
+        }
+
+        cache.put(key, new CacheEntry(value));
+    }
+
+    private void evictOldest() {
+        cache.reduce(1,
+            (k, v) -> {
+                if (System.currentTimeMillis() - v.createTime > EXPIRE_MILLIS) {
+                    return new AbstractMap.SimpleEntry<>(k, v.createTime);
+                }
+                return null;
+            },
+            (a, b) -> a != null && b != null && a.getValue() < b.getValue() ? a : b
+        );
+    }
+
+    private static class CacheEntry {
+        final Object value;
+        final long createTime;
+
+        CacheEntry(Object value) {
+            this.value = value;
+            this.createTime = System.currentTimeMillis();
+        }
+    }
+}
+```
+
+## 跳表集合
+
+```java
+// ConcurrentSkipListMap / ConcurrentSkipListSet
+public class SkipListExample {
+    // 有序并发 Map
+    private final ConcurrentSkipListMap<Integer, String> sortedMap =
+        new ConcurrentSkipListMap<>();
+
+    // 有序并发 Set
+    private final ConcurrentSkipListSet<Task> taskSet =
+        new ConcurrentSkipListSet<>(Comparator.comparing(Task::getPriority));
+
+    // 范围查询
+    public Map<Integer, String> getRange(int from, int to) {
+        // 闭区间查询
+        return sortedMap.subMap(from, true, to, true);
+    }
+
+    // 第一个/最后一个
+    public String getFirst() {
+        return sortedMap.firstEntry().getValue();
+    }
+
+    public String getLast() {
+        return sortedMap.lastEntry().getValue();
+    }
+
+    // 降序遍历
+    public void descendingTraverse() {
+        sortedMap.descendingMap().forEach((k, v) -> {
+            System.out.println(k + ": " + v);
+        });
+    }
+}
+```
+
+## 总结
+
+并发集合是线程安全编程的基础组件。
+
+**ConcurrentHashMap**：
+
+- 分段锁（Java 7）/ CAS + synchronized（Java 8+）
+- 原子操作：computeIfAbsent、putIfAbsent
+- 比 synchronizedMap 性能高一个数量级
+
+**ConcurrentSkipListMap**：
+
+- 有序并发 Map
+- 跳表实现，支持范围查询
+- 替代 TreeMap
+
+**ConcurrentSkipListSet**：
+
+- 有序并发 Set
+- 替代 TreeSet
+
+**CopyOnWriteArrayList**：
+
+- 读多写少场景
+- 读写不互斥
+
+**核心认知**：并发集合在内部实现了高效的线程安全，比在应用层加锁更简单、更高效。优先使用 JDK 提供的并发集合。

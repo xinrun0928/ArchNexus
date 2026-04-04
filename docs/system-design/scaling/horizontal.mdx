@@ -1,0 +1,506 @@
+---
+title: 水平扩展
+description: 通过增加节点提升系统容量
+---
+
+# 水平扩展
+
+你的系统流量增长了 10 倍，你的第一反应是升级服务器配置。但升级到顶配后，流量又增长了 10 倍。你该怎么办？
+
+水平扩展（Scale Out）正是为了解决这个问题：**不是买更大的服务器，而是买更多的服务器**。
+
+## 水平扩展 vs 垂直扩展
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    扩展策略对比                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  垂直扩展（Scale Up）                                          │
+│  ────────────────────                                           │
+│                    配置更高                                      │
+│           ┌─────────────┐                                     │
+│           │ Server      │                                     │
+│           │ 8C 64G    │                                     │
+│           └─────────────┘                                     │
+│                                                                  │
+│  问题：单点瓶颈、成本非线性增长、有上限                           │
+│                                                                  │
+│  水平扩展（Scale Out）                                         │
+│  ────────────────────                                           │
+│           ┌───────┐ ┌───────┐ ┌───────┐                      │
+│           │Srv 1 │ │Srv 2 │ │Srv 3 │                      │
+│           │ 4C   │ │ 4C   │ │ 4C   │                      │
+│           └───────┘ └───────┘ └───────┘                      │
+│                                                                  │
+│  优势：无上限、成本线性、易于故障隔离                            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 水平扩展的前提：无状态设计
+
+水平扩展的核心是**无状态设计**：每个节点都可以处理任何请求。
+
+### 有状态 vs 无状态
+
+```
+有状态：请求必须路由到特定服务器
+┌─────────────────────────────────────────────────────────┐
+│  请求 A ──▶ Server A（Session 存在 A）                      │
+│  请求 B ──▶ Server A（必须路由到 A）                      │
+│  问题：Server A 挂了，请求无法处理                          │
+└─────────────────────────────────────────────────────────┘
+
+无状态：请求可以路由到任意服务器
+┌─────────────────────────────────────────────────────────┐
+│  请求 A ──▶ LB ──▶ Server A                             │
+│  请求 B ──▶ LB ──▶ Server B                             │
+│  请求 C ──▶ LB ──▶ Server C                             │
+│  任何服务器都能处理任何请求                                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 无状态实现
+
+```java
+// 错误：本地存储会话
+public class StatefulService {
+    private final Map<String, Session> localSessions = new HashMap<>();
+
+    public Session getSession(String sessionId) {
+        return localSessions.get(sessionId);  // 只能访问本节点
+    }
+}
+
+// 正确：外部存储会话
+public class StatelessService {
+    private final RedisTemplate<String, Session> redis;
+
+    public Session getSession(String sessionId) {
+        return redis.opsForValue().get("session:" + sessionId);  // 任意节点可访问
+    }
+}
+
+// 错误：本地缓存全部数据
+public class StatefulCache {
+    private final Map<String, Object> cache = new ConcurrentHashMap<>();
+
+    public Object get(String key) {
+        return cache.get(key);  // 本地缓存，其他节点无法访问
+    }
+}
+
+// 正确：分布式缓存
+public class StatelessCache {
+    private final RedisTemplate<String, Object> redis;
+
+    public Object get(String key) {
+        return redis.opsForValue().get("cache:" + key);  // 共享缓存
+    }
+}
+```
+
+## 应用层水平扩展
+
+### 无状态服务
+
+```java
+// 无状态服务可以水平扩展
+@RestController
+public class OrderController {
+    @Autowired
+    private OrderService orderService;
+    @Autowired
+    private RedisTemplate redis;  // 共享存储
+    @Autowired
+    private KafkaTemplate kafka;   // 异步消息
+
+    // 任何节点都能处理
+    @PostMapping("/orders")
+    public ResponseEntity<Order> create(@RequestBody CreateOrderRequest request) {
+        Order order = orderService.create(request);
+        return ResponseEntity.ok(order);
+    }
+}
+
+// 服务本身无状态，部署多份即可
+// kubernetes deployment
+```
+
+```yaml
+# Kubernetes Deployment：水平扩展
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3  # 副本数，可以随时调整
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    spec:
+      containers:
+        - name: order-service
+          image: myrepo/order-service:v1
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 8080
+---
+# HPA：自动水平扩展
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+## 数据库水平扩展
+
+### 读写分离
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    读写分离架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────┐                                                   │
+│  │   LB    │                                                   │
+│  └───┬───┘                                                     │
+│      │                                                         │
+│  ┌───┴───┐                                                   │
+│  │ 写    │                                                   │
+│  └───────┘                                                   │
+│      │                                                         │
+│      ▼                                                         │
+│  ┌─────────┐                                                   │
+│  │ Primary │                                                   │
+│  │   DB    │                                                   │
+│  └─────┬───┘                                                   │
+│        │ 同步                                                  │
+│  ┌─────┴─────┐                                                 │
+│  │           │                                                 │
+│  ▼           ▼                                                 │
+│ ┌────┐   ┌────┐                                             │
+│ │Replica│   │Replica│                                            │
+│ └────┘   └────┘                                             │
+│                                                                  │
+│  写：主库                                                     │
+│  读：从库                                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// 读写分离配置
+@Configuration
+public class DataSourceConfig {
+
+    @Bean
+    public DataSource routingDataSource() {
+        RoutingDataSource routingDataSource = new RoutingDataSource();
+
+        // 配置主库
+        DataSource master = createDataSource("jdbc:mysql://master:3306", "root", "password");
+
+        // 配置从库
+        DataSource slave1 = createDataSource("jdbc:mysql://slave1:3306", "root", "password");
+        DataSource slave2 = createDataSource("jdbc:mysql://slave2:3306", "root", "password");
+
+        Map<Object, Object> targetDataSources = new HashMap<>();
+        targetDataSources.put("master", master);
+        targetDataSources.put("slave1", slave1);
+        targetDataSources.put("slave2", slave2);
+
+        routingDataSource.setTargetDataSources(targetDataSources);
+        routingDataSource.setDefaultTargetDataSource(master);
+
+        return routingDataSource;
+    }
+}
+
+// 路由策略
+public class RoutingDataSource extends AbstractRoutingDataSource {
+    private static final ThreadLocal<String> contextHolder = new ThreadLocal<>();
+
+    public static void setReadOnly() {
+        contextHolder.set("slave");
+    }
+
+    public static void setMaster() {
+        contextHolder.set("master");
+    }
+
+    public static void clear() {
+        contextHolder.remove();
+    }
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        String key = contextHolder.get();
+        return key != null ? key : "master";
+    }
+}
+
+// 使用：读使用 @Transactional(readOnly = true) 自动路由到从库
+@Service
+public class OrderService {
+    @Transactional(readOnly = true)  // 自动路由到从库
+    public Order findById(Long id) {
+        return orderRepository.findById(id);
+    }
+
+    @Transactional  // 默认路由到主库
+    public Order create(Order order) {
+        return orderRepository.save(order);
+    }
+}
+```
+
+### 分库分表
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    分库分表架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────┐                                                   │
+│  │   LB    │                                                   │
+│  └───┬───┘                                                     │
+│      │                                                         │
+│  ┌───┴───┐                                                   │
+│  │ Shard  │                                                   │
+│  │ Router │                                                   │
+│  └───┬───┘                                                     │
+│      │                                                         │
+│  ┌───┴───┬───────┬───────┐                                      │
+│  ▼       ▼       ▼       ▼                                      │
+│ ┌────┐ ┌────┐ ┌────┐ ┌────┐                                   │
+│ │DB0 │ │DB1 │ │DB2 │ │DB3 │                                   │
+│ └────┘ └────┘ └────┘ └────┘                                   │
+│  sharding_key % 4 = 0    sharding_key % 4 = 1                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// ShardingSphere 配置
+@Configuration
+public class ShardingConfig {
+    @Bean
+    public DataSource dataSource() {
+        ShardingRuleConfiguration ruleConfig = new ShardingRuleConfiguration();
+
+        // 配置分片规则：user_id % 2
+        ShardingTableRuleConfiguration orderTableRule =
+            new ShardingTableRuleConfiguration("t_order", "ds_${0..1}.t_order_${0..3}");
+
+        orderTableRule.setTableShardingStrategy(
+            new StandardShardingStrategyConfiguration(
+                "user_id",
+                new ModShardingAlgorithm("4")
+            )
+        );
+
+        // 配置数据源规则
+        ruleConfig.getTableRuleConfigs().add(orderTableRule);
+        ruleConfig.setDefaultDataSourceName("ds_0");
+
+        // 配置数据源
+        Map<String, DataSource> dataSourceMap = new HashMap<>();
+        dataSourceMap.put("ds_0", createDataSource("jdbc:mysql://host0:3306"));
+        dataSourceMap.put("ds_1", createDataSource("jdbc:mysql://host1:3306"));
+
+        DataSource dataSource = ShardingDataSourceFactory.createDataSource(
+            dataSourceMap,
+            ruleConfig,
+            new PropertiesConfiguration()
+        );
+
+        return dataSource;
+    }
+}
+```
+
+## 缓存水平扩展
+
+### Redis Cluster
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Redis Cluster 架构                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────┐                                                   │
+│  │  Client │                                                   │
+│  └───┬───┘                                                     │
+│      │                                                         │
+│  ┌───┴───┐                                                   │
+│  │ Redis  │                                                   │
+│  │Cluster │                                                   │
+│  └───┬───┘                                                     │
+│      │                                                         │
+│  ┌───┴───┬───────┬───────┐                                      │
+│  ▼       ▼       ▼       ▼                                      │
+│ ┌────┐ ┌────┐ ┌────┐ ┌────┐                                   │
+│ │Slot│ │Slot│ │Slot│ │Slot│                                   │
+│ │ 0  │ │ 5461│ │10922││16383│                                  │
+│ └────┘ └────┘ └────┘ └────┘                                   │
+│                                                                  │
+│  16384 个 slot，分散在多个节点                                  │
+│  key CRC16(key) % 16384 决定 slot                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// Redis Cluster 客户端
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
+        return template;
+    }
+}
+
+// 使用：无需关心数据分片，客户端自动路由
+@Service
+public class CacheService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public void cacheUser(User user) {
+        // 自动分片到正确的节点
+        redisTemplate.opsForValue().set("user:" + user.getId(), user);
+    }
+}
+```
+
+## 消息队列水平扩展
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Kafka 分区架构                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Topic: order-events                                            │
+│  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐                      │
+│  │Part 0│ │Part 1│ │Part 2│ │Part 3│                      │
+│  └───────┘ └───────┘ └───────┘ └───────┘                      │
+│                                                                  │
+│  Producer: 根据 key 路由到分区（默认 key.hashCode() % partitions）  │
+│  Consumer: 消费者组内每个消费者消费若干分区                       │
+│                                                                  │
+│  扩展：增加分区数 → 消费者可以增加                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// Kafka Producer：按业务 key 分区
+@Service
+public class OrderEventProducer {
+    @Autowired
+    private KafkaTemplate<String, OrderEvent> kafkaTemplate;
+
+    // 按 userId 分区，同一用户的订单在同一分区有序
+    public void sendOrderEvent(Order order) {
+        kafkaTemplate.send("order-events", order.getUserId().toString(), new OrderEvent(order));
+    }
+}
+
+// Kafka Consumer：消费者组内并行消费
+@Service
+public class OrderEventConsumer {
+    @KafkaListener(topics = "order-events", groupId = "order-consumer-group")
+    public void handle(OrderEvent event) {
+        // 每个分区被组内一个消费者消费
+        processOrderEvent(event);
+    }
+}
+```
+
+## 水平扩展的挑战
+
+### 数据一致性
+
+```
+问题：多节点写入，如何保证一致性？
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    一致性挑战                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌───────┐   ┌───────┐   ┌───────┐                             │
+│  │Node A │   │Node B │   │Node C │                             │
+│  │write  │   │write  │   │write  │                             │
+│  └───────┘   └───────┘   └───────┘                             │
+│       │         │         │                                      │
+│       └─────────┼─────────┘                                      │
+│                 ▼                                                │
+│          ┌──────────────┐                                       │
+│          │   Database   │                                       │
+│          └──────────────┘                                       │
+│                                                                  │
+│  问题：并发写入、分布式锁、事务一致                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 会话亲和性
+
+```
+问题：分布式环境下会话如何共享？
+
+方案：
+1. 外部会话存储（Redis）
+2. JWT 无状态会话
+3. 一致性哈希
+```
+
+## 总结
+
+水平扩展是通过增加节点来提升系统容量的策略。
+
+**核心要点**：
+
+- 无状态设计是水平扩展的前提
+- 应用层：无状态服务 + 负载均衡
+- 数据库：读写分离、分库分表
+- 缓存：Redis Cluster
+- 消息队列：Kafka 分区
+
+**优势**：
+
+- 无上限，可持续扩展
+- 成本线性增长
+- 故障隔离，单点故障不影响全局
+- 更容易实现高可用
+
+**挑战**：
+
+- 数据一致性
+- 会话管理
+- 分布式事务
+- 操作复杂度增加

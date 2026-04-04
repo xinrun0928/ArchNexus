@@ -1,0 +1,388 @@
+---
+title: 固定窗口与滑动窗口
+description: 基于窗口的限流算法详解
+---
+
+# 固定窗口与滑动窗口
+
+你想实现一个简单的限流器，但又担心固定窗口的边界问题。
+
+问题出在哪？**滑动窗口可以解决固定窗口的问题，但实现更复杂**。
+
+## 固定窗口算法
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    固定窗口原理                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  将时间划分为固定大小的「窗口」，统计每个窗口内的请求数        │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │                    时间轴                                │   │
+│  │  ◀─────── 1 分钟 ───────▶◀─────── 1 分钟 ───────▶  │   │
+│  │                                                         │   │
+│  │  窗口 1              窗口 2              窗口 3       │   │
+│  │  00:00-01:00         01:00-02:00         02:00-03:00  │   │
+│  │                                                         │   │
+│  │  限制: 100/min                                             │   │
+│  │  窗口 1: 80 请求 ✓                                       │   │
+│  │  窗口 2: 150 请求 ✗                                     │   │
+│  │  窗口 3: 50 请求 ✓                                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```java
+// 固定窗口限流器
+public class FixedWindowRateLimiter {
+    private final int limit;                    // 窗口内最大请求数
+    private final Duration windowSize;         // 窗口大小
+    private final Map<Long, AtomicInteger> windows = new ConcurrentHashMap<>();
+
+    public FixedWindowRateLimiter(int limit, Duration windowSize) {
+        this.limit = limit;
+        this.windowSize = windowSize;
+    }
+
+    public boolean tryAcquire() {
+        long windowKey = getWindowKey();
+
+        AtomicInteger counter = windows.computeIfAbsent(
+            windowKey, k -> new AtomicInteger(0));
+
+        return counter.updateAndGet(current -> {
+            if (current >= limit) {
+                return current;  // 超过限制
+            }
+            return current + 1;  // +1
+        }) <= limit;
+    }
+
+    private long getWindowKey() {
+        return System.currentTimeMillis() / windowSize.toMillis();
+    }
+
+    // 清理过期窗口（可选）
+    public void cleanup() {
+        long expiredKey = getWindowKey() - 1;
+        windows.remove(expiredKey);
+    }
+}
+```
+
+### 边界问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    固定窗口边界问题                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  场景：限流 100/min                                            │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  问题：                                                 │   │
+│  │                                                         │   │
+│  │  00:00:59 ──▶ 100 个请求（窗口 1，接受）           │   │
+│  │  00:01:00 ──▶ 窗口重置                              │   │
+│  │  00:01:01 ──▶ 100 个新请求（窗口 2，接受）           │   │
+│  │                                                         │   │
+│  │  结果：2 分钟内处理了 200 个请求                      │   │
+│  │  问题：峰值时可以达到 2 倍限制                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 滑动窗口算法
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    滑动窗口原理                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  统计当前时刻之前的整个时间窗口内的请求数                        │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │                    时间轴                               │   │
+│  │  ◀──────────────────────────────────────────────▶      │   │
+│  │                        ↑                                 │   │
+│  │                     当前时刻                             │   │
+│  │                                                         │   │
+│  │  ◀─────── 1 分钟窗口 ───────▶                        │   │
+│  │  只统计窗口内的请求                                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  优势：不存在边界问题，统计精确                                 │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 滑动窗口实现
+
+```java
+// 滑动窗口限流器（基于计数器）
+public class SlidingWindowRateLimiter {
+    private final int limit;                      // 窗口内最大请求数
+    private final Duration windowSize;           // 窗口大小
+    private final ConcurrentLinkedDeque<Long> timestamps = new ConcurrentLinkedDeque<>();
+
+    public SlidingWindowRateLimiter(int limit, Duration windowSize) {
+        this.limit = limit;
+        this.windowSize = windowSize;
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSize.toMillis();
+
+        // 移除窗口外的请求
+        while (!timestamps.isEmpty() && timestamps.peekFirst() <= windowStart) {
+            timestamps.pollFirst();
+        }
+
+        // 检查是否超过限制
+        if (timestamps.size() < limit) {
+            timestamps.addLast(now);
+            return true;
+        }
+
+        return false;
+    }
+
+    public int getCurrentCount() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSize.toMillis();
+
+        return (int) timestamps.stream()
+            .filter(t -> t > windowStart)
+            .count();
+    }
+}
+```
+
+### 滑动日志算法
+
+```java
+// 滑动日志算法（记录每个请求的时间戳）
+public class SlidingLogRateLimiter {
+    private final int limit;                      // 窗口内最大请求数
+    private final Duration windowSize;           // 窗口大小
+    private final Map<String, ConcurrentLinkedDeque<Long>> userLogs = new ConcurrentHashMap<>();
+
+    public SlidingLogRateLimiter(int limit, Duration windowSize) {
+        this.limit = limit;
+        this.windowSize = windowSize;
+    }
+
+    public boolean tryAcquire(String userId) {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSize.toMillis();
+
+        ConcurrentLinkedDeque<Long> timestamps =
+            userLogs.computeIfAbsent(userId, k -> new ConcurrentLinkedDeque<>());
+
+        synchronized (timestamps) {
+            // 移除窗口外的请求
+            while (!timestamps.isEmpty() && timestamps.peekFirst() <= windowStart) {
+                timestamps.pollFirst();
+            }
+
+            // 检查并记录
+            if (timestamps.size() < limit) {
+                timestamps.addLast(now);
+                return true;
+            }
+
+            return false;
+        }
+    }
+}
+```
+
+## 滑动窗口 vs 滑动日志
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    滑动窗口 vs 滑动日志                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 滑动窗口（计数器）                                     │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ - 存储：只存储当前窗口的请求数                        │   │
+│  │ - 时间复杂度：O(1) 或 O(n) 清理                    │   │
+│  │ - 优点：内存占用低                                   │   │
+│  │ - 缺点：精度不如滑动日志                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 滑动日志                                               │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ - 存储：记录每个请求的时间戳                          │   │
+│  │ - 时间复杂度：O(1) 插入，O(n) 清理                  │   │
+│  │ - 优点：统计精确                                       │   │
+│  │ - 缺点：高并发时内存占用大                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  选择建议：                                                    │
+│  - 一般限流：滑动窗口                                         │
+│  - 精确限流：滑动日志                                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 滑动窗口复合格流
+
+### 多级滑动窗口
+
+```java
+// 多级滑动窗口（秒级 + 分钟级）
+public class MultiLevelSlidingWindow {
+    // 秒级窗口
+    private final SlidingWindowRateLimiter perSecond = new SlidingWindowRateLimiter(50, Duration.ofSeconds(1));
+    // 分钟级窗口
+    private final SlidingWindowRateLimiter perMinute = new SlidingWindowRateLimiter(2000, Duration.ofMinutes(1));
+
+    public boolean tryAcquire() {
+        // 同时检查秒级和分钟级限制
+        return perSecond.tryAcquire() && perMinute.tryAcquire();
+    }
+}
+```
+
+### Redis 滑动窗口
+
+```lua
+-- Redis 滑动窗口实现
+-- KEYS[1] = 限流 key
+-- ARGV[1] = 窗口大小（毫秒）
+-- ARGV[2] = 限制数
+-- ARGV[3] = 当前时间戳
+
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local windowStart = now - window
+
+-- 移除窗口外的记录
+redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+-- 获取当前窗口内的请求数
+local current = redis.call('ZCARD', key)
+
+if current < limit then
+    -- 添加新请求
+    redis.call('ZADD', key, now, now .. ':' .. math.random())
+    redis.call('EXPIRE', key, math.ceil(window / 1000) + 1)
+    return 1  -- 允许
+else
+    return 0  -- 拒绝
+end
+```
+
+```java
+// Java Redis 滑动窗口实现
+@Service
+public class RedisSlidingWindowRateLimiter {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public boolean tryAcquire(String key, int limit, Duration window) {
+        String fullKey = "rate_limit:" + key;
+        long now = System.currentTimeMillis();
+
+        String script = """
+            local key = KEYS[1]
+            local window = tonumber(ARGV[1])
+            local limit = tonumber(ARGV[2])
+            local now = tonumber(ARGV[3])
+            local windowStart = now - window
+
+            redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+            local current = redis.call('ZCARD', key)
+
+            if current < limit then
+                redis.call('ZADD', key, now, now .. ':' .. math.random())
+                redis.call('EXPIRE', key, math.ceil(window / 1000) + 1)
+                return 1
+            else
+                return 0
+            end
+            """;
+
+        Long result = redisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            Collections.singletonList(fullKey),
+            window.toMillis(), limit, now
+        );
+
+        return result != null && result == 1;
+    }
+}
+```
+
+## 算法对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    窗口算法对比                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌────────────┬───────────┬───────────┬───────────┬────────┐ │
+│  │ 算法        │ 边界问题  │ 实现难度  │ 内存占用  │ 精确度 │ │
+│  ├────────────┼───────────┼───────────┼───────────┼────────┤ │
+│  │ 固定窗口   │ 有        │ 低        │ 低        │ 中     │ │
+│  │ 滑动窗口   │ 无        │ 中        │ 中        │ 中     │ │
+│  │ 滑动日志   │ 无        │ 中        │ 高        │ 高     │ │
+│  └────────────┴───────────┴───────────┴───────────┴────────┘ │
+│                                                                  │
+│  选择建议：                                                    │
+│  - 简单限流：固定窗口（注意边界问题）                        │
+│  - 一般生产环境：滑动窗口                                      │
+│  - 精确限流：滑动日志 / Redis ZSET                           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+固定窗口和滑动窗口是两种基础的限流算法。
+
+**固定窗口**：
+
+- 实现简单
+- 有边界问题
+- 适合粗粒度限流
+
+**滑动窗口**：
+
+- 统计精确
+- 无边界问题
+- 实现稍复杂
+
+**滑动日志**：
+
+- 最精确
+- 内存占用较高
+- 适合精确限流
+
+**选择建议**：
+
+- 入门级：固定窗口
+- 生产级：滑动窗口
+- 精确级：滑动日志 / Redis ZSET

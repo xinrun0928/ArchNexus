@@ -1,0 +1,345 @@
+---
+title: 数据迁移实战
+description: 数据库迁移的数据同步与校验实践
+---
+
+# 数据迁移实战
+
+你的数据库需要升级，但数据不能丢，业务不能停。
+
+数据迁移是高风险操作，需要周密的计划和充分的验证。
+
+## 迁移方案评估
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    数据迁移方案对比                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 方案一：停机迁移                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  流程：停止应用 → 迁移数据 → 启动新系统         │   │
+│  │                                                         │   │
+│  │  优点：简单，数据一致性好                          │   │
+│  │  缺点：业务中断时间长                              │   │
+│  │                                                         │   │
+│  │  适用场景：数据量小，可接受停机窗口               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 方案二：双写迁移                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  流程：新旧系统双写 → 增量同步 → 切换流量         │   │
+│  │                                                         │   │
+│  │  优点：业务影响小，可回退                          │   │
+│  │  缺点：实现复杂，需处理数据冲突                     │   │
+│  │                                                         │   │
+│  │  适用场景：数据量大，需要灰度切换                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 方案三：CDC 迁移                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  流程：监听 binlog → 实时同步 → 切换流量          │   │
+│  │                                                         │   │
+│  │  优点：实时同步，延迟低                            │   │
+│  │  缺点：需要 CDC 工具，配置复杂                     │   │
+│  │                                                         │   │
+│  │  适用场景：数据量大，要求实时同步                  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 停机迁移
+
+### 数据量评估
+
+```sql
+-- 评估迁移时间
+SELECT
+    table_name,
+    table_rows,
+    data_length / 1024 / 1024 AS data_mb,
+    index_length / 1024 / 1024 AS index_mb
+FROM information_schema.tables
+WHERE table_schema = 'mydb'
+ORDER BY (data_length + index_length) DESC
+LIMIT 10;
+```
+
+```bash
+# 使用 mysqldump 迁移
+# 估算时间
+# 100GB 数据约需 2-4 小时
+
+# 全量导出
+mysqldump -h source_host -u root -p \
+    --single-transaction \
+    --routines \
+    --triggers \
+    --events \
+    --master-data=2 \
+    mydb | gzip > backup.sql.gz
+
+# 全量导入
+gunzip < backup.sql.gz | mysql -h target_host -u root -p mydb
+```
+
+### 无锁迁移
+
+```bash
+# pt-online-schema-change
+# 在线修改表结构，不锁表
+
+pt-online-schema-change \
+    --alter "ADD COLUMN new_col VARCHAR(100)" \
+    --charset=utf8mb4 \
+    --execute \
+    D=mydb,t=users
+```
+
+## 双写迁移
+
+```java
+// 双写实现
+@Service
+public class DualWriteService {
+    @Autowired private PrimaryDataSource primaryDataSource;
+    @Autowired private SecondaryDataSource secondaryDataSource;
+
+    @Transactional
+    public void saveUser(User user) {
+        // 1. 写入主库
+        jdbcTemplate(primaryDataSource).update(
+            "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+            user.getId(), user.getName(), user.getEmail()
+        );
+
+        // 2. 写入从库（异步）
+        asyncExecutor.execute(() -> {
+            try {
+                jdbcTemplate(secondaryDataSource).update(
+                    "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+                    user.getId(), user.getName(), user.getEmail()
+                );
+            } catch (Exception e) {
+                log.error("Failed to write to secondary", e);
+            }
+        });
+    }
+}
+```
+
+```java
+// 数据补偿
+@Service
+public class DataCompensationService {
+    @Autowired private OffsetStore offsetStore;
+
+    @Scheduled(fixedDelay = 60000)  // 每分钟执行
+    public void compensate() {
+        // 1. 获取上次同步时间点
+        LocalDateTime lastSyncTime = offsetStore.getOffset("users");
+
+        // 2. 查询源库增量数据
+        List<User> users = sourceJdbc.query(
+            "SELECT * FROM users WHERE updated_at > ?",
+            new Object[]{lastSyncTime},
+            userMapper
+        );
+
+        // 3. 同步到目标库
+        for (User user : users) {
+            try {
+                upsertToTarget(user);
+            } catch (Exception e) {
+                log.error("Compensation failed for user: {}", user.getId(), e);
+            }
+        }
+
+        // 4. 更新同步时间点
+        if (!users.isEmpty()) {
+            LocalDateTime maxUpdateTime = users.stream()
+                .map(User::getUpdatedAt)
+                .max(LocalDateTime::compareTo)
+                .orElse(lastSyncTime);
+            offsetStore.saveOffset("users", maxUpdateTime);
+        }
+    }
+}
+```
+
+## CDC 迁移
+
+### Debezium 配置
+
+```json
+{
+    "name": "mysql-connector",
+    "config": {
+        "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+        "tasks.max": "1",
+        "database.hostname": "mysql",
+        "database.port": "3306",
+        "database.user": "debezium",
+        "database.password": "password",
+        "database.server.id": "184054",
+        "topic.prefix": "mysql",
+        "database.include.list": "mydb",
+        "table.include.list": "mydb.users,mydb.orders",
+        "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+        "schema.history.internal.kafka.topic": "schema-changes",
+        "include.schema.changes": "false",
+        "transforms": "unwrap",
+        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState"
+    }
+}
+```
+
+```java
+// 消费 CDC 事件
+@Service
+public class CdcEventConsumer {
+    @KafkaListener(topics = "mysql.mydb.users")
+    public void consumeUserEvent(ConsumerRecord<String, UserEvent> record) {
+        UserEvent event = record.value();
+        Operation op = event.getOp();
+
+        switch (op) {
+            case "c":  // Create
+                insertToTarget(event.getAfter());
+                break;
+            case "u":  // Update
+                updateToTarget(event.getAfter());
+                break;
+            case "d":  // Delete
+                deleteFromTarget(event.getBefore().getId());
+                break;
+        }
+    }
+}
+```
+
+## 数据校验
+
+```java
+// 全量校验
+@Service
+public class DataValidationService {
+    @Autowired private JdbcTemplate sourceJdbc;
+    @Autowired private JdbcTemplate targetJdbc;
+
+    public ValidationReport fullValidation() {
+        ValidationReport report = new ValidationReport();
+
+        // 1. 记录数校验
+        Map<String, Long> sourceCounts = getTableCounts(sourceJdbc);
+        Map<String, Long> targetCounts = getTableCounts(targetJdbc);
+
+        for (String table : sourceCounts.keySet()) {
+            if (!sourceCounts.get(table).equals(targetCounts.get(table))) {
+                report.addError(table, "记录数不一致",
+                    sourceCounts.get(table), targetCounts.get(table));
+            }
+        }
+
+        // 2. 数据校验（抽样）
+        List<String> tables = Arrays.asList("users", "orders");
+        for (String table : tables) {
+            validateTable(table, 1000);  // 抽样 1000 条
+        }
+
+        return report;
+    }
+
+    // 抽样校验
+    public void validateTable(String table, int sampleSize) {
+        List<Long> sourceIds = sourceJdbc.queryForList(
+            String.format("SELECT id FROM %s ORDER BY RAND() LIMIT %d", table, sampleSize),
+            Long.class
+        );
+
+        for (Long id : sourceIds) {
+            Map<String, Object> source = sourceJdbc.queryForMap(
+                String.format("SELECT * FROM %s WHERE id = ?", table), id);
+            Map<String, Object> target = targetJdbc.queryForMap(
+                String.format("SELECT * FROM %s WHERE id = ?", table), id);
+
+            if (!equals(source, target)) {
+                log.warn("Data mismatch in {}: id={}", table, id);
+            }
+        }
+    }
+}
+```
+
+```sql
+-- 增量数据校验
+-- 检查数据同步延迟
+SELECT
+    (SELECT MAX(updated_at) FROM source.users) AS source_max,
+    (SELECT MAX(updated_at) FROM target.users) AS target_max,
+    TIMESTAMPDIFF(SECOND,
+        (SELECT MAX(updated_at) FROM target.users),
+        (SELECT MAX(updated_at) FROM source.users)
+    ) AS lag_seconds;
+```
+
+## 回退方案
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    回退方案                                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 紧急回退触发条件                                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 错误率 > 1%                                       │   │
+│  │  - 数据不一致率 > 0.1%                              │   │
+│  │  - 延迟 > 5 分钟                                    │   │
+│  │  - 关键业务指标异常                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 回退执行步骤                                         │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  1. 停止双写                                       │   │
+│  │  2. 切换流量到旧系统                               │   │
+│  │  3. 补偿双写期间的数据到旧系统                    │   │
+│  │  4. 验证旧系统数据完整性                         │   │
+│  │  5. 恢复旧系统运行                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+数据迁移是高风险操作，需要周密计划。
+
+**迁移方案选择**：
+
+- 小数据量：停机迁移
+- 大数据量：双写迁移或 CDC 迁移
+
+**关键环节**：
+
+- 数据量评估：估算迁移时间
+- 增量同步：补偿期间的数据
+- 数据校验：记录数 + 内容
+- 回退方案：紧急回退预案
+
+**核心认知**：数据迁移中最重要的是数据一致性校验。不要相信迁移脚本，一定要有独立的校验机制确保数据完整。

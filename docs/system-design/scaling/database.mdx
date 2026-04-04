@@ -1,0 +1,420 @@
+---
+title: 数据库扩展策略
+description: 从单机到分布式的演进路径
+---
+
+# 数据库扩展策略
+
+你的电商系统订单量从 100 万增长到 10 亿，数据库从单表变成了几百 G。查询变慢，连接耗尽，备份都做不完。
+
+这就是数据库扩展的挑战：**数据量和并发增长时，数据库如何扩展？**
+
+## 数据库扩展策略图谱
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    数据库扩展策略图谱                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  单机 ──▶ 读写分离 ──▶ 分库分表 ──▶ NewSQL                   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  阶段 1：读写分离                                        │   │
+│  │  瓶颈：单机写入瓶颈                                      │   │
+│  │  方案：主库写入，从库读取                               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  阶段 2：垂直分库                                        │   │
+│  │  瓶颈：单机存储上限                                      │   │
+│  │  方案：按业务拆分到不同实例                             │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  阶段 3：水平分表                                        │   │
+│  │  瓶颈：单表数据量上限                                    │   │
+│  │  方案：按分片键拆分数据                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  阶段 4：NewSQL/分布式数据库                            │   │
+│  │  瓶颈：跨库查询、分布式事务                             │   │
+│  │  方案：TiDB/CockroachDB/PolarDB                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 策略一：读写分离
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    读写分离架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  写入 ──▶ Primary DB                                           │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌─────────────┐                                                │
+│  │  主库      │                                                │
+│  │  接收写入  │                                                │
+│  └──────┬─────┘                                                │
+│         │ binlog 同步                                            │
+│  ┌──────┴─────┐                                                │
+│  │            │                                                 │
+│  ▼            ▼                                                 │
+│ ┌────┐      ┌────┐                                            │
+│ │从库│      │从库│                                            │
+│ └────┘      └────┘                                            │
+│  ◀──────── 读取 ─────────                                       │
+│                                                                  │
+│  效果：读性能线性提升，写性能不变                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```yaml
+# MySQL 主从配置
+# 主库 my.cnf
+[mysqld]
+server-id = 1
+log-bin = mysql-bin
+binlog_format = ROW
+sync_binlog = 1
+innodb_flush_log_at_trx_commit = 1
+
+# 从库 my.cnf
+[mysqld]
+server-id = 2
+relay-log = relay-bin
+read_only = 1
+replicate-do-db = app_db
+```
+
+```java
+// 应用层读写分离
+@Configuration
+public class DataSourceConfig {
+    @Bean
+    public DataSource dataSource() {
+        RoutingDataSource routingDataSource = new RoutingDataSource();
+        routingDataSource.setTargetDataSources(createDataSourceMap());
+        routingDataSource.setDefaultTargetDataSource(masterDataSource);
+        return routingDataSource;
+    }
+
+    private Map<Object, Object> createDataSourceMap() {
+        Map<Object, Object> map = new HashMap<>();
+        map.put("master", masterDataSource);
+        map.put("slave1", slaveDataSource1);
+        map.put("slave2", slaveDataSource2);
+        return map;
+    }
+}
+
+// 注解方式路由
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ReadOnly {}
+
+@Component
+public class ReadWriteInterceptor {
+    @Around("@annotation(readOnly)")
+    public Object routeToSlave(ProceedingJoinPoint joinPoint, ReadOnly readOnly) {
+        if (readOnly != null) {
+            RoutingDataSource.setReadOnly();
+        }
+        try {
+            return joinPoint.proceed();
+        } finally {
+            RoutingDataSource.clear();
+        }
+    }
+}
+
+// 使用
+@Service
+public class UserService {
+    @Transactional(readOnly = true)  // 自动路由到从库
+    public User findById(Long id) {
+        return userRepository.findById(id);
+    }
+
+    @Transactional  // 路由到主库
+    public User create(User user) {
+        return userRepository.save(user);
+    }
+}
+```
+
+### 局限性
+
+```
+读写分离的局限性：
+
+1. 写入瓶颈仍然存在
+   - 所有写入都到主库
+   - 主库仍然单点
+
+2. 主从延迟
+   - 写入后立即读取可能读不到
+   - 需要延迟感知
+
+3. 复制风暴
+   - 大查询会拖慢从库
+   - 影响其他查询
+```
+
+## 策略二：垂直分库
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    垂直分库架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  按业务拆分到不同数据库实例：                                   │
+│                                                                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐           │
+│  │ 用户库      │  │ 订单库      │  │ 商品库      │           │
+│  │ user_db    │  │ order_db   │  │ product_db│           │
+│  └─────────────┘  └─────────────┘  └─────────────┘           │
+│                                                                  │
+│  优势：业务隔离、资源独立                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```java
+// 多数据源配置
+@Configuration
+public class MultiDataSourceConfig {
+    @Bean
+    @ConfigurationProperties(prefix = "spring.datasource.user")
+    public DataSource userDataSource() {
+        return DataSourceBuilder.create().build();
+    }
+
+    @Bean
+    @ConfigurationProperties(prefix = "spring.datasource.order")
+    public DataSource orderDataSource() {
+        return DataSourceBuilder.create().build();
+    }
+
+    @Bean
+    @ConfigurationProperties(prefix = "spring.datasource.product")
+    public DataSource productDataSource() {
+        return DataSourceBuilder.create().build();
+    }
+}
+
+// 使用时指定数据源
+@Service
+public class UserService {
+    @Autowired
+    @Qualifier("userDataSource")
+    private DataSource userDataSource;
+}
+
+// 或者使用包扫描隔离
+// 每个模块用自己的 DataSource
+```
+
+### 优势与挑战
+
+```
+垂直分库优势：
+- 业务隔离，故障不扩散
+- 资源独立，可独立优化
+- 数据量减少，查询更快
+
+垂直分库挑战：
+- 跨库查询困难
+- 事务无法跨库
+- 关联查询需要应用层处理
+```
+
+## 策略三：水平分表
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    水平分表架构                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  按分片键拆分数据到多个表/库：                                   │
+│                                                                  │
+│  t_order (按 user_id 分 4 张表)                                 │
+│                                                                  │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐           │
+│  │t_order_0│  │t_order_1│  │t_order_2│  │t_order_3│           │
+│  │user_id%4│  │user_id%4│  │user_id%4│  │user_id%4│           │
+│  │= 0      │  │= 1      │  │= 2      │  │= 3      │           │
+│  └─────────┘  └─────────┘  └─────────┘  └─────────┘           │
+│                                                                  │
+│  效果：数据量线性分散                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 分片策略
+
+```java
+// 哈希分片：数据均匀分布
+public class HashShardingAlgorithm implements ShardingAlgorithm {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, ShardingValue shardingValue) {
+        long id = Long.parseLong(shardingValue.getValue().toString());
+        int index = (int) (id % availableTargetNames.size());
+        return availableTargetNames.stream()
+            .sorted()
+            .skip(index)
+            .findFirst()
+            .orElse(availableTargetNames.iterator().next());
+    }
+}
+
+// 范围分片：按时间或 ID 范围
+public class RangeShardingAlgorithm implements ShardingAlgorithm {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, ShardingValue shardingValue) {
+        long id = Long.parseLong(shardingValue.getValue().toString());
+        if (id < 1000000) return "ds_0.t_order_0";
+        if (id < 5000000) return "ds_1.t_order_1";
+        if (id < 10000000) return "ds_2.t_order_2";
+        return "ds_3.t_order_3";
+    }
+}
+```
+
+### 分片后的问题
+
+```
+分片后面临的挑战：
+
+1. 跨分片查询
+   - 全局查询（如统计、排序）需要多节点
+   - 解决方案：异构索引、搜索库
+
+2. 分片键选择
+   - 查询必须带分片键
+   - 变更代价大
+
+3. 数据迁移
+   - 扩缩容需要迁移数据
+   - 双写 + 灰度切换
+
+4. 分布式事务
+   - 跨库事务无法本地处理
+   - 解决方案：分布式事务中间件
+```
+
+## 策略四：NewSQL / 分布式数据库
+
+### 代表产品
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NewSQL 数据库                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  TiDB：MySQL 兼容，水平扩展                                      │
+│  CockroachDB：PostgreSQL 兼容，全球分布                          │
+│  PolarDB：阿里云，存储计算分离                                   │
+│  OceanBase：支付宝自研，MySQL 兼容                               │
+│  YugabyteDB：PostgreSQL/Cassandra 兼容                          │
+│                                                                  │
+│  特点：                                                         │
+│  ✓ SQL 全兼容                                                   │
+│  ✓ 水平扩展                                                    │
+│  ✓ 分布式事务                                                  │
+│  ✓ 强一致性                                                   │
+│  ✓ 自动故障恢复                                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### TiDB 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TiDB 架构                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                   TiDB Server                         │   │
+│  │  SQL 层：无状态，可水平扩展                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                            │                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                  TiKV Server                          │   │
+│  │  存储层：Raft 协议保证一致性                          │   │
+│  │  每个 Region 3 副本，自动分裂/合并                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                            │                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                   PD Server                           │   │
+│  │  调度器：Region 调度、负载均衡                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 演进路径
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    数据库扩展演进路径                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  阶段 1：单体优化                                              │
+│  ─────────────────                                              │
+│  - 参数调优                                                    │
+│  - 索引优化                                                    │
+│  - 缓存减少查询                                               │
+│                                                                  │
+│  阶段 2：读写分离                                              │
+│  ─────────────────                                              │
+│  - 主从复制                                                    │
+│  - 读写分离                                                    │
+│  - 延迟感知                                                   │
+│                                                                  │
+│  阶段 3：垂直分库                                              │
+│  ─────────────────                                              │
+│  - 按业务拆分                                                  │
+│  - 独立优化                                                   │
+│                                                                  │
+│  阶段 4：水平分表                                              │
+│  ─────────────────                                              │
+│  - 按分片键拆分                                               │
+│  - 分片中间件                                                 │
+│                                                                  │
+│  阶段 5：NewSQL                                                │
+│  ─────────────────                                              │
+│  - 分布式数据库                                               │
+│  - 自动扩缩容                                                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+数据库扩展是随着业务增长逐步演进的过程。
+
+**核心要点**：
+
+- 读写分离：提升读性能
+- 垂直分库：业务隔离
+- 水平分表：数据量分散
+- NewSQL：分布式原生方案
+
+**演进建议**：
+
+- 先优化单体，再考虑扩展
+- 按需演进，不要过度设计
+- 分片键选择要慎重
+- 预留扩容能力

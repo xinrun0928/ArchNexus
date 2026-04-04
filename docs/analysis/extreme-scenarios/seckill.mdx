@@ -1,0 +1,312 @@
+---
+title: 秒杀系统设计
+description: 高并发场景下的库存扣减与抢单系统架构
+---
+
+# 秒杀系统设计
+
+双十一零点，你的系统被瞬间涌入的流量冲垮。
+
+秒杀是互联网公司面临的最极端的高并发场景，也是架构设计能力的试金石。
+
+## 秒杀特点
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    秒杀场景特点                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  流量特征：                                           │   │
+│  │                                                         │   │
+│  │  - 瞬时峰值：平时流量的数百甚至数千倍              │   │
+│  │  - 持续时间短：通常只有几分钟到几十分钟            │   │
+│  │  - 地域分布：全国用户同时抢购                     │   │
+│  │  - 读多写少：大量用户查询，库存扣减只有少数成功   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  技术挑战：                                           │   │
+│  │                                                         │   │
+│  │  - 瞬时高并发：系统能否扛住峰值流量               │   │
+│  │  - 库存准确：不能超卖，也不能少卖                 │   │
+│  │  - 一致性：库存与订单必须一致                     │   │
+│  │  - 可用性：秒杀期间不能宕机                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 秒杀架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    秒杀系统架构                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │              用户请求                                       │   │
+│  │                 │                                          │   │
+│  │                 ▼                                          │   │
+│  │         ┌─────────────┐                                │   │
+│  │         │  CDN/WAF  │  静态资源加速                    │   │
+│  │         └──────┬─────┘                                │   │
+│  │                │                                           │   │
+│  │                ▼                                           │   │
+│  │         ┌─────────────┐                                │   │
+│  │         │  负载均衡  │  Nginx / SLB                    │   │
+│  │         └──────┬─────┘                                │   │
+│  │                │                                           │   │
+│  │                ▼                                           │   │
+│  │         ┌─────────────┐                                │   │
+│  │         │  秒杀网关  │  限流/风控                      │   │
+│  │         └──────┬─────┘                                │   │
+│  │                │                                           │   │
+│  │                ▼                                           │   │
+│  │    ┌──────────┼──────────┐                          │   │
+│  │    │          │          │                              │   │
+│  │    ▼          ▼          ▼                              │   │
+│  │ ┌────┐    ┌────┐    ┌────┐                        │   │
+│  │ │服务1│    │服务2│    │服务3│                        │   │
+│  │ └──┬─┘    └──┬─┘    └──┬─┘                        │   │
+│  │    │          │          │                              │   │
+│  │    └──────────┼──────────┘                              │   │
+│  │               ▼                                           │   │
+│  │        ┌─────────────┐                                │   │
+│  │        │  库存服务  │  Redis Lua                       │   │
+│  │        └─────────────┘                                │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 库存扣减
+
+```java
+// 秒杀库存服务
+@Service
+public class SeckillStockService {
+    @Autowired private RedisTemplate<String, String> redisTemplate;
+
+    // 初始化库存
+    public void initStock(Long productId, int stock) {
+        String key = "seckill:stock:" + productId;
+        redisTemplate.opsForValue().set(key, String.valueOf(stock));
+    }
+
+    // Lua 脚本原子扣减库存
+    public String luaScript = """
+        local key = KEYS[1]
+        local quantity = tonumber(ARGV[1])
+
+        local stock = tonumber(redis.call('GET', key))
+        if stock == nil then
+            return '-1'  -- 库存未初始化
+        end
+
+        if stock < quantity then
+            return '0'  -- 库存不足
+        end
+
+        redis.call('DECRBY', key, quantity)
+        return '1'  -- 扣减成功
+        """;
+
+    // 扣减库存
+    public boolean deductStock(Long productId, int quantity) {
+        String key = "seckill:stock:" + productId;
+
+        RedisScript<String> script = new RedisScript<>(luaScript, String.class);
+        String result = redisTemplate.execute(script,
+            List.of(key),
+            String.valueOf(quantity));
+
+        return "1".equals(result);
+    }
+
+    // 回滚库存（失败时）
+    public void rollbackStock(Long productId, int quantity) {
+        String key = "seckill:stock:" + productId;
+        redisTemplate.opsForValue().increment(key, quantity);
+    }
+}
+```
+
+## 请求拦截
+
+```java
+// 多层拦截
+@Service
+public class SeckillRequestFilter {
+    @Autowired private RateLimiter rateLimiter;
+    @Autowired private BlacklistService blacklistService;
+
+    public SeckillResponse handle(SeckillRequest request) {
+        // 1. IP 黑名单
+        if (blacklistService.isBlocked(request.getIp())) {
+            return SeckillResponse.blocked("黑名单用户");
+        }
+
+        // 2. 用户抢购限制（同一用户不能重复抢购）
+        String userKey = "seckill:user:" + request.getProductId() + ":" + request.getUserId();
+        if (redisTemplate.hasKey(userKey)) {
+            return SeckillResponse.blocked("已抢购过");
+        }
+
+        // 3. 限流
+        if (!rateLimiter.tryAcquire(request.getProductId())) {
+            return SeckillResponse.blocked("抢购人数过多");
+        }
+
+        // 4. 验证码（可选）
+        if (!verifyCaptcha(request.getCaptchaToken())) {
+            return SeckillResponse.blocked("验证码错误");
+        }
+
+        // 通过所有检查
+        return SeckillResponse.success();
+    }
+}
+
+// 限流器
+@Service
+public class RateLimiterService {
+    private LoadingCache<String, Bucket> buckets;
+
+    @PostConstruct
+    public void init() {
+        buckets = Caffeine.newBuilder()
+            .maximumSize(100000)
+            .expireAfterWrite(1, TimeUnit.MINUTES)
+            .build(key -> Bucket.builder()
+                .addToken(1)
+                .refillGreedy(1000, Duration.ofMinutes(1))
+                .build());
+    }
+
+    public boolean tryAcquire(Long productId) {
+        Bucket bucket = buckets.get(productId.toString());
+        return bucket.tryConsume(1);
+    }
+}
+```
+
+## 下单与支付
+
+```java
+// 秒杀下单服务
+@Service
+public class SeckillOrderService {
+    @Autowired private SeckillStockService stockService;
+    @Autowired private OrderRepository orderRepository;
+    @Autowired private KafkaTemplate kafkaTemplate;
+
+    @Transactional
+    public Order createSeckillOrder(SeckillRequest request) {
+        // 1. 扣减库存
+        boolean deducted = stockService.deductStock(
+            request.getProductId(), 1);
+
+        if (!deducted) {
+            throw new SeckillException("库存不足");
+        }
+
+        try {
+            // 2. 创建订单
+            Order order = new Order();
+            order.setUserId(request.getUserId());
+            order.setProductId(request.getProductId());
+            order.setStatus(OrderStatus.PENDING_PAYMENT);
+            order.setExpireTime(LocalDateTime.now().plusMinutes(15));  // 15 分钟支付
+
+            orderRepository.save(order);
+
+            // 3. 标记用户已抢购
+            String userKey = "seckill:user:" + request.getProductId()
+                + ":" + request.getUserId();
+            redisTemplate.opsForValue().set(userKey, order.getId().toString(),
+                Duration.ofMinutes(30));
+
+            // 4. 发送延迟消息（处理超时未支付）
+            kafkaTemplate.send("seckill-orders",
+                order.getId().toString(),
+                order);
+
+            return order;
+
+        } catch (Exception e) {
+            // 5. 失败回滚库存
+            stockService.rollbackStock(request.getProductId(), 1);
+            throw e;
+        }
+    }
+}
+
+// 超时未支付处理
+@KafkaListener(topics = "seckill-orders")
+public void handleSeckillOrder(Order order) {
+    // 延迟检查支付状态
+    try {
+        Thread.sleep(15 * 60 * 1000);  // 等待 15 分钟
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+
+    Order dbOrder = orderRepository.findById(order.getId());
+    if (dbOrder.getStatus() == OrderStatus.PENDING_PAYMENT) {
+        // 超时未支付，取消订单，回滚库存
+        dbOrder.setStatus(OrderStatus.CANCELLED);
+        orderRepository.save(dbOrder);
+        stockService.rollbackStock(dbOrder.getProductId(), 1);
+    }
+}
+```
+
+## 数据层优化
+
+```yaml
+# Redis 集群配置
+# 主从复制 + 哨兵
+redis:
+  cluster:
+    nodes:
+      - 10.0.0.1:6379
+      - 10.0.0.2:6379
+      - 10.0.0.3:6379
+
+# 数据库分库分表
+# 按 product_id 分库分表
+sharding:
+  tables:
+    seckill_order:
+      actual-data-nodes: ds_${0..1}.seckill_order_${0..15}
+      table-strategy:
+        standard:
+          sharding-column: product_id
+          sharding-algorithm-name: product_mod
+```
+
+## 总结
+
+秒杀是最高难度的高并发场景。
+
+**核心设计**：
+
+- 多层限流：网关层、Redis 层、业务层
+- 库存预扣减：Lua 脚本保证原子性
+- 异步下单：消息队列削峰
+- 超时机制：未支付自动回滚
+
+**关键指标**：
+
+- 系统能扛住峰值流量
+- 库存不能超卖
+- 订单与库存最终一致
+
+**核心认知**：秒杀系统的本质是用复杂性换取确定性。通过层层拦截、异步处理、超时机制，确保在极端流量下系统依然稳定。

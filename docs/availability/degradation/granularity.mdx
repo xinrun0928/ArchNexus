@@ -1,0 +1,395 @@
+---
+title: 降级粒度控制
+description: 如何选择合适的降级粒度
+---
+
+# 降级粒度控制
+
+你的系统降级了，但整个功能都没了，用户体验很差。
+
+问题出在哪？**降级粒度太粗**。
+
+合适的降级粒度可以在保障系统稳定的同时，最大程度保留用户体验。
+
+## 降级粒度层级
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    降级粒度层级                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  粗 → 细                                                      │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ L1：系统级降级                                        │   │
+│  │ 所有功能统一降级或关闭                               │   │
+│  │ 例如：整个网站显示「系统维护中」                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ L2：服务级降级                                        │   │
+│  │ 按服务/模块降级                                      │   │
+│  │ 例如：推荐服务降级，但商品浏览正常                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ L3：接口级降级                                        │   │
+│  │ 按接口/功能点降级                                    │   │
+│  │ 例如：个性化推荐降级，默认推荐正常                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ L4：数据级降级                                        │   │
+│  │ 按数据类型降级                                       │   │
+│  │ 例如：实时数据降级，缓存数据正常                     │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 粒度选择原则
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    粒度选择原则                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  核心原则：保障核心功能，最大程度保留用户体验                   │
+│                                                                  │
+│  1. 核心功能 → 细粒度降级                                      │
+│     ┌─────────────────────────────────────────────────────────┐   │
+│     │ 核心功能不能降级，要保证正常                        │   │
+│     │ 非核心部分可以降级                                 │   │
+│     └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  2. 非核心功能 → 粗粒度降级                                   │
+│     ┌─────────────────────────────────────────────────────────┐   │
+│     │ 非核心功能可以整体降级                             │   │
+│     │ 不需要精细控制                                    │   │
+│     └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  3. 混合场景 → 分层降级                                       │
+│     ┌─────────────────────────────────────────────────────────┐   │
+│     │ 核心接口正常                                       │   │
+│     │ 非核心接口降级                                     │   │
+│     │ 部分数据用缓存代替                                 │   │
+│     └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 服务级降级
+
+### 按服务降级
+
+```java
+// 按服务降级
+@Service
+public class ServiceLevelDegrade {
+    private final Set<String> degradedServices = new ConcurrentHashSet<>();
+
+    public void degradeService(String service) {
+        degradedServices.add(service);
+        log.warn("服务降级: {}", service);
+    }
+
+    public void recoverService(String service) {
+        degradedServices.remove(service);
+        log.info("服务恢复: {}", service);
+    }
+
+    public boolean isServiceDegraded(String service) {
+        return degradedServices.contains(service);
+    }
+
+    // 服务降级拦截
+    public <T> T getService(String service, Supplier<T> normalSupplier, Supplier<T> degradedSupplier) {
+        if (degradedServices.contains(service)) {
+            return degradedSupplier.get();
+        }
+        return normalSupplier.get();
+    }
+}
+
+// 使用
+@Service
+public class ProductController {
+    @Autowired
+    private ServiceLevelDegrade degrade;
+
+    public ProductDetail getProductDetail(Long productId) {
+        ProductDetail detail = productService.getDetail(productId);
+
+        // 评论服务降级
+        detail.setReviews(degrade.getService(
+            "comment",
+            () -> commentService.getReviews(productId),     // 正常
+            () -> Collections.emptyList()                      // 降级
+        ));
+
+        // 推荐服务降级
+        detail.setRecommendations(degrade.getService(
+            "recommendation",
+            () -> recommendationService.getRecommendations(productId),  // 正常
+            () -> getDefaultRecommendations()                           // 降级
+        ));
+
+        return detail;
+    }
+}
+```
+
+### 按接口降级
+
+```java
+// 按接口降级
+@Configuration
+public class InterfaceDegradeConfig {
+    private final Map<String, DegradeConfig> configs = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void init() {
+        // 推荐接口配置
+        configs.put("recommendation:personal", new DegradeConfig(false, true));  // 个性化推荐可降级
+        configs.put("recommendation:hot", new DegradeConfig(false, false));     // 热门推荐不可降级
+        configs.put("recommendation:similar", new DegradeConfig(false, true));   // 相似推荐可降级
+
+        // 评论接口配置
+        configs.put("comment:list", new DegradeConfig(false, false));    // 评论列表不可降级
+        configs.put("comment:publish", new DegradeConfig(true, true));     // 发布评论可降级
+        configs.put("comment:count", new DegradeConfig(false, true));    // 评论数可降级
+    }
+
+    public boolean shouldDegrade(String interfaceName) {
+        DegradeConfig config = configs.get(interfaceName);
+        return config != null && config.isDegraded();
+    }
+}
+
+// 使用
+@Service
+public class RecommendationService {
+    @Autowired
+    private InterfaceDegradeConfig degradeConfig;
+
+    public List<Product> getPersonalRecommendations(Long userId) {
+        String interfaceName = "recommendation:personal";
+        if (degradeConfig.shouldDegrade(interfaceName)) {
+            return getDefaultRecommendations();
+        }
+        return recommendationDao.getPersonal(userId);
+    }
+
+    public List<Product> getHotRecommendations() {
+        String interfaceName = "recommendation:hot";
+        if (degradeConfig.shouldDegrade(interfaceName)) {
+            return getDefaultRecommendations();
+        }
+        return recommendationDao.getHot();
+    }
+}
+```
+
+## 数据级降级
+
+### 按数据类型降级
+
+```java
+// 按数据类型降级
+@Service
+public class DataLevelDegrade {
+    private final Map<String, DataDegradeLevel> dataLevels = new ConcurrentHashMap<>();
+
+    public enum DataDegradeLevel {
+        REALTIME,    // 实时数据
+        CACHED,      // 缓存数据
+        DEFAULT       // 默认数据
+    }
+
+    public void setDataLevel(String dataType, DataDegradeLevel level) {
+        dataLevels.put(dataType, level);
+    }
+
+    public DataDegradeLevel getDataLevel(String dataType) {
+        return dataLevels.getOrDefault(dataType, DataDegradeLevel.REALTIME);
+    }
+}
+
+// 使用
+@Service
+public class ProductService {
+    @Autowired
+    private DataLevelDegrade degrade;
+
+    public ProductDetail getProductDetail(Long productId) {
+        ProductDetail detail = new ProductDetail();
+
+        // 库存数据降级
+        DataDegradeLevel inventoryLevel = degrade.getDataLevel("inventory");
+        switch (inventoryLevel) {
+            case REALTIME -> detail.setInventory(getRealTimeInventory(productId));
+            case CACHED -> detail.setInventory(getCachedInventory(productId));
+            case DEFAULT -> detail.setInventory(getDefaultInventory());
+        }
+
+        // 价格数据降级
+        DataDegradeLevel priceLevel = degrade.getDataLevel("price");
+        switch (priceLevel) {
+            case REALTIME -> detail.setPrice(getRealTimePrice(productId));
+            case CACHED -> detail.setPrice(getCachedPrice(productId));
+            case DEFAULT -> detail.setPrice(getDefaultPrice());
+        }
+
+        // 库存数据降级
+        DataDegradeLevel stockLevel = degrade.getDataLevel("stock");
+        switch (stockLevel) {
+            case REALTIME -> detail.setStock(getRealTimeStock(productId));
+            case CACHED -> detail.setStock(getCachedStock(productId));
+            case DEFAULT -> detail.setStock(getDefaultStock());
+        }
+
+        return detail;
+    }
+
+    // 实时数据
+    private Inventory getRealTimeInventory(Long productId) {
+        return inventoryService.getInventory(productId);
+    }
+
+    // 缓存数据
+    private Inventory getCachedInventory(Long productId) {
+        return cacheService.getFromCache("inventory", productId);
+    }
+
+    // 默认数据
+    private Inventory getDefaultInventory() {
+        return new Inventory(true, "库存充足");
+    }
+}
+```
+
+### 多级降级示例
+
+```java
+// 多级降级策略
+@Service
+public class MultiLevelDegradeService {
+    public OrderStatus getOrderStatus(Long orderId) {
+        // 第一级：尝试实时数据
+        try {
+            return orderService.getRealTimeStatus(orderId);
+        } catch (Exception e) {
+            log.warn("实时订单状态获取失败，尝试缓存", e);
+        }
+
+        // 第二级：尝试缓存数据
+        try {
+            return orderCacheService.getStatus(orderId);
+        } catch (Exception e) {
+            log.warn("缓存订单状态获取失败，尝试本地缓存", e);
+        }
+
+        // 第三级：尝试本地缓存
+        try {
+            return localCacheService.getStatus(orderId);
+        } catch (Exception e) {
+            log.warn("本地缓存失败，返回默认状态", e);
+        }
+
+        // 第四级：返回默认数据
+        return new OrderStatus(OrderStatusEnum.UNKNOWN, "状态查询中");
+    }
+}
+```
+
+## 降级粒度配置
+
+### 配置文件
+
+```yaml
+# application.yml
+degrade:
+  # 服务级降级
+  services:
+    recommendation:
+      degrade: false
+      fallback: hot-list
+    comment:
+      degrade: false
+      fallback: empty
+
+  # 接口级降级
+  interfaces:
+    "recommendation:personal":
+      degrade: true
+      fallback: default
+    "recommendation:hot":
+      degrade: false
+    "comment:publish":
+      degrade: true
+      fallback: async
+
+  # 数据级降级
+  data:
+    inventory:
+      level: cached  # realtime / cached / default
+    price:
+      level: cached
+    stock:
+      level: default
+```
+
+### 动态配置
+
+```java
+// 动态调整降级粒度
+@Service
+public class DynamicDegradeConfig {
+    @Autowired
+    private DynamicProperties properties;
+
+    public void setDegradeLevel(String scope, String level) {
+        switch (scope) {
+            case "service" -> setServiceLevel(level);
+            case "interface" -> setInterfaceLevel(level);
+            case "data" -> setDataLevel(level);
+        }
+        log.info("降级粒度调整: {} = {}", scope, level);
+        notificationService.alert("降级配置变更: " + scope + " = " + level);
+    }
+
+    private void setServiceLevel(String service) {
+        properties.set("degrade.service." + service, true);
+    }
+
+    private void setInterfaceLevel(String interfaceName) {
+        properties.set("degrade.interface." + interfaceName + ".degrade", true);
+    }
+
+    private void setDataLevel(String level) {
+        properties.set("degrade.data.inventory.level", level);
+    }
+}
+```
+
+## 总结
+
+降级粒度控制是精细化降级的关键。
+
+**粒度层级**：
+
+- L1 系统级
+- L2 服务级
+- L3 接口级
+- L4 数据级
+
+**粒度选择**：
+
+- 核心功能：细粒度降级
+- 非核心功能：粗粒度降级
+
+**实践要点**：
+
+- 分层降级保障核心功能
+- 按需选择降级粒度
+- 支持动态配置调整

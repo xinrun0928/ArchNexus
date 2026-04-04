@@ -1,0 +1,335 @@
+---
+title: 读写分离的最佳实践
+description: 正确实施读写分离的实践指南
+---
+
+# 读写分离的最佳实践
+
+你的系统做了读写分离，但问题一堆：延迟、数据不一致、性能反而下降。
+
+问题出在哪？**没有遵循读写分离的最佳实践**。
+
+读写分离看起来简单，但实施起来有很多坑。
+
+## 读写分离实施前提
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    实施读写分离的前提                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 主库性能已经优化                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  读写分离不能解决慢查询问题                          │   │
+│  │  先优化 SQL，再考虑读写分离                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. 复制延迟可接受                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  监控复制延迟                                          │   │
+│  │  确保 P99 延迟在业务可接受范围内                     │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 业务可接受最终一致性                                │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  写入后立即读取可能读到旧数据                        │   │
+│  │  业务必须能容忍短暂不一致                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 路由实现方案
+
+### 方案一：应用层路由
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    应用层路由                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │              应用层                                    │   │
+│  │                                                         │   │
+│  │         ┌────────────────┐                            │   │
+│  │         │  路由判断      │                            │   │
+│  │         └───────┬────────┘                            │   │
+│  │                 │                                      │   │
+│  │         ┌───────┴───────┐                            │   │
+│  │         │               │                              │   │
+│  │         ▼               ▼                              │   │
+│  │     ┌────────┐     ┌────────┐                      │   │
+│  │     │ 主库   │     │ 从库   │                      │   │
+│  │     └────────┘     └────────┘                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  优点：灵活控制                                                │
+│  缺点：需要修改代码                                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// 应用层路由实现
+@Service
+public class ReadWriteRoutingService {
+    @Autowired
+    private DataSource masterDataSource;
+
+    @Autowired
+    private List<DataSource> slaveDataSources;
+
+    private final AtomicInteger slaveIndex = new AtomicInteger(0);
+
+    public DataSource getMasterDataSource() {
+        return masterDataSource;
+    }
+
+    public DataSource getSlaveDataSource() {
+        // 轮询选择从库
+        int index = slaveIndex.getAndIncrement() % slaveDataSources.size();
+        return slaveDataSources.get(index);
+    }
+
+    public DataSource route(boolean isWrite) {
+        return isWrite ? masterDataSource : getSlaveDataSource();
+    }
+}
+```
+
+### 方案二：中间件路由
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    中间件路由                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │              应用层                                    │   │
+│  │                    │                                    │   │
+│  │                    ▼                                    │   │
+│  │         ┌────────────────┐                            │   │
+│  │         │  数据库中间件   │  ← MySQL Proxy / ShardingSphere    │
+│  │         └───────┬────────┘                            │   │
+│  │                 │                                      │   │
+│  │         ┌───────┴───────┐                            │   │
+│  │         │               │                              │   │
+│  │         ▼               ▼                              │   │
+│  │     ┌────────┐     ┌────────┐                      │   │
+│  │     │ 主库   │     │ 从库   │                      │   │
+│  │     └────────┘     └────────┘                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  优点：应用透明                                                │
+│  缺点：增加一层复杂度                                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 方案三：框架层路由（ShardingSphere）
+
+```yaml
+# ShardingSphere-JDBC 配置
+spring:
+  shardingsphere:
+    datasource:
+      ds-master:
+        type: com.zaxxer.hikari.HikariDataSource
+        # 主库配置
+      ds-slave-0:
+        type: com.zaxxer.hikari.HikariDataSource
+        # 从库配置
+
+    rules:
+      readwrite-splitting:
+        dataSources:
+          ds:
+            type: Static
+            props:
+              write-data-source-name: ds-master
+              read-data-source-names: ds-slave-0, ds-slave-1
+            load-balancer-name: round_robin
+
+        load balancers:
+          round_robin:
+            type: ROUND_ROBIN
+```
+
+## 事务处理
+
+### 事务内读写问题
+
+```java
+// 事务内读写问题
+@Service
+public class TransactionReadWriteService {
+
+    // 错误示例：事务内先读后写，然后立即读取
+    @Transactional
+    public void wrongPattern() {
+        // 读取（走从库，可能读到旧数据）
+        Order order = orderRepository.findById(1L);
+
+        // 修改
+        order.setStatus("completed");
+        orderRepository.save(order);  // 写入主库
+
+        // 再次读取（走从库，一定读到旧数据）
+        Order updated = orderRepository.findById(1L);
+        // updated 还是旧状态！
+    }
+
+    // 正确示例：使用 readOnly 事务
+    @Transactional(readOnly = true)
+    public Order readFromSlave(Long id) {
+        return orderRepository.findById(id);
+    }
+
+    // 正确示例：先写后读，强制读主库
+    @Transactional
+    public void correctPattern(Order order) {
+        orderRepository.save(order);  // 写入主库
+        // 在同一事务内，后续读取会路由到主库
+        Order saved = orderRepository.findById(order.getId());  // 读主库
+    }
+}
+```
+
+### 事务传播行为
+
+```java
+// 事务传播行为
+@Service
+public class TransactionPropagationService {
+
+    // REQUIRED：加入已有事务
+    @Transactional
+    public void updateAndRead(Order order) {
+        orderRepository.save(order);
+        // 在同一事务内，可以读到刚才写入的数据
+    }
+
+    // REQUIRES_NEW：挂起当前事务，开启新事务
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void isolatedWrite(Order order) {
+        orderRepository.save(order);
+    }
+}
+```
+
+## 常见问题处理
+
+### 问题一：自增主键
+
+```java
+// 自增主键问题
+@Service
+public class AutoIncrementService {
+
+    // 写入后获取自增 ID
+    @Transactional
+    public Long createAndGetId(Product product) {
+        Product saved = productRepository.save(product);
+        return saved.getId();  // 主库可以立即获取
+    }
+}
+```
+
+### 问题二：分布式 ID
+
+```java
+// 分布式 ID 方案
+@Service
+public class DistributedIdService {
+
+    // 使用 Snowflake
+    @Autowired
+    private IdGenerator idGenerator;
+
+    @Transactional
+    public Product createWithId(Product product) {
+        product.setId(idGenerator.nextId());
+        return productRepository.save(product);
+    }
+}
+```
+
+## 监控与告警
+
+```java
+// 完整的监控配置
+@Configuration
+public class ReadWriteMonitoringConfig {
+    @Bean
+    public MeterRegistry meterRegistry() {
+        return new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+    }
+
+    @Bean
+    public ReplicationLagMetrics replicationLagMetrics(
+            MeterRegistry registry,
+            DataSource slaveDataSource) {
+
+        return new ReplicationLagMetrics(registry, slaveDataSource);
+    }
+}
+
+// 告警配置
+@Component
+public class ReadWriteAlerting {
+
+    @Autowired
+    private AlertService alertService;
+
+    @Scheduled(fixedRate = 10000)
+    public void checkLag() {
+        long lag = getReplicationLag();
+
+        if (lag > 60) {
+            alertService.send(
+                AlertLevel.HIGH,
+                "复制延迟过高: " + lag + "秒");
+        }
+    }
+}
+```
+
+## 总结
+
+读写分离的最佳实践包括：
+
+**实施前提**：
+
+- 主库已优化
+- 延迟可接受
+- 业务可容忍最终一致
+
+**路由方案**：
+
+- 应用层路由：灵活但需改代码
+- 中间件路由：透明但增加复杂度
+- 框架层路由：配置化
+
+**事务处理**：
+
+- 事务内写入后立即读取需要路由到主库
+- 注意事务传播行为
+
+**监控要点**：
+
+- 复制延迟
+- 读写比例
+- 从库负载

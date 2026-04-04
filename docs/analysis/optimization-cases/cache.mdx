@@ -1,0 +1,426 @@
+---
+title: 缓存调优
+description: Redis 缓存的性能优化与问题排查
+---
+
+# 缓存调优
+
+你的缓存命中率只有 60%，系统性能不稳定。
+
+缓存是高性能系统的必备组件，但使用不当会带来新的问题。
+
+## 缓存命中问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    缓存命中问题分析                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 命中率的定义                                          │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  命中率 = 命中次数 / 总请求次数 × 100%              │   │
+│  │                                                         │   │
+│  │  常见命中率参考：                                     │   │
+│  │  - 热数据命中率：> 95%                              │   │
+│  │  - 混合数据命中率：80-90%                          │   │
+│  │  - 命中率 < 80%：需要优化                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# 查看 Redis 命中率
+redis-cli info stats | grep keyspace
+# keyspace_hits:123456
+# keyspace_misses:6543
+# hit rate = 123456 / (123456 + 6543) = 95%
+
+# 实时监控
+redis-cli --latency-history
+redis-cli --bigkeys
+```
+
+## 缓存架构优化
+
+```java
+// 多级缓存架构
+@Service
+public class MultiLevelCacheService {
+    // L1：本地缓存（Caffeine）
+    private Cache<Long, ProductDTO> localCache;
+
+    // L2：分布式缓存（Redis）
+    @Autowired private RedisTemplate<String, ProductDTO> redisTemplate;
+
+    @PostConstruct
+    public void init() {
+        localCache = Caffeine.newBuilder()
+            .maximumSize(10000)      // 最大 10000 条
+            .expireAfterWrite(1, TimeUnit.MINUTES)  // 1 分钟过期
+            .recordStats()           // 记录统计
+            .build();
+    }
+
+    public ProductDTO getProduct(Long productId) {
+        // L1：先查本地缓存
+        ProductDTO cached = localCache.getIfPresent(productId);
+        if (cached != null) {
+            return cached;
+        }
+
+        // L2：查 Redis
+        String key = "product:" + productId;
+        cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            // 回填本地缓存
+            localCache.put(productId, cached);
+            return cached;
+        }
+
+        // L3：查数据库
+        Product product = productRepository.findById(productId);
+        if (product == null) {
+            return null;
+        }
+
+        cached = convertToDTO(product);
+
+        // 回填 Redis
+        redisTemplate.opsForValue().set(key, cached, Duration.ofMinutes(30));
+
+        // 回填本地缓存
+        localCache.put(productId, cached);
+
+        return cached;
+    }
+
+    // 统计缓存命中率
+    public CacheStats getStats() {
+        CacheStats l1Stats = localCache.stats();
+        log.info("L1 命中率: {}, 命中: {}, 未命中: {}",
+            l1Stats.hitRate(), l1Stats.hitCount(), l1Stats.missCount());
+        return l1Stats;
+    }
+}
+```
+
+## 缓存问题与解决
+
+### 1. 缓存穿透
+
+```java
+// 缓存穿透：大量请求不存在的数据
+@Service
+public class CachePenetrationService {
+    @Autowired private RedisTemplate<String, Object> redisTemplate;
+
+    // 解决方案 1：布隆过滤器
+    @Autowired private BloomFilter<Long> bloomFilter;
+
+    public Product getProduct(Long productId) {
+        // 先检查布隆过滤器
+        if (!bloomFilter.mightContain(productId)) {
+            return null;  // 一定不存在
+        }
+
+        // 再查缓存和数据库
+        return getProductFromCacheOrDb(productId);
+    }
+
+    // 解决方案 2：空值缓存
+    private static final String NULL_VALUE = "NULL";
+
+    public Product getProductWithNullCache(Long productId) {
+        String key = "product:" + productId;
+
+        // 查缓存
+        Object cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            if (NULL_VALUE.equals(cached)) {
+                return null;  // 空值缓存
+            }
+            return (Product) cached;
+        }
+
+        // 查数据库
+        Product product = productRepository.findById(productId);
+
+        // 写入缓存（包括空值）
+        if (product == null) {
+            redisTemplate.opsForValue().set(key, NULL_VALUE,
+                Duration.ofMinutes(5));  // 空值短过期
+        } else {
+            redisTemplate.opsForValue().set(key, product,
+                Duration.ofMinutes(30));
+        }
+
+        return product;
+    }
+}
+```
+
+### 2. 缓存击穿
+
+```java
+// 缓存击穿：热点 key 过期瞬间，大量请求打到数据库
+@Service
+public class CacheBreakdownService {
+    @Autowired private RedisTemplate<String, Object> redisTemplate;
+    @Autowired private RedissonClient redisson;
+
+    private static final String LOCK_PREFIX = "lock:product:";
+
+    public Product getProduct(Long productId) {
+        String key = "product:" + productId;
+
+        // 1. 先查缓存
+        Product cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 2. 获取分布式锁
+        String lockKey = LOCK_PREFIX + productId;
+        RLock lock = redisson.getLock(lockKey);
+
+        try {
+            // 尝试获取锁
+            if (lock.tryLock(0, 10, TimeUnit.SECONDS)) {
+                try {
+                    // 双重检查
+                    cached = redisTemplate.opsForValue().get(key);
+                    if (cached != null) {
+                        return cached;
+                    }
+
+                    // 查数据库
+                    Product product = productRepository.findById(productId);
+
+                    // 写入缓存
+                    if (product != null) {
+                        redisTemplate.opsForValue().set(key, product,
+                            Duration.ofMinutes(30));
+                    }
+
+                    return product;
+                } finally {
+                    lock.unlock();
+                }
+            } else {
+                // 未获取到锁，短暂等待后重试
+                Thread.sleep(50);
+                return redisTemplate.opsForValue().get(key);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return productRepository.findById(productId);
+        }
+    }
+
+    // 热点数据：永不过期 + 定期更新
+    public void refreshHotProduct(Long productId) {
+        String key = "product:" + productId;
+        Product product = productRepository.findById(productId);
+        if (product != null) {
+            // 永不过期，但定期更新
+            redisTemplate.opsForValue().set(key, product);
+        }
+    }
+}
+```
+
+### 3. 缓存雪崩
+
+```java
+// 缓存雪崩：大量缓存同时过期
+@Service
+public class CacheAvalancheService {
+    @Autowired private RedisTemplate<String, Object> redisTemplate;
+
+    // 解决方案 1：过期时间加随机值
+    public void saveWithJitter(String key, Object value, Duration baseTTL) {
+        // 在基础过期时间的 80%-120% 之间随机
+        long jitter = (long) (Math.random() * 0.4 * baseTTL.toMillis());
+        long ttl = (long) (baseTTL.toMillis() * 0.8) + jitter;
+
+        redisTemplate.opsForValue().set(key, value, Duration.ofMillis(ttl));
+    }
+
+    // 解决方案 2：提前续命
+    @Scheduled(fixedRate = 60000)  // 每分钟执行
+    public void refreshPopularProducts() {
+        // 获取热门商品
+        List<Long> popularProductIds = getPopularProductIds();
+
+        for (Long productId : popularProductIds) {
+            String key = "product:" + productId;
+
+            // 检查剩余 TTL
+            Long ttl = redisTemplate.getExpire(key, TimeUnit.SECONDS);
+            if (ttl != null && ttl < 300) {  // 剩余少于 5 分钟
+                // 提前续命
+                Product product = productRepository.findById(productId);
+                if (product != null) {
+                    redisTemplate.opsForValue().set(key, product,
+                        Duration.ofMinutes(30));
+                }
+            }
+        }
+    }
+
+    // 解决方案 3：互斥锁重建
+    // 见缓存击穿部分
+}
+```
+
+## Redis 性能优化
+
+```bash
+# Redis 配置优化
+
+# 内存配置
+maxmemory 10gb
+maxmemory-policy allkeys-lru
+
+# 持久化策略（根据业务选择）
+# RDB + AOF
+save 900 1
+save 300 10
+save 60 10000
+appendonly yes
+appendfsync everysec
+
+# 网络优化
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+```
+
+```java
+// Redis 连接优化
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(
+            RedisConnectionFactory connectionFactory) {
+
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // 使用 Jackson 序列化
+        Jackson2JsonRedisSerializer<Object> serializer =
+            new Jackson2JsonRedisSerializer<>(Object.class);
+
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(serializer);
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(serializer);
+
+        template.afterPropertiesSet();
+        return template;
+    }
+
+    @Bean
+    public RedisConnectionFactory connectionFactory() {
+        LettuceConnectionFactory factory = new LettuceConnectionFactory();
+        factory.setHostProperties(new LettucePoolingClientConfiguration.Builder()
+            .poolConfig(new GenericObjectPoolConfig()
+                .setMaxTotal(50)
+                .setMaxIdle(20)
+                .setMinIdle(5)
+                .setMaxWait(Duration.ofMillis(3000)))
+            .commandTimeout(Duration.ofMillis(1000))  // 命令超时
+            .build());
+        return factory;
+    }
+}
+```
+
+## 缓存监控
+
+```java
+// 缓存监控指标
+@Service
+public class CacheMonitoringService {
+    @Autowired private RedisTemplate<String, Object> redisTemplate;
+
+    public Map<String, Object> getCacheMetrics() {
+        RedisConnectionFactory factory = redisTemplate.getConnectionFactory();
+        RedisConnection connection = factory.getConnection();
+
+        Map<String, Object> metrics = new HashMap<>();
+
+        // 内存信息
+        Properties memory = connection.serverCommands().info("memory");
+        metrics.put("used_memory", memory.get("used_memory_human"));
+
+        // 命中率
+        Properties stats = connection.serverCommands().info("stats");
+        long hits = Long.parseLong(stats.getProperty("keyspace_hits", "0"));
+        long misses = Long.parseLong(stats.getProperty("keyspace_misses", "0"));
+        double hitRate = hits * 100.0 / (hits + misses);
+        metrics.put("hit_rate", String.format("%.2f%%", hitRate));
+        metrics.put("hits", hits);
+        metrics.put("misses", misses);
+
+        // 连接信息
+        Properties clients = connection.serverCommands().info("clients");
+        metrics.put("connected_clients", clients.get("connected_clients"));
+
+        connection.close();
+        return metrics;
+    }
+
+    // 监控大 Key
+    public void checkBigKeys() {
+        // 使用 SCAN 遍历
+        ScanOptions options = ScanOptions.scanOptions()
+            .count(100)
+            .match("*")
+            .build();
+
+        try (Cursor<byte[]> cursor = redisTemplate.getConnectionFactory()
+                .getConnection().scan(options)) {
+
+            while (cursor.hasNext()) {
+                byte[] key = cursor.next();
+                Long size = redisTemplate.opsForValue().getOperations()
+                    .getKeySerializer().deserialize(key) instanceof String ?
+                    estimateStringSize(key) : estimateSize(key);
+
+                if (size > 10 * 1024 * 1024) {  // > 10MB
+                    log.warn("发现大 Key: {} bytes", size);
+                }
+            }
+        }
+    }
+}
+```
+
+## 总结
+
+缓存是高性能系统的必备组件。
+
+**三大问题**：
+
+- 缓存穿透：布隆过滤器 + 空值缓存
+- 缓存击穿：分布式锁 + 热点永不过期
+- 缓存雪崩：过期时间加随机值 + 提前续命
+
+**架构优化**：
+
+- 多级缓存：本地 + 分布式
+- 合理过期时间：热点永不过期
+- 监控告警：命中率、大 Key、连接数
+
+**性能优化**：
+
+- 序列化优化：使用高效序列化
+- 连接池优化：合理配置大小
+- Pipeline：批量操作减少 RTT
+
+**核心认知**：缓存不是银弹，使用不当会带来新的问题。缓存 + 数据库是经典组合，关键是要让缓存成为真正的热点加速器。

@@ -1,0 +1,406 @@
+---
+title: 连接池优化
+description: 数据库和 HTTP 连接池的配置与调优
+---
+
+# 连接池优化
+
+你的系统响应时间很长，但 CPU 使用率不高。查看日志发现大量 `Could not get connection` 错误。
+
+问题出在哪？**连接池太小，线程在等待连接**。
+
+## 连接池的原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    连接池工作原理                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                  Connection Pool                        │   │
+│  │                                                      │   │
+│  │   ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐              │   │
+│  │   │ C1 │ │ C2 │ │ C3 │ │ C4 │ │ C5 │              │   │
+│  │   └────┘ └────┘ └────┘ └────┘ └────┘              │   │
+│  │                                                      │   │
+│  │   Pool: 5 个连接，线程按需获取                      │   │
+│  │   Thread A ──▶ 获取 C1 ──▶ 使用 ──▶ 归还 C1       │   │
+│  │   Thread B ──▶ 获取 C2 ──▶ 使用 ──▶ 归还 C2       │   │
+│  │   Thread C ──▶ 获取 C3 ──▶ 使用 ──▶ 归还 C3       │   │
+│  │   Thread D ──▶ 等待...（无空闲连接）              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  瓶颈：                                                        │
+│  - 连接数不足：线程等待                                          │
+│  - 连接复用不当：连接长时间占用                                  │
+│  - 连接泄漏：连接未正确归还                                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 数据库连接池
+
+### HikariCP 配置
+
+```java
+// HikariCP 配置
+@Configuration
+public class HikariConfig {
+    @Bean
+    public DataSource dataSource() {
+        HikariConfig config = new HikariConfig();
+
+        // 连接池大小
+        // 公式：connections = ((core_count * 2) + effective_spindle_count)
+        int coreCount = Runtime.getRuntime().availableProcessors();
+        config.setMaximumPoolSize(coreCount * 2 + 10);
+        config.setMinimumIdle(coreCount);
+
+        // 连接超时
+        config.setConnectionTimeout(30000);    // 获取连接超时：30s
+        config.setIdleTimeout(600000);          // 空闲超时：10min
+        config.setMaxLifetime(1800000);         // 连接最大生命周期：30min
+
+        // 性能优化
+        config.addDataSourceProperty("cachePrepStmts", "true");
+        config.addDataSourceProperty("prepStmtCacheSize", "250");
+        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        config.addDataSourceProperty("useServerPrepStmts", "true");
+        config.addDataSourceProperty("rewriteBatchedStatements", "true");
+
+        // 验证
+        config.setConnectionTestQuery("SELECT 1");
+        config.setValidationTimeout(5000);
+
+        return new HikariDataSource(config);
+    }
+}
+```
+
+### 连接池大小计算
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    连接池大小计算                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  公式：                                                        │
+│  connections = ((core_count * 2) + effective_spindle_count)     │
+│                                                                  │
+│  示例：                                                         │
+│  - CPU 核心数：8                                               │
+│  - 磁盘类型：SSD（effective_spindle_count ≈ 1）                │
+│  - 连接数 = (8 * 2) + 1 = 17                                  │
+│                                                                  │
+│  经验公式（IO 密集型）：                                        │
+│  connections = core_count * expected_utilization *              │
+│                (1 + average_wait_time / average_work_time)      │
+│                                                                  │
+│  示例：                                                         │
+│  - core_count = 8                                             │
+│  - expected_utilization = 0.8                                  │
+│  - wait_time = 100ms, work_time = 10ms                        │
+│  - connections = 8 * 0.8 * (1 + 100/10) = 72                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 常见问题
+
+```java
+// 问题一：连接泄漏
+public class ConnectionLeakExample {
+    @Autowired
+    private DataSource dataSource;
+
+    // 错误：未关闭连接
+    public void wrongMethod() {
+        Connection conn = dataSource.getConnection();
+        // 使用连接
+        // 没有 finally { conn.close(); }
+    }
+
+    // 正确：使用 try-with-resources
+    public void correctMethod() {
+        try (Connection conn = dataSource.getConnection()) {
+            // 使用连接，自动关闭
+        }
+    }
+}
+
+// 问题二：长事务占用连接
+public class LongTransactionExample {
+    // 错误：在事务中做 IO 操作
+    @Transactional
+    public void wrongMethod() {
+        Connection conn = dataSource.getConnection();
+        // 查询数据
+        // 发送 HTTP 请求（耗时操作）
+        // 提交事务
+        // 连接被长时间占用
+    }
+
+    // 正确：快速事务
+    @Transactional
+    public void correctMethod() {
+        // 查询数据（在事务中）
+        // 提交事务
+        // 发送 HTTP 请求（在事务外）
+    }
+}
+```
+
+## HTTP 连接池
+
+### Apache HttpClient 连接池
+
+```java
+// Apache HttpClient 连接池
+@Configuration
+public class HttpClientConfig {
+    @Bean
+    public CloseableHttpClient httpClient() {
+        // 连接池配置
+        PoolingHttpClientConnectionManager connectionManager =
+            new PoolingHttpClientConnectionManager();
+
+        // 最大连接数
+        connectionManager.setMaxTotal(200);
+
+        // 每个路由最大连接数
+        connectionManager.setDefaultMaxPerRoute(100);
+
+        // 路由配置
+        connectionManager.setMaxPerRoute(
+            new HttpRoute(new HttpHost("api.example.com")), 50);
+
+        // 请求配置
+        RequestConfig requestConfig = RequestConfig.custom()
+            .setConnectTimeout(5000)           // 连接超时
+            .setSocketTimeout(30000)           // 读取超时
+            .setConnectionRequestTimeout(5000)  // 获取连接超时
+            .setStaleConnectionCheckEnabled(true)
+            .build();
+
+        // 空闲连接清理
+        IdleConnectionMonitor monitor = new IdleConnectionMonitor(connectionManager);
+        new Thread(monitor).start();
+
+        return HttpClients.custom()
+            .setConnectionManager(connectionManager)
+            .setDefaultRequestConfig(requestConfig)
+            .build();
+    }
+}
+
+// 空闲连接监控
+public class IdleConnectionMonitor implements Runnable {
+    private final PoolingHttpClientConnectionManager connectionManager;
+    private final int maxIdleTime = 30;  // 秒
+
+    public IdleConnectionMonitor(PoolingHttpClientConnectionManager connectionManager) {
+        this.connectionManager = connectionManager;
+    }
+
+    @Override
+    public void run() {
+        while (true) {
+            try {
+                Thread.sleep(10000);  // 每 10 秒检查一次
+                // 关闭空闲连接
+                connectionManager.closeIdleConnections(maxIdleTime, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+}
+```
+
+### OkHttp 连接池
+
+```java
+// OkHttp 连接池
+@Configuration
+public class OkHttpConfig {
+    @Bean
+    public OkHttpClient okHttpClient() {
+        return new OkHttpClient.Builder()
+            // 连接池
+            .connectionPool(new ConnectionPool(
+                50,             // 最大空闲连接数
+                5, TimeUnit.MINUTES  // 空闲超时
+            ))
+            // 连接超时
+            .connectTimeout(5, TimeUnit.SECONDS)
+            // 读取超时
+            .readTimeout(30, TimeUnit.SECONDS)
+            // 写入超时
+            .writeTimeout(30, TimeUnit.SECONDS)
+            // 连接池监听
+            .eventListenerFactory(EventListener.Factory {
+                return new EventListener() {
+                    // 记录连接获取、释放等事件
+                };
+            })
+            .build();
+    }
+}
+```
+
+### 连接池问题排查
+
+```bash
+# 查看连接状态
+netstat -an | grep ESTABLISHED | wc -l
+netstat -an | grep TIME_WAIT | wc -l
+
+# 大量 TIME_WAIT
+# 原因：短连接频繁创建销毁
+# 解决：开启连接复用、检查 connection: close 头
+
+# 大量连接等待
+# 原因：服务端响应慢或连接池配置不当
+# 解决：增加连接池、检查服务端状态
+```
+
+## Redis 连接池
+
+### Jedis 连接池
+
+```java
+// Jedis 连接池配置
+@Configuration
+public class JedisConfig {
+    @Bean
+    public JedisPool jedisPool() {
+        JedisPoolConfig poolConfig = new JedisPoolConfig();
+
+        // 连接池配置
+        poolConfig.setMaxTotal(200);
+        poolConfig.setMaxIdle(50);
+        poolConfig.setMinIdle(20);
+
+        // 阻塞等待
+        poolConfig.setMaxWaitMillis(3000);
+
+        // 检测连接
+        poolConfig.setTestOnBorrow(true);
+        poolConfig.setTestOnReturn(true);
+        poolConfig.setTestWhileIdle(true);
+        poolConfig.setMinEvictableIdleTimeMillis(60000);
+
+        return new JedisPool(poolConfig, "localhost", 6379);
+    }
+}
+
+// 使用连接池
+@Service
+public class RedisService {
+    @Autowired
+    private JedisPool jedisPool;
+
+    public String get(String key) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            return jedis.get(key);
+        }
+    }
+}
+```
+
+### Lettuce 连接池
+
+```java
+// Lettuce 连接池配置
+@Configuration
+public class LettuceConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(
+            LettuceConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+
+        // Lettuce 连接池配置
+        GenericObjectPoolConfig poolConfig = new GenericObjectPoolConfig<>();
+        poolConfig.setMaxTotal(200);
+        poolConfig.setMaxIdle(50);
+        poolConfig.setMinIdle(20);
+        poolConfig.setMaxWait(Duration.ofMillis(3000));
+
+        // 配置到连接工厂
+        LettucePoolingClientConfiguration clientConfig =
+            LettucePoolingClientConfiguration.builder()
+                .poolConfig(poolConfig)
+                .commandTimeout(Duration.ofMillis(3000))
+                .build();
+
+        factory.setClientConfiguration(clientConfig);
+        factory.afterPropertiesSet();
+
+        return template;
+    }
+}
+```
+
+## 连接池监控
+
+```java
+// 连接池监控
+@Service
+public class ConnectionPoolMonitor {
+    @Autowired
+    private DataSource dataSource;
+
+    public PoolStats getPoolStats() {
+        if (dataSource instanceof HikariDataSource) {
+            HikariDataSource hikari = (HikariDataSource) dataSource;
+            HikariPool pool = hikari.getHikariPool();
+
+            return new PoolStats(
+                pool.getActiveConnections(),     // 活跃连接
+                pool.getIdleConnections(),       // 空闲连接
+                pool.getTotalConnections(),       // 总连接
+                pool.getThreadsAwaitingConnection(),  // 等待线程
+                pool.getConnectionTimeout()      // 超时
+            );
+        }
+        return null;
+    }
+
+    @Scheduled(fixedRate = 60000)
+    public void logPoolStats() {
+        PoolStats stats = getPoolStats();
+        if (stats != null && stats.getThreadsAwaitingConnection() > 10) {
+            log.warn("连接池等待过多: {}", stats);
+        }
+    }
+}
+```
+
+## 总结
+
+连接池是性能优化的关键环节。
+
+**配置要点**：
+
+| 参数 | HikariCP | 说明 |
+|---|---|---|
+| maximumPoolSize | 最大连接数 | 与线程数匹配 |
+| minimumIdle | 最小空闲 | 预热连接 |
+| connectionTimeout | 连接超时 | 30s 左右 |
+| idleTimeout | 空闲超时 | 10min |
+| maxLifetime | 最大生命周期 | 30min |
+
+**常见问题**：
+
+- 连接泄漏：未正确关闭连接
+- 长事务：事务中做 IO
+- 连接不足：线程等待
+- 连接老化：连接复用过长
+
+**监控指标**：
+
+- 活跃连接数
+- 空闲连接数
+- 等待线程数
+- 连接获取时间

@@ -1,0 +1,486 @@
+---
+title: 异步化处理
+description: 通过异步化提升系统吞吐量和响应速度
+---
+
+# 异步化处理
+
+你的接口要处理发邮件、发短信、记录日志，每一步都要等前一步完成。
+
+问题出在哪？**同步处理让不需要等待的操作占用了响应时间**。
+
+异步化正是解决这个问题的方案：**把非关键路径的操作异步化，减少响应时间**。
+
+## 同步 vs 异步
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    同步 vs 异步                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  同步处理：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ [业务] ──▶ [发邮件] ──▶ [发短信] ──▶     │   │
+│  │              50ms       20ms          10ms         100ms    │   │
+│  │                                                    │   │
+│  │ 总延迟 = 50 + 20 + 10 + 100 = 180ms                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  异步处理：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ [业务] ──▶ Response (50ms)              │   │
+│  │              50ms        │                               │   │
+│  │                          ├──异步──▶ [发邮件] (20ms)   │   │
+│  │                          ├──异步──▶ [发短信] (10ms)   │   │
+│  │                          ├──异步──▶ [日志] (100ms)    │   │
+│  │                                                         │   │
+│  │ 总延迟 = 50ms                                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 异步化的应用场景
+
+### 场景一：非核心流程异步化
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    非核心流程异步化                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  核心流程（必须同步）：                                        │
+│  - 订单创建                                                   │
+│  - 支付扣款                                                   │
+│  - 库存扣减                                                   │
+│                                                                  │
+│  非核心流程（可以异步）：                                      │
+│  - 发送通知（邮件、短信、App Push）                           │
+│  - 记录日志                                                   │
+│  - 数据统计                                                   │
+│  - 第三方回调                                                 │
+│  - 更新搜索索引                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 场景二：耗时 IO 异步化
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    耗时 IO 异步化                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  同步 IO（阻塞等待）：                                        │
+│  - 数据库查询                                                 │
+│  - HTTP 调用                                                  │
+│  - 文件读写                                                   │
+│                                                                  │
+│  异步 IO（非阻塞）：                                           │
+│  - 消息队列                                                 │
+│  - 响应式编程                                                │
+│  - 回调函数                                                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Java 异步实现方式
+
+### 1. CompletableFuture
+
+```java
+// CompletableFuture 异步调用
+@Service
+public class AsyncService {
+    private final ExecutorService executor = Executors.newFixedThreadPool(100);
+
+    // 同步方法
+    public User getUser(Long userId) {
+        return userRepository.findById(userId);
+    }
+
+    // 异步方法
+    public CompletableFuture<User> getUserAsync(Long userId) {
+        return CompletableFuture.supplyAsync(
+            () -> userRepository.findById(userId),
+            executor
+        );
+    }
+
+    // 并行调用多个服务
+    public CompletableFuture<UserDetail> getUserDetail(Long userId, Long orderId) {
+        CompletableFuture<User> userFuture = getUserAsync(userId);
+        CompletableFuture<Order> orderFuture = getOrderAsync(orderId);
+
+        // 等待所有完成
+        return CompletableFuture.allOf(userFuture, orderFuture)
+            .thenApply(v -> new UserDetail(
+                userFuture.join(),
+                orderFuture.join()
+            ));
+    }
+
+    // 任一完成即返回
+    public CompletableFuture<Object> getFromMultiple(Long userId, Long orderId) {
+        CompletableFuture<User> userFuture = getUserAsync(userId);
+        CompletableFuture<Order> orderFuture = getOrderAsync(orderId);
+
+        return userFuture.applyToEither(orderFuture, result -> result);
+    }
+}
+```
+
+### 2. @Async 注解
+
+```java
+// Spring @Async 配置
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(100);
+        executor.setQueueCapacity(500);
+        executor.setThreadNamePrefix("async-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+
+// 使用 @Async
+@Service
+public class NotificationService {
+    @Async
+    public CompletableFuture<Void> sendEmail(String to, String content) {
+        // 发送邮件（异步）
+        emailSender.send(to, content);
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Async
+    public CompletableFuture<Void> sendSms(String phone, String content) {
+        // 发送短信（异步）
+        smsSender.send(phone, content);
+        return CompletableFuture.completedFuture(null);
+    }
+}
+
+// 调用方
+@Service
+public class OrderService {
+    @Autowired
+    private NotificationService notificationService;
+
+    public void createOrder(Order order) {
+        // 创建订单（同步）
+        orderRepository.save(order);
+
+        // 发送通知（异步）
+        notificationService.sendEmail(order.getUserEmail(), "订单创建成功");
+        notificationService.sendSms(order.getUserPhone(), "订单创建成功");
+    }
+}
+```
+
+### 3. 消息队列异步化
+
+```java
+// 消息队列异步处理
+@Service
+public class AsyncMessageService {
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    // 生产者：发送消息
+    public void createOrder(Order order) {
+        // 1. 创建订单（同步）
+        Order saved = orderRepository.save(order);
+
+        // 2. 发送消息（异步）
+        OrderCreatedEvent event = new OrderCreatedEvent(saved);
+        kafkaTemplate.send("order-events", saved.getId().toString(), event);
+
+        // 3. 立即返回
+        return saved;
+    }
+}
+
+// 消费者：处理消息
+@Service
+public class OrderEventConsumer {
+    @KafkaListener(topics = "order-events", groupId = "notification-group")
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        // 发送通知
+        emailService.send(event.getUserEmail(), "订单创建成功");
+        smsService.send(event.getUserPhone(), "订单创建成功");
+    }
+
+    @KafkaListener(topics = "order-events", groupId = "analytics-group")
+    public void handleOrderForAnalytics(OrderCreatedEvent event) {
+        // 记录统计
+        analyticsService.recordOrder(event);
+    }
+}
+```
+
+## 异步编程模式
+
+### 异步回调模式
+
+```java
+// 异步回调模式
+public class AsyncCallbackExample {
+    public interface Callback<T> {
+        void onSuccess(T result);
+        void onError(Exception e);
+    }
+
+    public <T> void asyncCall(Callable<T> callable, Callback<T> callback) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                T result = callable.call();
+                callback.onSuccess(result);
+            } catch (Exception e) {
+                callback.onError(e);
+            }
+        });
+    }
+
+    // 使用
+    public void example() {
+        asyncCall(
+            () -> userRepository.findById(1L),
+            new Callback<User>() {
+                @Override
+                public void onSuccess(User user) {
+                    System.out.println("用户: " + user.getName());
+                }
+
+                @Override
+                public void onError(Exception e) {
+                    System.out.println("错误: " + e.getMessage());
+                }
+            }
+        );
+    }
+}
+```
+
+### 异步编排模式
+
+```java
+// 异步编排
+@Service
+public class AsyncOrchestration {
+    // 串行执行
+    public CompletableFuture<String> serialProcess(Long userId) {
+        return getUser(userId)
+            .thenCompose(user -> getOrders(user.getId()))
+            .thenCompose(orders -> enrichWithProducts(orders))
+            .thenApply(enriched -> JSON.toJSONString(enriched));
+    }
+
+    // 并行执行
+    public CompletableFuture<UserDashboard> parallelProcess(Long userId) {
+        CompletableFuture<User> userFuture = getUser(userId);
+        CompletableFuture<List<Order>> ordersFuture = getOrders(userId);
+        CompletableFuture<List<Favorite>> favoritesFuture = getFavorites(userId);
+
+        return CompletableFuture.allOf(userFuture, ordersFuture, favoritesFuture)
+            .thenApply(v -> new UserDashboard(
+                userFuture.join(),
+                ordersFuture.join(),
+                favoritesFuture.join()
+            ));
+    }
+
+    // 复杂编排
+    public CompletableFuture<OrderDetail> complexProcess(Long orderId) {
+        return getOrder(orderId)
+            .thenCompose(order ->
+                // 先获取订单，再并行获取关联数据
+                CompletableFuture.allOf(
+                    getUser(order.getUserId()),
+                    getProducts(order.getProductIds())
+                ).thenApply(v -> {
+                    // 组合结果
+                    return new OrderDetail(order);
+                })
+            );
+    }
+}
+```
+
+## 异步异常处理
+
+```java
+// 异步异常处理
+@Service
+public class AsyncExceptionHandling {
+    // 方案一：exceptionally
+    public CompletableFuture<User> getUserWithFallback(Long userId) {
+        return CompletableFuture.supplyAsync(() -> userRepository.findById(userId))
+            .exceptionally(ex -> {
+                log.error("获取用户失败: {}", userId, ex);
+                return User.getDefault();  // 返回默认值
+            });
+    }
+
+    // 方案二：handle
+    public CompletableFuture<User> getUserWithHandle(Long userId) {
+        return CompletableFuture.supplyAsync(() -> userRepository.findById(userId))
+            .handle((result, ex) -> {
+                if (result != null) {
+                    return result;
+                }
+                log.error("获取用户失败: {}", userId, ex);
+                return User.getDefault();
+            });
+    }
+
+    // 方案三：whenComplete
+    public CompletableFuture<User> getUserWithComplete(Long userId) {
+        return CompletableFuture.supplyAsync(() -> userRepository.findById(userId))
+            .whenComplete((result, ex) -> {
+                if (ex != null) {
+                    log.error("获取用户失败: {}", userId, ex);
+                    metrics.recordError("user.get");
+                } else {
+                    metrics.recordSuccess("user.get");
+                }
+            });
+    }
+
+    // 超时处理
+    public CompletableFuture<User> getUserWithTimeout(Long userId) {
+        return CompletableFuture.supplyAsync(() -> userRepository.findById(userId))
+            .orTimeout(3, TimeUnit.SECONDS)
+            .exceptionally(ex -> {
+                if (ex instanceof TimeoutException) {
+                    log.warn("获取用户超时: {}", userId);
+                    return User.getDefault();
+                }
+                return null;
+            });
+    }
+}
+```
+
+## 异步化注意事项
+
+### 注意事项一：事务问题
+
+```java
+// 问题：异步方法中无法访问主线程的事务
+@Service
+public class TransactionProblemService {
+    @Transactional
+    public void createOrder(Order order) {
+        orderRepository.save(order);
+
+        // 问题：这里开启异步，但事务还没提交
+        // 异步方法中无法获取到这条数据
+        @Async
+        public void sendNotification(Order order) {
+            // 可能查询不到刚插入的数据
+        }
+    }
+
+    // 解决方案：使用编程式事务
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    public void createOrderWithNotification(Order order) {
+        transactionTemplate.execute(status -> {
+            orderRepository.save(order);
+
+            // 在事务提交后再发送通知
+            notificationService.sendNotification(order.getId());
+            return null;
+        });
+    }
+}
+```
+
+### 注意事项二：线程上下文
+
+```java
+// 问题：ThreadLocal 在异步线程中无法访问
+@Service
+public class ContextProblemService {
+    private static final ThreadLocal<UserContext> context = new ThreadLocal<>();
+
+    public void process() {
+        context.set(new UserContext(getCurrentUser()));
+
+        // 异步方法中无法获取 context
+        CompletableFuture.runAsync(() -> {
+            // context.get() 返回 null
+        });
+    }
+
+    // 解决方案：使用 CompletableFuture 参数传递
+    public void processCorrect() {
+        UserContext ctx = new UserContext(getCurrentUser());
+
+        CompletableFuture.runAsync(() -> {
+            // 通过闭包访问
+            processWithContext(ctx);
+        });
+    }
+}
+```
+
+### 注意事项三：监控和日志
+
+```java
+// 异步监控
+@Service
+public class AsyncMonitoring {
+    public <T> CompletableFuture<T> monitor(CompletableFuture<T> future, String operation) {
+        long start = System.currentTimeMillis();
+
+        return future.whenComplete((result, ex) -> {
+            long duration = System.currentTimeMillis() - start;
+
+            if (ex != null) {
+                log.error("异步操作失败: {} - {}ms", operation, duration, ex);
+                metrics.recordError(operation, duration);
+            } else {
+                log.info("异步操作完成: {} - {}ms", operation, duration);
+                metrics.recordSuccess(operation, duration);
+            }
+        });
+    }
+}
+```
+
+## 总结
+
+异步化是提升系统吞吐量和响应速度的有效手段。
+
+**适用场景**：
+
+- 非核心流程异步化
+- 耗时 IO 操作
+- 多服务并行调用
+- 削峰填谷
+
+**实现方式**：
+
+| 方式 | 适用场景 | 复杂度 |
+|---|---|---|
+| CompletableFuture | Java 并行调用 | 中 |
+| @Async | Spring 异步方法 | 低 |
+| 消息队列 | 解耦、可靠性要求高 | 高 |
+| 响应式编程 | 高并发 IO | 高 |
+
+**注意事项**：
+
+- 事务边界问题
+- 线程上下文传递
+- 异常处理和监控
+- 超时控制

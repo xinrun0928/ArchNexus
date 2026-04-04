@@ -116,7 +116,7 @@ export const nav = [
         items: [
             { text: '🏢 知名架构解析', link: '/analysis/famous-architectures/' },
             { text: '🔍 故障案例分析', link: '/analysis/failure-cases/' },
-            { text: '⚡ 性能调优案例', link: '/analysis/optimization-cases/' },
+            { text: '⚡️ 性能调优案例', link: '/analysis/optimization-cases/' },
             { text: '🚀 架构迁移案例', link: '/analysis/migration-cases/' },
             { text: '🎯 极限场景处理', link: '/analysis/extreme-scenarios/' }
         ]

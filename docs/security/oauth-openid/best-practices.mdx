@@ -1,0 +1,392 @@
+---
+title: OAuth 最佳实践
+description: OAuth 2.0 安全实现的关键注意事项
+---
+
+# OAuth 最佳实践
+
+你的 OAuth 实现存在安全漏洞，被人刷了接口。
+
+问题出在哪？**没有遵循 OAuth 安全最佳实践**。
+
+OAuth 2.0 虽然是标准协议，但实现不当会导致严重的安全问题。
+
+## 常见安全风险
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    OAuth 常见安全风险                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 授权码劫持                                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  攻击者截获授权码，冒充客户端换取 Token                  │   │
+│  │  风险：授权码在 URL 中传输                           │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. Token 泄露                                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Access Token 或 Refresh Token 泄露                    │   │
+│  │  攻击者可以用 Token 访问用户资源                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. Scope 过度授权                                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  客户端请求了超出需要的权限                           │   │
+│  │  用户没有意识到授予了过多权限                         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 4. 重放攻击                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  攻击者截获请求并重放                                  │   │
+│  │  授权码或 Token 被重复使用                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 5. CSRF 攻击                                             │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  攻击者诱导用户访问恶意页面，触发授权请求              │   │
+│  │  可能绑定攻击者的账号到用户身份                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 最佳实践
+
+### 1. 使用授权码模式 + PKCE
+
+```java
+// PKCE 配置（必须用于移动端和 SPA）
+@Configuration
+public class PkceConfig {
+
+    // 生成 code_verifier 和 code_challenge
+    public PkceChallenge generatePkceChallenge() {
+        // 1. 生成随机的 code_verifier（43-128 字符）
+        String codeVerifier = generateRandomString(64);
+
+        // 2. 计算 code_challenge = BASE64URL(SHA256(code_verifier))
+        String codeChallenge = calculateCodeChallenge(codeVerifier);
+
+        return new PkceChallenge(codeVerifier, codeChallenge);
+    }
+
+    private String calculateCodeChallenge(String verifier) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(verifier.getBytes(StandardCharsets.UTF_8));
+            return Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private String generateRandomString(int length) {
+        SecureRandom random = new SecureRandom();
+        String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+        StringBuilder sb = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            sb.append(chars.charAt(random.nextInt(chars.length())));
+        }
+        return sb.toString();
+    }
+}
+```
+
+### 2. 验证 state 参数
+
+```java
+// state 验证
+@Service
+public class OAuthStateService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String STATE_PREFIX = "oauth:state:";
+    private static final Duration STATE_EXPIRE = Duration.ofMinutes(10);
+
+    // 生成 state
+    public String generateState(String redirectUri, String provider) {
+        String state = UUID.randomUUID().toString();
+
+        OAuthState oauthState = new OAuthState();
+        oauthState.setRedirectUri(redirectUri);
+        oauthState.setProvider(provider);
+        oauthState.setCreatedAt(LocalDateTime.now());
+
+        redisTemplate.opsForValue().set(
+            STATE_PREFIX + state,
+            JsonUtils.toJson(oauthState),
+            STATE_EXPIRE
+        );
+
+        return state;
+    }
+
+    // 验证 state
+    public boolean validateState(String state, String expectedRedirectUri,
+                                String expectedProvider) {
+        String key = STATE_PREFIX + state;
+        String json = redisTemplate.opsForValue().get(key);
+
+        if (json == null) {
+            return false;  // state 不存在或已过期
+        }
+
+        OAuthState oauthState = JsonUtils.fromJson(json, OAuthState.class);
+
+        boolean valid = oauthState.getRedirectUri().equals(expectedRedirectUri)
+            && oauthState.getProvider().equals(expectedProvider);
+
+        // state 只能使用一次
+        redisTemplate.delete(key);
+
+        return valid;
+    }
+}
+```
+
+### 3. 安全存储 Token
+
+```java
+// Token 安全存储
+@Service
+public class SecureTokenStorage {
+
+    // Access Token 存储（内存或加密存储）
+    private final Map<String, AccessToken> tokenCache = new ConcurrentHashMap<>();
+
+    // 存储 Access Token
+    public void storeToken(String userId, String provider,
+                          AccessTokenResponse response) {
+        AccessToken token = new AccessToken();
+        token.setAccessToken(response.getAccessToken());
+        token.setRefreshToken(response.getRefreshToken());
+        token.setExpiresAt(LocalDateTime.now()
+            .plusSeconds(response.getExpiresIn()));
+        token.setScope(response.getScope());
+
+        String key = buildKey(userId, provider);
+        tokenCache.put(key, token);
+
+        // 如果有 Refresh Token，安全存储
+        if (response.getRefreshToken() != null) {
+            storeRefreshTokenSecurely(userId, provider,
+                response.getRefreshToken());
+        }
+    }
+
+    // 安全存储 Refresh Token（必须加密）
+    private void storeRefreshTokenSecurely(String userId, String provider,
+                                          String refreshToken) {
+        // 使用加密存储，不要明文存储
+        byte[] encrypted = encryptionService.encrypt(refreshToken);
+        // 存储加密后的 Refresh Token
+        refreshTokenStore.save(userId, provider, encrypted);
+    }
+}
+```
+
+### 4. 限制 Scope
+
+```java
+// Scope 限制
+@Configuration
+public class ScopeLimitConfig {
+
+    // 客户端声明的权限
+    private static final Map<String, Set<String>> CLIENT_SCOPES = Map.of(
+        "client-wechat", Set.of("profile", "email"),
+        "client-github", Set.of("user:email")
+    );
+
+    // 验证请求的 scope 是否在允许范围内
+    public Set<String> validateAndLimitScope(String clientId,
+                                             Set<String> requestedScopes) {
+        Set<String> allowedScopes = CLIENT_SCOPES.get(clientId);
+
+        if (allowedScopes == null) {
+            throw new SecurityException("未知的客户端");
+        }
+
+        Set<String> validScopes = requestedScopes.stream()
+            .filter(allowedScopes::contains)
+            .collect(Collectors.toSet());
+
+        if (validScopes.isEmpty()) {
+            throw new SecurityException("没有有效的权限范围");
+        }
+
+        return validScopes;
+    }
+}
+```
+
+### 5. Token 轮转
+
+```java
+// Refresh Token 轮转
+@Service
+public class TokenRotationService {
+    @Autowired
+    private TokenStore tokenStore;
+
+    // 刷新 Access Token
+    public AccessTokenResponse refreshAccessToken(String refreshToken) {
+        // 1. 验证 Refresh Token
+        RefreshTokenInfo info = tokenStore.getRefreshTokenInfo(refreshToken);
+
+        if (info == null || info.isRevoked()) {
+            throw new SecurityException("Refresh Token 无效");
+        }
+
+        // 2. 撤销旧 Refresh Token（轮转）
+        tokenStore.revokeRefreshToken(refreshToken);
+
+        // 3. 颁发新的 Access Token 和 Refresh Token
+        AccessTokenResponse response = generateNewTokens(info.getUserId());
+
+        // 4. 存储新 Token
+        tokenStore.storeTokens(info.getUserId(), response);
+
+        return response;
+    }
+}
+```
+
+### 6. CSRF 防护
+
+```java
+// OAuth CSRF 防护
+@Service
+public class OAuthCsrfProtectionService {
+
+    // 在发起授权请求时生成 state
+    public String buildAuthorizationRequest(String provider,
+                                           String redirectUri,
+                                           HttpSession session) {
+        // 1. 生成随机的 state
+        String state = generateSecureState();
+
+        // 2. 将 state 存入 Session（用于回调验证）
+        session.setAttribute("oauth_state_" + provider, state);
+        session.setAttribute("oauth_redirect_" + provider, redirectUri);
+
+        // 3. 构建授权 URL
+        AuthorizationRequest request = AuthorizationRequest
+            .authorizationCode()
+            .clientId(getClientId(provider))
+            .authorizationUri(getAuthUri(provider))
+            .redirectUri(redirectUri)
+            .scopes(getScopes(provider))
+            .state(state)
+            .nonce(generateNonce())
+            .build();
+
+        return request.getAuthorizationRequestUri();
+    }
+
+    // 验证回调
+    public boolean validateCallback(String provider,
+                                   String state,
+                                   String callbackState,
+                                   HttpSession session) {
+        String sessionState = (String) session.getAttribute(
+            "oauth_state_" + provider);
+
+        // 清除 Session 中的 state
+        session.removeAttribute("oauth_state_" + provider);
+
+        // 验证 state
+        if (sessionState == null || !sessionState.equals(state)) {
+            throw new SecurityException("CSRF 验证失败");
+        }
+
+        return true;
+    }
+}
+```
+
+## 安全配置清单
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    OAuth 安全配置清单                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 客户端安全                                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ✓ client_secret 必须安全存储                        │   │
+│  │  ✓ 使用 PKCE（SPA、移动端）                          │   │
+│  │  ✓ 验证 state 参数                                    │   │
+│  │  ✓ 验证 redirect_uri                                │   │
+│  │  ✓ Token 必须加密存储                                │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 授权服务器安全                                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ✓ 验证 client_id                                    │   │
+│  │  ✓ 验证 redirect_uri                                │   │
+│  │  ✓ 授权码只能用一次                                  │   │
+│  │  ✓ 授权码短期过期                                    │   │
+│  │  ✓ 支持 Token 轮转                                  │   │
+│  │  ✓ 记录审计日志                                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 传输安全                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  ✓ 必须使用 HTTPS                                    │   │
+│  │  ✓ Token 不在 URL 中传输                            │   │
+│  │  ✓ 使用 SameSite Cookie                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+OAuth 2.0 安全实现需要遵循最佳实践。
+
+**关键安全措施**：
+
+- PKCE：移动端和 SPA 必须使用
+- state 验证：防止 CSRF
+- 安全的 Token 存储：加密存储
+- Scope 限制：只请求必要的权限
+- Token 轮转：Refresh Token 一次性使用
+- HTTPS：必须使用
+
+**常见风险**：
+
+- 授权码劫持
+- Token 泄露
+- 过度授权
+- CSRF
+
+**核心认知**：OAuth 2.0 协议本身是安全的，但实现细节决定了最终的安全性。再好的协议，实现不当也会导致漏洞。

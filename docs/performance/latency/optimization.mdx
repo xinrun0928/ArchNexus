@@ -1,0 +1,474 @@
+---
+title: 延迟优化策略
+description: 从架构到代码的延迟优化实践
+---
+
+# 延迟优化策略
+
+找到了瓶颈，下一步就是优化。延迟优化有多种策略，需要根据实际情况选择。
+
+## 优化策略总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟优化策略总览                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    架构层优化                            │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 1. 缓存：热点数据缓存，减少计算                        │   │
+│  │ 2. 异步：非关键路径异步化                              │   │
+│  │ 3. 并行：依赖操作并行化                                │   │
+│  │ 4. 分片：数据分片消除热点                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    数据层优化                            │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 1. 索引：合理索引加速查询                              │   │
+│  │ 2. 预加载：提前加载热点数据                            │   │
+│  │ 3. 读写分离：读写分流                                  │   │
+│  │ 4. 连接池：复用连接减少开销                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    代码层优化                            │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 1. 算法：选择更优算法                                  │   │
+│  │ 2. 对象：减少对象分配                                  │   │
+│  │ 3. 序列化：优化序列化性能                              │   │
+│  │ 4. 零拷贝：避免不必要的数据复制                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 策略一：缓存
+
+### 多级缓存
+
+```java
+// 多级缓存实现
+@Service
+public class MultiLevelCacheService {
+    // L1: 本地缓存
+    private final Cache<String, Object> l1Cache = Caffeine.newBuilder()
+        .maximumSize(10000)
+        .expireAfterWrite(1, TimeUnit.MINUTES)
+        .build();
+
+    // L2: Redis
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public Object get(String key) {
+        // L1 优先
+        Object value = l1Cache.getIfPresent(key);
+        if (value != null) {
+            return value;
+        }
+
+        // L2 其次
+        value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            l1Cache.put(key, value);  // 回填 L1
+            return value;
+        }
+
+        // 回源
+        value = loadFromDb(key);
+        redisTemplate.opsForValue().set(key, value, Duration.ofMinutes(30));
+        l1Cache.put(key, value);
+
+        return value;
+    }
+}
+```
+
+### 缓存优化效果
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    缓存优化效果对比                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  无缓存：                                                       │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ DB ──▶ 100ms                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  L1 缓存命中：                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ Memory ──▶ 0.1ms                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  提升：1000 倍                                                 │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 策略二：异步化
+
+### 异步 HTTP
+
+```java
+// 异步 HTTP 调用
+@Service
+public class AsyncHttpService {
+    private final AsyncRestTemplate asyncRestTemplate = new AsyncRestTemplate();
+
+    public CompletableFuture<String> getUser(Long userId) {
+        return asyncRestTemplate.getForEntity(
+            "http://user-service/api/users/{id}",
+            String.class,
+            userId
+        ).toCompletableFuture()
+         .thenApply(response -> response.getBody());
+    }
+
+    public CompletableFuture<String> getProduct(Long productId) {
+        return asyncRestTemplate.getForEntity(
+            "http://product-service/api/products/{id}",
+            String.class,
+            productId
+        ).toCompletableFuture()
+         .thenApply(response -> response.getBody());
+    }
+
+    // 并行调用
+    public CompletableFuture<Detail> getDetail(Long userId, Long productId) {
+        CompletableFuture<String> userFuture = getUser(userId);
+        CompletableFuture<String> productFuture = getProduct(productId);
+
+        return CompletableFuture.allOf(userFuture, productFuture)
+            .thenApply(v -> new Detail(
+                userFuture.join(),
+                productFuture.join()
+            ));
+    }
+}
+```
+
+### 异步消息
+
+```java
+// 异步消息处理
+@Service
+public class AsyncMessageService {
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    // 同步：等待处理完成
+    public void syncProcess(Order order) {
+        orderService.process(order);      // 50ms
+        notificationService.notify(order); // 20ms
+        analyticsService.record(order);   // 10ms
+        // 总计：80ms
+    }
+
+    // 异步：非关键路径异步化
+    public void asyncProcess(Order order) {
+        // 核心流程同步
+        orderService.process(order);      // 50ms
+
+        // 非核心流程异步
+        CompletableFuture.runAsync(() -> notificationService.notify(order));
+        CompletableFuture.runAsync(() -> analyticsService.record(order));
+
+        // 总计：50ms
+    }
+}
+```
+
+## 策略三：并行化
+
+### 并行查询
+
+```java
+// 并行查询优化
+@Service
+public class ParallelQueryService {
+
+    // 串行查询
+    public UserProfile getProfileSlow(Long userId) {
+        User user = userDao.findById(userId);          // 10ms
+        List<Order> orders = orderDao.findByUserId(userId); // 20ms
+        List<Favorite> favorites = favoriteDao.findByUserId(userId); // 15ms
+        return new UserProfile(user, orders, favorites);
+        // 总计：45ms
+    }
+
+    // 并行查询
+    public UserProfile getProfileFast(Long userId) {
+        CompletableFuture<User> userFuture = CompletableFuture
+            .supplyAsync(() -> userDao.findById(userId));
+        CompletableFuture<List<Order>> ordersFuture = CompletableFuture
+            .supplyAsync(() -> orderDao.findByUserId(userId));
+        CompletableFuture<List<Favorite>> favoritesFuture = CompletableFuture
+            .supplyAsync(() -> favoriteDao.findByUserId(userId));
+
+        // 等待所有完成
+        CompletableFuture.allOf(userFuture, ordersFuture, favoritesFuture).join();
+
+        return new UserProfile(
+            userFuture.join(),
+            ordersFuture.join(),
+            favoritesFuture.join()
+        );
+        // 总计：max(10, 20, 15) = 20ms
+        // 提升 2.25 倍
+    }
+}
+```
+
+### CompletableFuture 最佳实践
+
+```java
+// CompletableFuture 优化技巧
+public class CompletableFutureOptimization {
+    // 技巧一：使用线程池
+    private final ExecutorService executor = Executors.newFixedThreadPool(
+        Runtime.getRuntime().availableProcessors() * 2,
+        new ThreadFactoryBuilder().setNameFormat("async-%d").build()
+    );
+
+    // 技巧二：异常处理
+    public CompletableFuture<String> getWithFallback(String key) {
+        return CompletableFuture
+            .supplyAsync(() -> fetchFromService(key), executor)
+            .exceptionally(ex -> {
+                log.error("服务调用失败，使用缓存", ex);
+                return getFromCache(key);
+            });
+    }
+
+    // 技巧三：超时控制
+    public CompletableFuture<String> getWithTimeout(String key) {
+        return CompletableFuture
+            .supplyAsync(() -> fetchFromService(key), executor)
+            .orTimeout(3, TimeUnit.SECONDS)
+            .exceptionally(ex -> {
+                if (ex instanceof TimeoutException) {
+                    log.warn("服务调用超时: {}", key);
+                    return getFromCache(key);
+                }
+                return null;
+            });
+    }
+}
+```
+
+## 策略四：数据库优化
+
+### 索引优化
+
+```sql
+-- 优化前：全表扫描
+SELECT * FROM orders
+WHERE user_id = 12345
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- EXPLAIN 分析
+-- type: ALL (全表扫描)
+-- rows: 10000000 (扫描 1000 万行)
+
+-- 优化后：使用索引
+CREATE INDEX idx_user_created ON orders(user_id, created_at DESC);
+
+-- 再次 EXPLAIN
+-- type: ref (索引查找)
+-- rows: 20 (只扫描 20 行)
+-- Extra: Using index condition
+```
+
+### SQL 优化
+
+```java
+// 批量查询优化
+@Service
+public class BatchQueryService {
+
+    // 错误：循环查询（N+1 问题）
+    public List<User> getUsersWithOrdersWrong(List<Long> userIds) {
+        return userIds.stream()
+            .map(userId -> {
+                User user = userDao.findById(userId);
+                user.setOrders(orderDao.findByUserId(userId));  // N+1!
+                return user;
+            })
+            .collect(Collectors.toList());
+    }
+
+    // 正确：批量查询
+    public List<User> getUsersWithOrdersCorrect(List<Long> userIds) {
+        // 批量查询用户
+        List<User> users = userDao.findByIds(userIds);
+
+        // 批量查询订单
+        List<Order> orders = orderDao.findByUserIds(userIds);
+        Map<Long, List<Order>> ordersMap = orders.stream()
+            .collect(Collectors.groupingBy(Order::getUserId));
+
+        // 组装
+        users.forEach(user ->
+            user.setOrders(ordersMap.getOrDefault(user.getId(), Collections.emptyList()))
+        );
+
+        return users;
+    }
+}
+```
+
+### 连接池优化
+
+```java
+// HikariCP 连接池优化
+@Configuration
+public class DataSourceConfig {
+    @Bean
+    public DataSource dataSource() {
+        HikariConfig config = new HikariConfig();
+
+        // 池大小优化
+        // 公式：connections = ((core_count * 2) + effective_spindle_count)
+        int coreCount = Runtime.getRuntime().availableProcessors();
+        config.setMaximumPoolSize(coreCount * 2 + 10);
+        config.setMinimumIdle(coreCount);
+
+        // 超时优化
+        config.setConnectionTimeout(3000);   // 获取连接超时
+        config.setIdleTimeout(600000);      // 空闲连接超时
+        config.setMaxLifetime(1800000);    // 连接最大生命周期
+
+        // 性能优化
+        config.addDataSourceProperty("cachePrepStmts", "true");
+        config.addDataSourceProperty("prepStmtCacheSize", "250");
+        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+
+        return new HikariDataSource(config);
+    }
+}
+```
+
+## 策略五：序列化优化
+
+### JSON 序列化
+
+```java
+// Jackson 序列化优化
+@Configuration
+public class JacksonConfig {
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // 关闭特性
+        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        mapper.configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        // 启用序列化优化
+        mapper.registerModule(new JavaTimeModule());  // Java 8 时间支持
+        mapper.registerModule(new Hibernate5Module()); // Hibernate 懒加载支持
+
+        return mapper;
+    }
+}
+
+// FastJSON vs Jackson
+/*
+┌─────────────────────────────────────────────────────────────────┐
+│                    序列化性能对比                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  FastJSON：                                                    │
+│  - 序列化：快（约 2x Jackson）                                  │
+│  - 反序列化：快（约 2x Jackson）                                │
+│  - 安全性：历史上有漏洞，需要注意                               │
+│                                                                  │
+│  Jackson：                                                     │
+│  - 生态好                                                       │
+│  - 功能全                                                       │
+│  - 安全性好                                                    │
+│                                                                  │
+│  推荐：功能优先选 Jackson，性能敏感选 FastJSON                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+*/
+```
+
+### Protocol Buffers
+
+```protobuf
+// proto 定义
+syntax = "proto3";
+
+message User {
+    int64 id = 1;
+    string name = 2;
+    string email = 3;
+    int32 age = 4;
+}
+
+// Java 生成
+// protoc --java_out=. user.proto
+
+// 使用
+User user = User.newBuilder()
+    .setId(1)
+    .setName("张三")
+    .setEmail("zhang@example.com")
+    .setAge(25)
+    .build();
+
+// 序列化
+byte[] bytes = user.toByteArray();
+
+// 反序列化
+User parsedUser = User.parseFrom(bytes);
+```
+
+## 优化效果评估
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    优化效果评估表                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │ 优化项        │ 优化前  │ 优化后  │ 提升  │ 成本         │   │
+│  ├───────────────────────────────────────────────────────────┤   │
+│  │ L1 缓存      │ 100ms  │ 0.1ms  │ 1000x │ 中          │   │
+│  │ 异步化       │ 80ms   │ 50ms   │ 1.6x  │ 高          │   │
+│  │ 并行查询     │ 45ms   │ 20ms   │ 2.25x │ 低          │   │
+│  │ 数据库索引   │ 500ms  │ 50ms   │ 10x   │ 低          │   │
+│  │ 批量查询     │ 1000ms │ 100ms  │ 10x   │ 中          │   │
+│  │ PB 序列化    │ 10ms   │ 1ms    │ 10x   │ 高          │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  优化建议：优先低成本高回报的优化                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+延迟优化需要系统化的策略。
+
+**核心策略**：
+
+| 策略 | 效果 | 成本 | 优先级 |
+|---|---|---|---|
+| 缓存 | 极高 | 中 | ⭐⭐⭐ |
+| 异步化 | 高 | 高 | ⭐⭐⭐ |
+| 并行化 | 高 | 低 | ⭐⭐⭐ |
+| 数据库优化 | 高 | 低 | ⭐⭐⭐ |
+| 序列化优化 | 中 | 高 | ⭐⭐ |
+
+**优化原则**：
+
+1. 先测量后优化
+2. 先架构后代码
+3. 先瓶颈后全面
+4. 先效果后复杂度

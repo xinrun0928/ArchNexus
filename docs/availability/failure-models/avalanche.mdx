@@ -1,0 +1,373 @@
+---
+title: 雪崩效应
+description: 分布式系统的雪崩效应及其防护
+---
+
+# 雪崩效应
+
+你的系统在高峰期的故障率是平时的 10 倍，明明配置都一样，为什么？
+
+问题出在哪？**高并发本身就是故障的放大器**。
+
+雪崩效应正是这种现象：正常情况下稳定的系统，在高负载下可能突然崩溃。
+
+## 雪崩效应的本质
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    雪崩效应的本质                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  雪崩效应 = 轻微的性能下降 × 连锁反应 = 系统崩溃                 │
+│                                                                  │
+│  触发条件：                                                    │
+│  1. 系统处于高负载状态                                         │
+│  2. 某个组件性能下降                                           │
+│  3. 请求堆积                                                  │
+│  4. 更多组件 性能下降                                          │
+│  5. 循环往复，最终系统崩溃                                     │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │   正常状态：                                            │   │
+│  │   请求 1000 ──▶ 处理 1000 ──▶ 响应 1000               │   │
+│  │   延迟: 10ms                                            │   │
+│  │                                                         │   │
+│  │   雪崩状态：                                            │   │
+│  │   请求 1000 ──▶ 处理 100 ──▶ 堆积 900 ──▶ 超时崩溃  │   │
+│  │   延迟: 10000ms                                         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 雪崩的形成机制
+
+### 机制一：资源耗尽
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    资源耗尽型雪崩                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  线程池 / 连接池容量有限：                                      │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  线程池容量: 100                                        │   │
+│  │                                                         │   │
+│  │  时刻 1: 80 个请求在处理，20 个等待 ──▶ 正常          │   │
+│  │  时刻 2: 100 个请求在处理，0 个等待 ──▶ 饱和          │   │
+│  │  时刻 3: 新请求被拒绝或排队 ──▶ 用户重试              │   │
+│  │  时刻 4: 重试请求 + 新请求 = 200 ──▶ 崩溃          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 机制二：GC 停顿
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    GC 停顿型雪崩                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  高并发 + 大对象分配 = 频繁 GC + 长停顿：                       │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  正常情况：                                              │   │
+│  │  Minor GC: 10ms × 1次/秒 = 1% 停顿                   │   │
+│  │                                                         │   │
+│  │  高负载情况：                                           │   │
+│  │  对象大量创建 ──▶ Eden 区快速填满                    │   │
+│  │  Minor GC: 50ms × 5次/秒 = 25% 停顿                 │   │
+│  │  停顿期间请求堆积                                       │   │
+│  │                                                         │   │
+│  │  极端情况：                                             │   │
+│  │  对象太多 ──▶ Full GC: 500ms × 1次 = 系统假死      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 机制三：缓存失效
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    缓存失效型雪崩                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  大量缓存同时失效 = 大量请求穿透到数据库：                       │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  正常情况：                                             │   │
+│  │  缓存命中率 99%                                        │   │
+│  │  数据库 QPS: 10000 × 1% = 100                        │   │
+│  │                                                         │   │
+│  │  缓存失效情况：                                         │   │
+│  │  缓存命中率 0%                                         │   │
+│  │  数据库 QPS: 10000 × 100% = 10000 ──▶ 数据库崩溃  │   │
+│  │                                                         │   │
+│  │  常见原因：                                             │   │
+│  │  - 缓存过期时间设置相同                               │   │
+│  │  - 系统重启导致缓存清空                               │   │
+│  │  - Redis 故障导致缓存丢失                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 雪崩效应的防护
+
+### 防护一：容量规划
+
+```java
+// 容量规划
+public class CapacityPlanning {
+    /*
+    容量规划步骤：
+
+    1. 确定目标 QPS
+       - 历史峰值 × 增长系数
+
+    2. 确定单实例处理能力
+       - 压测获取
+       - 或估算：并发数 / 平均响应时间
+
+    3. 计算所需实例数
+       - 实例数 = 目标 QPS / 单实例 QPS / 利用率系数
+
+    4. 预留 buffer
+       - 实例数 × 1.5 ~ 2.0
+
+    示例：
+    - 目标 QPS: 10000
+    - 单实例 QPS: 500
+    - 利用率系数: 0.7
+    - 所需实例: 10000 / 500 / 0.7 = 29
+    - 预留 buffer: 29 × 1.5 = 44
+    */
+}
+```
+
+### 防护二：限流保护
+
+```java
+// Sentinel 限流配置
+@Configuration
+public class SentinelConfig {
+    @Bean
+    public SentinelResourceAspect sentinelResourceAspect() {
+        return new SentinelResourceAspect();
+    }
+}
+
+// 使用限流
+@Service
+public class RateLimitedService {
+    @SentinelResource(value = "getData",
+        blockHandler = "blockHandler",
+        fallback = "fallback")
+    public String getData(String id) {
+        return dataService.get(id);
+    }
+
+    // 限流处理
+    public String blockHandler(String id, BlockException ex) {
+        return "系统繁忙，请稍后重试";
+    }
+
+    // 降级处理
+    public String fallback(String id, Throwable ex) {
+        log.error("获取数据失败", ex);
+        return getDefaultData();
+    }
+}
+```
+
+### 防护三：熔断降级
+
+```java
+// Resilience4j 熔断配置
+@Configuration
+public class Resilience4jConfig {
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        return CircuitBreakerRegistry.ofDefaults();
+    }
+}
+
+@Service
+public class CircuitBreakerService {
+    private final CircuitBreaker circuitBreaker;
+
+    public CircuitBreakerService(CircuitBreakerRegistry registry) {
+        this.circuitBreaker = registry.circuitBreaker("slowService");
+    }
+
+    public String callService() {
+        return circuitBreaker.executeSupplier(() -> {
+            return remoteService.call();
+        });
+    }
+
+    // 降级方法
+    public String fallback() {
+        return "服务降级，返回缓存数据";
+    }
+}
+```
+
+### 防护四：缓存策略
+
+```java
+// 防止缓存雪崩
+@Service
+public class CacheStrategyService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 错误：固定过期时间
+    public Object getDataWrong(String key) {
+        Object value = redisTemplate.opsForValue().get(key);
+        if (value == null) {
+            value = loadFromDb(key);
+            // 所有 key 同时过期
+            redisTemplate.opsForValue().set(key, value, Duration.ofHours(1));  // [!code highlight]
+        }
+        return value;
+    }
+
+    // 正确：随机过期时间
+    public Object getDataRight(String key) {
+        Object value = redisTemplate.opsForValue().get(key);
+        if (value == null) {
+            value = loadFromDb(key);
+            // 随机过期时间 ± 10%
+            long baseExpiry = 3600;  // 1 小时
+            long jitter = (long)(baseExpiry * 0.1 * Math.random());
+            long expiry = baseExpiry + jitter;
+            redisTemplate.opsForValue().set(key, value, Duration.ofSeconds(expiry));  // [!code highlight]
+        }
+        return value;
+    }
+
+    // 正确：不过期 + 异步更新
+    public Object getDataAsyncRefresh(String key) {
+        Object value = redisTemplate.opsForValue().get(key);
+        if (value == null) {
+            value = loadFromDb(key);
+            redisTemplate.opsForValue().set(key, value);  // 永不过期
+
+            // 异步更新缓存
+            CompletableFuture.runAsync(() -> {
+                Object newValue = loadFromDb(key);
+                redisTemplate.opsForValue().set(key, newValue);
+            });
+        }
+        return value;
+    }
+}
+```
+
+### 防护五：预热保护
+
+```java
+// 预热保护
+@Service
+public class WarmupService {
+    private final Map<String, Object> cache = new ConcurrentHashMap<>();
+    private volatile boolean warmed = false;
+
+    public Object getData(String key) {
+        if (!warmed) {
+            warmup();
+        }
+        return cache.getOrDefault(key, loadFromDb(key));
+    }
+
+    private void warmup() {
+        synchronized (this) {
+            if (warmed) return;
+
+            log.info("开始预热...");
+
+            // 预热热点数据
+            List<String> hotKeys = getHotKeys();
+            for (String key : hotKeys) {
+                Object value = loadFromDb(key);
+                cache.put(key, value);
+            }
+
+            warmed = true;
+            log.info("预热完成，共加载 {} 条数据", hotKeys.size());
+        }
+    }
+
+    private List<String> getHotKeys() {
+        // 从监控或历史数据获取热点 key
+        return redisTemplate.opsForZSet()
+            .reverseRange("hot:keys", 0, 99)
+            .stream()
+            .map(key -> (String) key)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 雪崩恢复策略
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    雪崩恢复策略                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 自动限流                                              │
+│     - 触发阈值，自动限制流量                                    │
+│     - 保护系统不被压垮                                          │
+│                                                                  │
+│  2. 渐进恢复                                                   │
+│     - 不要突然放开全部流量                                      │
+│     - 逐步增加负载，观察系统状态                                │
+│                                                                  │
+│  3. 降级策略                                                   │
+│     - 部分功能不可用，保证核心功能                              │
+│     - 异步处理非核心请求                                        │
+│                                                                  │
+│  4. 人工介入                                                   │
+│     - 严重故障需要人工判断                                      │
+│     - 建立故障响应流程                                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+雪崩效应是高并发系统的常见故障模式。
+
+**形成机制**：
+
+- 资源耗尽型
+- GC 停顿型
+- 缓存失效型
+
+**防护策略**：
+
+- 容量规划：预留 buffer
+- 限流保护：控制流量
+- 熔断降级：快速失败
+- 缓存策略：防止同时失效
+- 预热保护：渐进加载
+
+**恢复策略**：
+
+- 自动限流
+- 渐进恢复
+- 降级优先
+- 人工介入

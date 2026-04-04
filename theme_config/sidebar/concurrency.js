@@ -33,7 +33,7 @@ export const concurrencySidebar = [
         text: '事务隔离',
         link: '/concurrency/isolation/',
         items: [
-            { text: '事务隔离级别', link: '/concurrency/isolation/levels' },
+            { text: '事务隔离级别', link: '/concurrency/isolation/index' },
             { text: '脏读、不可重复读、幻读', link: '/concurrency/isolation/anomalies' },
             { text: 'MVCC 原理', link: '/concurrency/isolation/mvcc' },
             { text: '隔离级别选择', link: '/concurrency/isolation/selection' }

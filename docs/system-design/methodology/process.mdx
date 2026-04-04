@@ -1,0 +1,358 @@
+---
+title: 系统设计流程
+description: 从零到一的系统设计方法论
+---
+
+# 系统设计流程
+
+面试官抛出一个问题：「设计一个短链接系统」。你脑子一片空白，想了半天憋出一句「用 Redis 存 key-value」。
+
+这不是你的技术不行，而是**没有方法论**。
+
+系统设计不是灵光一现，而是有套路可循的流程。
+
+## 通用设计流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    系统设计四步法                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Step 1: 需求澄清                                                │
+│  ──────────────────                                               │
+│  明确系统边界、使用场景、用户规模、功能范围                        │
+│  不要假设，用问题确认假设                                        │
+│                                                                  │
+│  Step 2: 高层设计                                                │
+│  ──────────────────                                               │
+│  画出整体架构图，核心组件有哪些，数据流向                         │
+│                                                                  │
+│  Step 3: 详细设计                                                │
+│  ──────────────────                                               │
+│  深入每个组件，数据模型、API 设计、算法选型                       │
+│                                                                  │
+│  Step 4: 权衡分析                                                │
+│  ──────────────────                                               │
+│  识别瓶颈，分析 trade-off，选择最优方案                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Step 1: 需求澄清
+
+需求澄清是整个设计的基础。很多人一上来就开始画图，结果画了半天发现方向跑偏了。
+
+### 必须澄清的问题
+
+拿到一个系统设计问题，先问自己这几个问题：
+
+| 问题类型 | 示例 | 目的 |
+|---|---|---|
+| 功能范围 | 需要支持登录吗？需要用户体系吗？ | 划定系统边界 |
+| 用户规模 | 日活多少？峰值 QPS？数据量多大？ | 确定架构规模 |
+| 性能指标 | 延迟要求？可用性要求？ | 确定 SLA |
+| 扩展需求 | 未来增长预期？功能迭代计划？ | 预留扩展性 |
+
+### 澄清问题清单
+
+```java
+// 设计短链接系统时的澄清问题
+/*
+澄清问题：
+
+1. 功能范围
+   - 短链接需要永久有效还是支持过期？
+   - 需要支持自定义短链接别名吗？
+   - 需要统计点击量吗？
+
+2. 用户规模
+   - 每天生成多少短链接？
+   - 每天有多少次访问？
+   - 需要存储多少历史数据？
+
+3. 性能指标
+   - P99 延迟要求多少？
+   - 可用性要求几个 9？
+
+4. 扩展需求
+   - 需要支持国际化和多语言吗？
+   - 将来可能支持哪些功能？
+*/
+```
+
+### 明确约束条件
+
+在动手设计之前，把约束条件写下来：
+
+```
+约束条件：
+- 日活用户：1000 万
+- 每天新增短链接：1000 万
+- 每天访问量：10 亿
+- P99 延迟：< 50ms
+- 可用性：99.99%
+- 数据保留：永久
+```
+
+## Step 2: 高层设计
+
+需求澄清完后，开始画高层架构图。
+
+### 核心组件识别
+
+```
+短链接系统高层设计：
+
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Client    │────▶│  API Server │────▶│   Cache    │
+│             │     │             │     │  (Redis)   │
+└─────────────┘     └──────┬──────┘     └─────────────┘
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │  Database   │
+                    │  (MySQL)    │
+                    └─────────────┘
+```
+
+### 组件职责划分
+
+| 组件 | 职责 |
+|---|---|
+| API Server | 处理用户请求，路由到对应服务 |
+| Cache | 热点数据缓存，加速读取 |
+| Database | 持久化存储，保证数据可靠 |
+| Short ID Generator | 生成唯一的短链接 ID |
+
+### 数据流设计
+
+```
+写流程（生成短链接）：
+用户 ──▶ API ──▶ ID 生成器 ──▶ 写入 DB ──▶ 写入缓存 ──▶ 返回短链接
+
+读流程（访问短链接）：
+用户 ──▶ API ──▶ 查缓存 ──▶ 命中 ──▶ 返回原始 URL
+                    │
+                    ▼
+                  未命中
+                    │
+                    ▼
+                  查 DB ──▶ 写入缓存 ──▶ 返回原始 URL
+```
+
+## Step 3: 详细设计
+
+高层设计完成后，进入详细设计阶段。
+
+### API 设计
+
+```java
+// 短链接服务 API
+
+// 创建短链接
+POST /api/v1/shorten
+Request:
+{
+    "original_url": "https://example.com/very/long/url/path",
+    "custom_alias": "my-link",     // 可选，自定义别名
+    "expires_at": "2025-12-31"     // 可选，过期时间
+}
+Response:
+{
+    "short_url": "https://short.co/abc123",
+    "expires_at": "2025-12-31"
+}
+
+// 访问短链接（重定向）
+GET /{short_code}
+Response: 302 Redirect to original_url
+
+// 查询统计
+GET /api/v1/shorten/{short_code}/stats
+Response:
+{
+    "click_count": 12345,
+    "top_referrers": ["google.com", "twitter.com"],
+    "last_accessed_at": "2024-01-15T10:30:00Z"
+}
+
+// 批量创建
+POST /api/v1/shorten/batch
+Request:
+{
+    "urls": [
+        {"original_url": "https://example.com/1"},
+        {"original_url": "https://example.com/2"}
+    ]
+}
+Response:
+{
+    "results": [
+        {"short_url": "https://short.co/abc1"},
+        {"short_url": "https://short.co/abc2"}
+    ]
+}
+```
+
+### 数据模型设计
+
+```sql
+-- 短链接表
+CREATE TABLE short_urls (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    short_code VARCHAR(20) NOT NULL UNIQUE,
+    original_url TEXT NOT NULL,
+    user_id BIGINT,
+    click_count BIGINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE,
+
+    INDEX idx_short_code (short_code),
+    INDEX idx_user_id (user_id),
+    INDEX idx_expires_at (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 访问日志表
+CREATE TABLE access_logs (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    short_code VARCHAR(20) NOT NULL,
+    referer VARCHAR(500),
+    user_agent VARCHAR(500),
+    ip_address VARCHAR(45),
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_short_code (short_code),
+    INDEX idx_accessed_at (accessed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### 核心算法设计
+
+```java
+// 短链接 ID 生成策略
+
+// 策略 1：哈希 + 碰撞检测
+public class HashBasedGenerator {
+    private static final String ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    public String generate(String url, int length) {
+        // 计算 MD5
+        String md5 = md5(url);
+
+        // 取前 N 位转为 62 进制
+        return convertToBase62(md5, length);
+    }
+
+    // 碰撞检测：如果已存在，添加随机盐后重试
+    public String generateUnique(String url) {
+        String shortCode = generate(url, 7);
+        int retry = 0;
+
+        while (exists(shortCode)) {
+            shortCode = generate(url + retry, 7);
+            retry++;
+            if (retry > 10) {
+                throw new RuntimeException("生成失败");
+            }
+        }
+        return shortCode;
+    }
+}
+
+// 策略 2：分布式 ID 生成器（推荐）
+public class DistributedIdGenerator {
+    private final SnowflakeIdGenerator snowflake;
+
+    public String generate() {
+        long id = snowflake.nextId();
+        return base62Encode(id);
+    }
+}
+```
+
+## Step 4: 权衡分析
+
+设计完成后，分析方案的瓶颈和 trade-off。
+
+### 瓶颈识别
+
+```
+系统瓶颈分析：
+
+1. 数据库写入
+   - 每天 1000 万写入
+   - 单库无法承受，考虑分库分表
+
+2. 缓存命中率
+   - 热点链接占 20%，冷数据占 80%
+   - 需要缓存淘汰策略
+
+3. 短链接碰撞
+   - 哈希方式可能有碰撞
+   - 需要碰撞检测和处理
+
+4. 数据迁移
+   - 分库分表时如何迁移数据
+   - 需要双写 + 灰度切换
+```
+
+### Trade-off 分析
+
+| 维度 | 方案 A | 方案 B | 选择 |
+|---|---|---|---|
+| ID 生成 | 哈希 | 分布式 ID | 方案 B，避免碰撞 |
+| 存储 | MySQL | Cassandra | 方案 A，简单场景够用 |
+| 缓存 | 本地缓存 | Redis 分布式 | 方案 B，支持多节点 |
+| 统计 | 实时写入 | 异步批量 | 方案 B，减少数据库压力 |
+
+## 设计评审清单
+
+设计完成后，用这个清单自检：
+
+```
+设计评审清单：
+
+□ 功能完整性
+  - 所有用户场景都覆盖了吗？
+  - 边界情况处理了吗？
+
+□ 可扩展性
+  - 支持未来的增长吗？
+  - 组件可以独立扩展吗？
+
+□ 可用性
+  - 单点故障有冗余吗？
+  - 故障隔离了吗？
+
+□ 性能
+  - P99 延迟满足要求吗？
+  - 吞吐能力够吗？
+
+□ 成本
+  - 基础设施成本可接受吗？
+  - 有优化空间吗？
+
+□ 可维护性
+  - 监控完备吗？
+  - 日志够用吗？
+  - 容易调试吗？
+```
+
+## 总结
+
+系统设计是有方法论的，不是靠灵感。
+
+**四步流程**：
+
+1. **需求澄清**：明确边界和约束，不要假设
+2. **高层设计**：画出核心组件和数据流
+3. **详细设计**：深入 API、数据模型、算法
+4. **权衡分析**：识别瓶颈，分析 trade-off
+
+**核心原则**：
+
+- 先正确，后优化
+- 优先简单方案
+- 预留扩展性
+- 考虑运维成本

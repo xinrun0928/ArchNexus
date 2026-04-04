@@ -1,0 +1,437 @@
+---
+title: 缓存双写问题
+description: 多级缓存场景下的数据一致性挑战
+---
+
+# 缓存双写问题
+
+你的系统有多级缓存（Redis + 本地缓存），但数据总是对不上。
+
+问题出在哪？**多级缓存的双写问题没有正确处理**。
+
+多级缓存架构带来了新的数据一致性挑战。
+
+## 什么是双写问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    什么是双写问题                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  双写：同时写入多个存储（Redis、数据库、本地缓存等）           │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │           更新数据 X                                    │   │
+│  │                │                                        │   │
+│  │                ▼                                        │   │
+│  │         ┌─────────────┐                               │   │
+│  │         │  数据库    │                               │   │
+│  │         └─────────────┘                               │   │
+│  │                │                                        │   │
+│  │       ┌────────┴────────┐                           │   │
+│  │       ▼                 ▼                            │   │
+│  │   ┌─────────┐     ┌─────────┐                    │   │
+│  │   │  Redis  │     │ 本地缓存 │                    │   │
+│  │   └─────────┘     └─────────┘                    │   │
+│  │                                                         │   │
+│  │  任何一步失败都可能导致数据不一致                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 双写失败场景
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    双写失败场景                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  场景一：数据库成功，Redis 失败                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  1. 写入数据库 ✓                                     │   │
+│  │  2. 写入 Redis ✗（网络故障）                         │   │
+│  │                                                         │   │
+│  │  结果：数据库是新的，Redis 是旧的                     │   │
+│  │  后续读取从 Redis 读到旧数据                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  场景二：数据库成功，本地缓存失败                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  1. 写入数据库 ✓                                     │   │
+│  │  2. 写入 Redis ✓                                     │   │
+│  │  3. 写入本地缓存 ✗（内存不足）                      │   │
+│  │                                                         │   │
+│  │  结果：只有本地缓存是旧的                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 双写解决方案
+
+### 方案一：串行双写 + 失败补偿
+
+```java
+// 串行双写 + 失败补偿
+@Service
+public class SerialDoubleWriteService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private LocalCache localCache;
+
+    public void updateUser(Long userId, UserUpdateRequest request) {
+        // 1. 写数据库
+        User user = userRepository.findById(userId)
+            .orElseThrow(() -> new UserNotFoundException(userId));
+
+        user.setName(request.getName());
+        user = userRepository.save(user);
+
+        // 2. 写 Redis
+        try {
+            String cacheKey = "user:" + userId;
+            redisTemplate.opsForValue().set(cacheKey, user);
+        } catch (Exception e) {
+            log.error("写入 Redis 失败，异步补偿", e);
+            // 记录补偿任务
+            compensateQueue.offer(new CompensateTask("user", userId, user));
+        }
+
+        // 3. 写本地缓存
+        try {
+            localCache.put("user:" + userId, user);
+        } catch (Exception e) {
+            log.error("写入本地缓存失败，异步补偿", e);
+            compensateQueue.offer(new CompensateTask("local", userId, user));
+        }
+    }
+}
+
+// 补偿任务消费者
+@Component
+public class CompensateConsumer {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private LocalCache localCache;
+
+    @KafkaListener(topics = "compensate")
+    public void consume(CompensateTask task) {
+        try {
+            if ("user".equals(task.getType())) {
+                redisTemplate.opsForValue().set(
+                    "user:" + task.getId(), task.getValue());
+            } else if ("local".equals(task.getType())) {
+                localCache.put("user:" + task.getId(), task.getValue());
+            }
+        } catch (Exception e) {
+            log.error("补偿失败: {}", task, e);
+            // 重新加入队列
+            compensateQueue.offer(task);
+        }
+    }
+}
+```
+
+### 方案二：异步消息队列双写
+
+```java
+// 异步消息队列双写
+@Service
+public class AsyncDoubleWriteService {
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    // 写入消息队列
+    public void updateUser(Long userId, UserUpdateRequest request) {
+        // 1. 先更新本地缓存
+        localCache.put("user:" + userId, request);
+
+        // 2. 发送消息（异步）
+        kafkaTemplate.send("user-update",
+            userId.toString(),
+            new UserUpdateEvent(userId, request));
+    }
+}
+
+// 消息消费者
+@Component
+public class UserUpdateConsumer {
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @KafkaListener(topics = "user-update", groupId = "user-update-group")
+    public void consume(UserUpdateEvent event) {
+        // 1. 更新数据库
+        User user = userRepository.findById(event.getUserId())
+            .orElseThrow(() -> new UserNotFoundException(event.getUserId()));
+
+        user.setName(event.getRequest().getName());
+        userRepository.save(user);
+
+        // 2. 更新 Redis
+        String cacheKey = "user:" + event.getUserId();
+        redisTemplate.opsForValue().set(cacheKey, user);
+    }
+}
+```
+
+### 方案三：订阅数据库变更
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    订阅数据库变更                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  应用 ──▶ 数据库                                      │   │
+│  │                 │                                       │   │
+│  │                 │ binlog                                │   │
+│  │                 ▼                                       │   │
+│  │         ┌─────────────┐                               │   │
+│  │         │  Canal     │                               │   │
+│  │         │ (订阅 binlog) │                              │   │
+│  │         └──────┬──────┘                               │   │
+│  │                │                                        │   │
+│  │                ▼                                        │   │
+│  │         ┌─────────────┐                               │   │
+│  │         │   Redis    │                               │   │
+│  │         └─────────────┘                               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  优点：应用只写数据库，其他存储自动同步                        │
+│  缺点：需要 canal 基础设施                                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Canal 配置
+
+```yaml
+# Canal 配置
+canal:
+  server:
+    port: 11111
+  instance:
+    master.address: mysql:3306
+    master.journal.name: mysql-bin.000001
+    master.position: 123456
+```
+
+```java
+// Canal 消费者
+@Component
+public class CanalConsumer {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private LocalCache localCache;
+
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    public void onMessage(List<CanalEntry.Entry> entries) {
+        for (CanalEntry.Entry entry : entries) {
+            if (entry.getEntryType() == CanalEntry.EntryType.ROWDATA) {
+                CanalEntry.RowChange rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
+
+                for (CanalEntry.RowData rowData : rowChange.getRowDatasList()) {
+                    String tableName = entry.getHeader().getTableName();
+
+                    if ("users".equals(tableName)) {
+                        processUserChange(rowChange.getEventType(), rowData);
+                    }
+                }
+            }
+        }
+    }
+
+    private void processUserChange(CanalEntry.EventType eventType, CanalEntry.RowData rowData) {
+        Long userId = null;
+        User user = null;
+
+        // 提取数据
+        for (CanalEntry.Column column : rowData.getBeforeColumnsList()) {
+            if ("id".equals(column.getName())) {
+                userId = Long.parseLong(column.getValue());
+            }
+        }
+
+        for (CanalEntry.Column column : rowData.getAfterColumnsList()) {
+            if ("id".equals(column.getName())) {
+                userId = Long.parseLong(column.getValue());
+            }
+            // 提取完整数据构建 user 对象...
+        }
+
+        if (userId == null) {
+            return;
+        }
+
+        // 同步到 Redis
+        if (eventType == CanalEntry.EventType.INSERT ||
+            eventType == CanalEntry.EventType.UPDATE) {
+            redisTemplate.opsForValue().set("user:" + userId, user);
+        } else if (eventType == CanalEntry.EventType.DELETE) {
+            redisTemplate.delete("user:" + userId);
+        }
+
+        // 发送消息到本地缓存更新
+        kafkaTemplate.send("user-update-local", userId.toString(), user);
+    }
+}
+```
+
+## 多级缓存一致性问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    多级缓存一致性问题                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  多级缓存架构：                                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │         应用 ──▶ 本地缓存 ──▶ Redis ──▶ 数据库      │   │
+│  │                         ↑                               │   │
+│  │                         │                               │   │
+│  │              数据可能不一致                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  问题：                                                        │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  1. 数据库更新了，本地缓存还没更新                     │   │
+│  │  2. 本地缓存更新了，Redis 还没更新                   │   │
+│  │  3. 分布式环境下，不同机器本地缓存不同               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 多级缓存解决方案
+
+### 统一失效
+
+```java
+// 统一失效策略
+@Service
+public class MultiLevelCacheService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private LocalCache localCache;
+
+    private final String cachePrefix = "user:";
+
+    // 更新：先更新数据库，再删除所有缓存
+    public void updateUser(Long userId, UserUpdateRequest request) {
+        // 1. 更新数据库
+        User user = userRepository.findById(userId)
+            .orElseThrow(() -> new UserNotFoundException(userId));
+        user.setName(request.getName());
+        user = userRepository.save(user);
+
+        // 2. 删除 Redis 缓存
+        redisTemplate.delete(cachePrefix + userId);
+
+        // 3. 广播本地缓存失效（通过 Redis Pub/Sub）
+        redisTemplate.convertAndSend("cache:invalidate", cachePrefix + userId);
+    }
+
+    // 读取：按顺序尝试各层缓存
+    public User getUser(Long userId) {
+        String key = cachePrefix + userId;
+
+        // 1. 先读本地缓存
+        User local = localCache.get(key);
+        if (local != null) {
+            return local;
+        }
+
+        // 2. 再读 Redis
+        User redis = (User) redisTemplate.opsForValue().get(key);
+        if (redis != null) {
+            // 回填本地缓存
+            localCache.put(key, redis);
+            return redis;
+        }
+
+        // 3. 最后读数据库
+        User user = userRepository.findById(userId).orElse(null);
+        if (user != null) {
+            // 回填 Redis 和本地缓存
+            redisTemplate.opsForValue().set(key, user);
+            localCache.put(key, user);
+        }
+
+        return user;
+    }
+}
+
+// 本地缓存监听 Redis 失效消息
+@Component
+public class LocalCacheInvalidationListener {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @PostConstruct
+    public void init() {
+        redisTemplate.getConnectionFactory()
+            .getConnection()
+            .subscribe((message, pattern) -> {
+                String key = new String(message.getBody());
+                localCache.invalidate(key);
+            }, "cache:invalidate".getBytes());
+    }
+}
+```
+
+## 总结
+
+缓存双写是复杂缓存架构的核心问题。
+
+**问题场景**：
+
+- 数据库成功，Redis 失败
+- 多级缓存不一致
+
+**解决方案**：
+
+- 串行双写 + 失败补偿
+- 异步消息队列
+- 订阅数据库变更
+
+**多级缓存策略**：
+
+- 统一失效而非更新
+- 按顺序读取各层缓存
+- 广播失效消息
+
+**实践要点**：
+
+- 优先保证数据库一致
+- 缓存作为加速层
+- 做好补偿机制

@@ -1,0 +1,438 @@
+---
+title: 批处理优化
+description: 通过批量操作提升系统吞吐量
+---
+
+# 批处理优化
+
+你的系统每秒钟要处理 10 万条数据，单条插入需要 100ms。
+
+问题出在哪？**每次数据库交互都有网络开销和协议开销**。
+
+批处理正是解决这个问题的方案：**合并多次操作为一次，减少交互次数**。
+
+## 批处理原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    批处理原理                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  单条处理：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Request ──▶ DB ──▶ Response ──▶ Request ──▶ DB ──▶   │   │
+│  │              │                    │                       │   │
+│  │            100ms                  100ms                   │   │
+│  │                                                         │   │
+│  │ 1000 条 × 100ms = 100s                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  批量处理（每批 100 条）：                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ [100条] ──▶ DB ──▶ [100条] ──▶ DB ──▶ ...         │   │
+│  │             100ms                 100ms                │   │
+│  │                                                         │   │
+│  │ 10 批 × 100ms = 1s                                     │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  提升：100 倍                                                 │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 数据库批处理
+
+### JDBC 批量插入
+
+```java
+// JDBC 批量插入
+@Service
+public class BatchInsertService {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    // 错误：逐条插入
+    public void insertSlow(List<Order> orders) {
+        for (Order order : orders) {
+            jdbcTemplate.update(
+                "INSERT INTO orders (id, user_id, amount) VALUES (?, ?, ?)",
+                order.getId(), order.getUserId(), order.getAmount()
+            );
+        }
+    }
+
+    // 正确：批量插入
+    public void insertFast(List<Order> orders) {
+        String sql = "INSERT INTO orders (id, user_id, amount) VALUES (?, ?, ?)";
+
+        jdbcTemplate.batchUpdate(sql, orders, orders.size(),
+            (ps, order) -> {
+                ps.setLong(1, order.getId());
+                ps.setLong(2, order.getUserId());
+                ps.setBigDecimal(3, order.getAmount());
+            });
+    }
+
+    // 更高效：使用 BatchPreparedStatementSetter
+    public void insertWithSetter(List<Order> orders) {
+        String sql = "INSERT INTO orders (id, user_id, amount) VALUES (?, ?, ?)";
+
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                Order order = orders.get(i);
+                ps.setLong(1, order.getId());
+                ps.setLong(2, order.getUserId());
+                ps.setBigDecimal(3, order.getAmount());
+            }
+
+            @Override
+            public int getBatchSize() {
+                return orders.size();
+            }
+        });
+    }
+}
+```
+
+### MyBatis 批量插入
+
+```xml
+<!-- Mapper.xml -->
+<insert id="batchInsert" parameterType="java.util.List">
+    INSERT INTO orders (id, user_id, amount, created_at)
+    VALUES
+    <foreach collection="list" item="order" separator=",">
+        (#{order.id}, #{order.userId}, #{order.amount}, #{order.createdAt})
+    </foreach>
+</insert>
+```
+
+```java
+// Mapper 接口
+@Mapper
+public interface OrderMapper {
+    void batchInsert(List<Order> orders);
+}
+
+// 使用
+@Service
+public class OrderService {
+    @Autowired
+    private OrderMapper orderMapper;
+
+    public void saveOrders(List<Order> orders) {
+        // MySQL 单次最大包大小默认为 4MB
+        // 每批 1000 条左右
+        int batchSize = 1000;
+        for (int i = 0; i < orders.size(); i += batchSize) {
+            List<Order> batch = orders.subList(i,
+                Math.min(i + batchSize, orders.size()));
+            orderMapper.batchInsert(batch);
+        }
+    }
+}
+```
+
+### 批量更新
+
+```xml
+<!-- 批量更新 -->
+<update id="batchUpdate" parameterType="java.util.List">
+    <foreach collection="list" item="order" separator=";">
+        UPDATE orders
+        SET amount = #{order.amount}, status = #{order.status}
+        WHERE id = #{order.id}
+    </foreach>
+</update>
+```
+
+```java
+// MyBatis-Plus 批量更新
+@Service
+public class OrderService {
+    @Autowired
+    private IService<Order> orderService;
+
+    public void batchUpdate(List<Order> orders) {
+        // 方式一：循环单条更新
+        // 不推荐，效率低
+
+        // 方式二：使用 updateBatchById
+        orderService.updateBatchById(orders, 1000);  // 每批 1000 条
+    }
+}
+```
+
+## HTTP 批处理
+
+### 批量请求
+
+```java
+// 批量 HTTP 请求
+@Service
+public class BatchHttpService {
+    private final RestTemplate restTemplate;
+
+    // 错误：循环请求
+    public List<User> getUsersSlow(List<Long> userIds) {
+        return userIds.stream()
+            .map(id -> restTemplate.getForObject(
+                "http://user-service/api/users/{id}", User.class, id))
+            .collect(Collectors.toList());
+    }
+
+    // 正确：批量接口
+    public List<User> getUsersFast(List<Long> userIds) {
+        // 批量接口：一次请求获取多个用户
+        ResponseEntity<List<User>> response = restTemplate.exchange(
+            "http://user-service/api/users/batch?ids={ids}",
+            HttpMethod.GET,
+            null,
+            new ParameterizedTypeReference<List<User>>() {},
+            String.join(",", userIds.stream().map(String::valueOf).toArray(String[]::new))
+        );
+        return response.getBody();
+    }
+}
+```
+
+### 批量响应
+
+```java
+// 服务端批量接口
+@RestController
+public class UserController {
+    @GetMapping("/api/users/batch")
+    public List<User> getUsers(@RequestParam List<Long> ids) {
+        // 一次查询所有用户
+        return userService.findByIds(ids);
+    }
+
+    // 分页查询
+    @GetMapping("/api/users/page")
+    public Page<User> getUsersByPage(
+            @RequestParam List<Long> ids,
+            @RequestParam(defaultValue = "100") int pageSize) {
+        // 分批处理
+        List<User> allUsers = userService.findByIds(ids);
+
+        // 分页返回
+        int total = allUsers.size();
+        return new Page<>(allUsers, total, pageSize);
+    }
+}
+```
+
+## 消息队列批处理
+
+### Kafka 批量生产
+
+```java
+// Kafka 批量生产者
+@Service
+public class BatchKafkaProducer {
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    // 错误：逐条发送
+    public void sendSlow(List<OrderEvent> events) {
+        for (OrderEvent event : events) {
+            kafkaTemplate.send("order-events", event.getOrderId().toString(),
+                JSON.toJSONString(event));
+        }
+    }
+
+    // 正确：批量发送
+    public void sendFast(List<OrderEvent> events) {
+        // 批量发送
+        List<ProducerRecord<String, String>> records = events.stream()
+            .map(e -> new ProducerRecord<>(
+                "order-events",
+                e.getOrderId().toString(),
+                JSON.toJSONString(e)))
+            .collect(Collectors.toList());
+
+        kafkaTemplate.executeBatch(records, (transaction, record, callback) -> {
+            transaction.send(record);
+            return null;
+        });
+    }
+}
+```
+
+### Kafka 批量消费
+
+```java
+// Kafka 批量消费者
+@Configuration
+public class KafkaConsumerConfig {
+    @Bean
+    public ConsumerFactory<String, String> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "order-consumer");
+        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);  // 每次拉取 500 条
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+
+    @Bean
+    public KafkaListenerContainerFactory<ConcurrentMessageListenerContainer<String, String>>
+            kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory factory =
+            new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory());
+        factory.setBatchListener(true);  // 开启批量消费
+        factory.setConcurrency(3);  // 3 个并发消费者
+        return factory;
+    }
+}
+
+// 批量消费
+@Service
+public class BatchKafkaConsumer {
+    @KafkaListener(topics = "order-events", groupId = "order-consumer")
+    public void consume(List<ConsumerRecord<String, String>> records) {
+        log.info("批量消费: {} 条", records.size());
+
+        List<OrderEvent> events = records.stream()
+            .map(r -> JSON.parseObject(r.value(), OrderEvent.class))
+            .collect(Collectors.toList());
+
+        // 批量处理
+        orderService.processBatch(events);
+    }
+}
+```
+
+## 缓存批处理
+
+### Redis 批量操作
+
+```java
+// Redis 批量操作
+@Service
+public class BatchRedisService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 错误：循环操作
+    public Map<String, User> getUsersSlow(List<String> keys) {
+        Map<String, User> result = new HashMap<>();
+        for (String key : keys) {
+            User user = (User) redisTemplate.opsForValue().get(key);
+            result.put(key, user);
+        }
+        return result;
+    }
+
+    // 正确：批量操作
+    public Map<String, User> getUsersFast(List<String> keys) {
+        // MGET 批量获取
+        List<Object> values = redisTemplate.opsForValue().multiGet(keys);
+
+        Map<String, User> result = new HashMap<>();
+        for (int i = 0; i < keys.size(); i++) {
+            if (values.get(i) != null) {
+                result.put(keys.get(i), (User) values.get(i));
+            }
+        }
+        return result;
+    }
+
+    // 批量写入
+    public void setUsersFast(Map<String, User> users) {
+        redisTemplate.opsForValue().multiSet(users);
+    }
+
+    // Pipeline 批量操作
+    public void pipelineOps(List<String> keys) {
+        redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            for (String key : keys) {
+                connection.stringCommands().get(key.getBytes());
+            }
+            return null;
+        });
+    }
+}
+```
+
+## 批处理最佳实践
+
+### 批量大小选择
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    批量大小选择                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  太小：                                                        │
+│  - 批次数增加，开销增加                                        │
+│  - 无法充分利用网络和 IO                                        │
+│                                                                  │
+│  太大：                                                        │
+│  - 内存占用增加                                                │
+│  - 单次失败重试代价大                                          │
+│  - GC 压力大                                                    │
+│                                                                  │
+│  建议：                                                        │
+│  - 数据库：500-5000 条/批                                      │
+│  - HTTP：10-100 个/批                                         │
+│  - Kafka：500-5000 条/批                                      │
+│  - Redis：100-1000 个/批                                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 异常处理
+
+```java
+// 批量操作异常处理
+@Service
+public class BatchOperationWithRetry {
+    public void batchInsertWithRetry(List<Order> orders, int batchSize) {
+        for (int i = 0; i < orders.size(); i += batchSize) {
+            List<Order> batch = orders.subList(i,
+                Math.min(i + batchSize, orders.size()));
+
+            int retry = 0;
+            while (retry < 3) {
+                try {
+                    orderMapper.batchInsert(batch);
+                    break;  // 成功，跳出重试
+                } catch (Exception e) {
+                    retry++;
+                    if (retry >= 3) {
+                        throw e;  // 重试耗尽，抛出异常
+                    }
+                    log.warn("批量插入失败，重试: {}", retry);
+                }
+            }
+        }
+    }
+}
+```
+
+## 总结
+
+批处理是提升吞吐量的有效手段。
+
+**核心原理**：
+
+- 合并多次操作为一次
+- 减少网络和协议开销
+- 充分利用 IO
+
+**适用场景**：
+
+- 大数据量导入导出
+- 批量数据同步
+- 高频小请求聚合
+- 缓存预热
+
+**注意事项**：
+
+- 选择合适的批量大小
+- 做好异常处理和重试
+- 监控批处理性能
+- 考虑内存占用

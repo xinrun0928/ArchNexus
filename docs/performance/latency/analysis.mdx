@@ -1,0 +1,360 @@
+---
+title: 延迟分析方法
+description: 系统化分析定位延迟瓶颈的方法
+---
+
+# 延迟分析方法
+
+你的系统很慢，但不知道慢在哪。
+
+延迟分析的目标是**系统化地找到瓶颈**，而不是凭感觉猜测。
+
+## 延迟分析框架
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟分析框架：ALAL                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  A - Audit（审计）                                            │
+│  ─────────────────                                             │
+│  从端到端审计，分解每个环节的延迟                              │
+│                                                                  │
+│  L - Locate（定位）                                            │
+│  ─────────────────                                             │
+│  缩小范围，定位到具体瓶颈组件                                  │
+│                                                                  │
+│  A - Analyze（分析）                                          │
+│  ─────────────────                                             │
+│  深入分析，确定根本原因                                        │
+│                                                                  │
+│  L - Log（记录）                                              │
+│  ─────────────────                                             │
+│  记录分析过程，建立基准                                        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 第一步：端到端审计
+
+### 请求链路追踪
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    端到端延迟追踪                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  用户请求                                                        │
+│      │                                                         │
+│      ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Gateway: 5ms                                             │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│      │                                                         │
+│      ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Auth Service: 10ms                                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│      │                                                         │
+│      ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Order Service: 50ms                                       │   │
+│  │   ├─ Redis: 1ms                                          │   │
+│  │   ├─ MySQL: 30ms                                         │   │
+│  │   └─ Kafka: 5ms                                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│      │                                                         │
+│      ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Response: 5ms                                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  总延迟 = 5 + 10 + 50 + 5 = 70ms                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 分布式追踪工具
+
+```java
+// SkyWalking 集成
+// skywalking-agent 配置
+// java -javaagent:skywalking-agent.jar -jar app.jar
+
+// 代码中使用
+@Service
+public class OrderService {
+    @Autowired
+    private Tracer tracer;
+
+    public Order createOrder(CreateOrderRequest request) {
+        Span span = tracer.createSpan("OrderService.createOrder");
+
+        try {
+            // Redis 操作
+            Span redisSpan = tracer.createSpan("Redis.get");
+            String userKey = "user:" + request.getUserId();
+            User user = redisTemplate.opsForValue().get(userKey);
+            redisSpan.end();
+
+            // 数据库操作
+            Span dbSpan = tracer.createSpan("MySQL.insert");
+            Order order = orderRepository.save(new Order());
+            dbSpan.end();
+
+            return order;
+        } finally {
+            span.end();
+        }
+    }
+}
+```
+
+## 第二步：瓶颈定位
+
+### 延迟分布分析
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟分布分析                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  分析各百分位的延迟分布：                                       │
+│                                                                  │
+│  P50 = 50ms                                                   │
+│  P90 = 100ms                                                  │
+│  P95 = 200ms                                                  │
+│  P99 = 500ms                                                  │
+│  P999 = 2000ms                                                │
+│                                                                  │
+│  判断：                                                        │
+│  - P50 和 P99 差距大 → 存在长尾问题                           │
+│  - P90 增长快 → 系统负载增加                                   │
+│  - P999 远大于 P99 → 极端情况，需要关注                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 延迟归因
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟归因分析                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  问题：某个接口 P99 延迟高                                     │
+│                                                                  │
+│  分析方法：                                                    │
+│  1. 按接口拆分                                                │
+│     - /api/orders: P99 = 500ms                                │
+│     - /api/products: P99 = 50ms                                │
+│     → 问题在订单接口                                           │
+│                                                                  │
+│  2. 按调用链拆分                                              │
+│     - Redis: P99 = 5ms                                        │
+│     - MySQL: P99 = 400ms                                      │
+│     → 问题在数据库                                             │
+│                                                                  │
+│  3. 按 SQL 拆分                                                │
+│     - SELECT orders: P99 = 300ms                              │
+│     - SELECT products: P99 = 50ms                             │
+│     - UPDATE stock: P99 = 100ms                               │
+│     → 问题在订单查询                                           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 第三步：深入分析
+
+### 数据库慢查询分析
+
+```sql
+-- 开启慢查询日志
+SHOW VARIABLES LIKE 'slow_query_log';
+SHOW VARIABLES LIKE 'long_query_time';
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 0.1;  -- 100ms 以上记录
+
+-- 查看慢查询
+SHOW GLOBAL STATUS LIKE 'Slow_queries';
+
+-- 分析慢查询
+EXPLAIN
+SELECT o.*, u.username
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status = 'PENDING'
+ORDER BY o.created_at DESC
+LIMIT 20;
+```
+
+```java
+// MyBatis 慢查询监控
+@Configuration
+public class SqlSlowQueryInterceptor {
+    @Bean
+    public Interceptor slowQueryInterceptor() {
+        return new Interceptor() {
+            @Override
+            public Object intercept(Invocation invocation) throws Throwable {
+                long start = System.currentTimeMillis();
+                try {
+                    return invocation.proceed();
+                } finally {
+                    long cost = System.currentTimeMillis() - start;
+                    if (cost > 100) {
+                        String sql = invocation.getMethod().getName();
+                        log.warn("慢查询: {}ms - {}", cost, sql);
+                    }
+                }
+            }
+        };
+    }
+}
+```
+
+### GC 分析
+
+```bash
+# GC 日志分析工具
+# 1. GCViewer
+java -jar gcviewer.jar gc.log
+
+# 2. GCEasy（在线工具）
+# 上传 gc.log 到 https://gceasy.io
+
+# 3. 日志分析命令
+grep "Pause" gc.log | awk '{print $NF}' | sort -n | tail -20
+# 查看停顿最长的 20 次 GC
+```
+
+### 线程分析
+
+```bash
+# 查看线程状态
+jstack <pid> | grep "State: BLOCKED" | wc -l
+# 查看阻塞线程数
+
+# 查看热点方法
+jstack <pid> | grep -A 5 "Waiting on condition"
+```
+
+## 第四步：记录与基准
+
+### 建立性能基准
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    性能基准文档                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  接口名称：/api/orders                                         │
+│  基准日期：2024-01-15                                         │
+│                                                                  │
+│  延迟基准：                                                   │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │ 指标        │ 当前值  │ 目标值  │ 状态              │   │
+│  ├───────────────────────────────────────────────────────┤   │
+│  │ P50        │ 50ms   │ < 30ms  │ ❌ 未达标         │   │
+│  │ P90        │ 100ms  │ < 100ms │ ✅ 达标           │   │
+│  │ P99        │ 500ms  │ < 300ms  │ ❌ 未达标         │   │
+│  └───────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  瓶颈分析：                                                    │
+│  - MySQL 查询 P99 = 400ms                                     │
+│  - 缺少索引，查询未走索引                                       │
+│                                                                  │
+│  优化计划：                                                    │
+│  - 添加复合索引 (status, created_at)                           │
+│  - 预计优化后 P99 < 200ms                                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 监控告警
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: latency-alerts
+    rules:
+      - alert: HighP99Latency
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "P99 延迟过高"
+          description: "接口 {{ $labels.endpoint }} P99 延迟 {{ $value }}s 超过 500ms"
+
+      - alert: LatencyAnomaly
+        expr: |
+          rate(http_request_duration_seconds_sum[5m])
+          / rate(http_request_duration_seconds_count[5m])
+          > 2 * avg_over_time(
+              rate(http_request_duration_seconds_sum[5m])
+              / rate(http_request_duration_seconds_count[5m])
+            [30m])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "延迟异常波动"
+```
+
+## 延迟分析清单
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟分析检查清单                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  □ 1. 端到端追踪                                              │
+│     - 是否配置了分布式追踪                                      │
+│     - 是否覆盖了所有关键路径                                    │
+│                                                                  │
+│  □ 2. 延迟分解                                                │
+│     - 各组件延迟分布是否符合预期                               │
+│     - P50/P90/P99 是否差距过大                                │
+│                                                                  │
+│  □ 3. 瓶颈定位                                                │
+│     - 是否定位到具体组件                                        │
+│     - 是否确定到具体接口/方法                                   │
+│                                                                  │
+│  □ 4. 根因分析                                                │
+│     - 是否找到根本原因                                          │
+│     - 是否有数据支撑                                           │
+│                                                                  │
+│  □ 5. 记录归档                                                │
+│     - 是否记录了分析过程                                        │
+│     - 是否建立了性能基准                                        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+延迟分析需要系统化的方法。
+
+**分析框架**：
+
+- Audit：端到端审计，分解延迟
+- Locate：缩小范围，定位瓶颈
+- Analyze：深入分析，确定根因
+- Log：记录过程，建立基准
+
+**分析工具**：
+
+| 工具 | 用途 |
+|---|---|
+| SkyWalking/Jaeger | 分布式追踪 |
+| Arthas | 应用诊断 |
+| GCViewer/GCEasy | GC 分析 |
+| MySQL EXPLAIN | SQL 分析 |
+| Prometheus/Grafana | 指标监控 |
+
+**分析清单**：
+
+- 先全局后局部
+- 先定量后定性
+- 先快速定位后深入分析

@@ -1,0 +1,324 @@
+---
+title: BIO、NIO、AIO 对比
+description: Java I/O 模型的演进与选择
+---
+
+# BIO、NIO、AIO 对比
+
+你的系统要处理 10 万并发连接，用传统的同步阻塞 IO 根本扛不住。
+
+问题出在哪？**同步阻塞 IO 在等待时浪费了大量线程资源**。
+
+理解 I/O 模型的区别，是选择合适 I/O 策略的基础。
+
+## I/O 模型演进
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    I/O 模型演进                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ BIO（同步阻塞 IO）                                    │   │
+│  │ - 每连接一个线程                                        │   │
+│  │ - 线程阻塞在 read/write                                │   │
+│  │ - 10 万连接 = 10 万线程                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ NIO（同步非阻塞 IO）                                 │   │
+│  │ - 一个线程处理多个连接                                │   │
+│  │ - Selector 多路复用                                   │   │
+│  │ - Channel + Buffer + Selector                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ AIO（异步非阻塞 IO）                                 │   │
+│  │ - 操作系统异步 IO 支持                                │   │
+│  │ - 读写操作完全异步                                    │   │
+│  │ - 回调通知结果                                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## BIO 模型
+
+### BIO 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BIO 模型原理                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ServerSocket.accept() → 阻塞等待连接                         │
+│  Thread.read(buffer) → 阻塞等待数据                           │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Client1 ──▶ Thread1 ──▶ read() ──▶ 阻塞           │   │
+│  │ Client2 ──▶ Thread2 ──▶ read() ──▶ 阻塞           │   │
+│  │ Client3 ──▶ Thread3 ──▶ read() ──▶ 阻塞           │   │
+│  │ ...                                                  │   │
+│  │ Client100000 ──▶ Thread100000 ──▶ ???              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  问题：                                                        │
+│  - 10 万连接 = 10 万线程                                      │
+│  - 每个线程栈 1MB = 100GB 内存                             │
+│  - 线程上下文切换开销巨大                                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### BIO 代码示例
+
+```java
+// BIO 服务端
+public class BioServer {
+    public static void main(String[] args) throws IOException {
+        ServerSocket server = new ServerSocket(8080);
+        System.out.println("Server started on port 8080");
+
+        while (true) {
+            // 阻塞等待连接
+            Socket client = server.accept();  // [!code highlight]
+            // 每个连接一个线程
+            new Thread(() -> {
+                try {
+                    BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(client.getInputStream()));
+                    PrintWriter writer = new PrintWriter(
+                        client.getOutputStream(), true);
+
+                    String line;
+                    while ((line = reader.readLine()) != null) {  // [!code highlight]
+                        writer.println("Echo: " + line);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } finally {
+                    try { client.close(); } catch (IOException ignored) {}
+                }
+            }).start();
+        }
+    }
+}
+```
+
+## NIO 模型
+
+### NIO 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NIO 模型原理                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  核心组件：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Channel（通道）                                        │   │
+│  │ - SocketChannel：网络 IO                              │   │
+│  │ - FileChannel：文件 IO                                │   │
+│  │ - DatagramChannel：UDP IO                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Buffer（缓冲区）                                       │   │
+│  │ - 堆内存缓冲区：HeapByteBuffer                        │   │
+│  │ - 直接内存缓冲区：DirectByteBuffer                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Selector（选择器）                                     │   │
+│  │ - 单线程监听多个 Channel 的 IO 事件                    │   │
+│  │ - OP_ACCEPT / OP_CONNECT / OP_READ / OP_WRITE        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### NIO 代码示例
+
+```java
+// NIO 服务端
+public class NioServer {
+    public static void main(String[] args) throws IOException {
+        Selector selector = Selector.open();  // [!code highlight]
+        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        serverChannel.configureBlocking(false);  // [!code highlight]
+        serverChannel.bind(new InetSocketAddress(8080));
+        serverChannel.register(selector, SelectionKey.OP_ACCEPT);  // [!code highlight]
+
+        System.out.println("NIO Server started on port 8080");
+
+        while (true) {
+            selector.select();  // [!code highlight]
+            Set<SelectionKey> keys = selector.selectedKeys();
+            Iterator<SelectionKey> iter = keys.iterator();
+
+            while (iter.hasNext()) {
+                SelectionKey key = iter.next();
+                iter.remove();
+
+                if (key.isAcceptable()) {
+                    // 处理连接请求
+                    ServerSocketChannel server = (ServerSocketChannel) key.channel();
+                    SocketChannel client = server.accept();  // [!code highlight]
+                    client.configureBlocking(false);
+                    client.register(selector, SelectionKey.OP_READ);
+                } else if (key.isReadable()) {
+                    // 处理读事件
+                    SocketChannel client = (SocketChannel) key.channel();
+                    ByteBuffer buffer = ByteBuffer.allocate(1024);
+                    int n = client.read(buffer);  // [!code highlight]
+                    if (n > 0) {
+                        buffer.flip();
+                        client.write(buffer);
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### NIO vs BIO 对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NIO vs BIO 对比                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 指标           │ BIO              │ NIO                │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 连接模型       │ 一连接一线程     │ 多路复用           │   │
+│  │ 线程数         │ 连接数            │ 线程数固定         │   │
+│  │ 阻塞模式       │ 完全阻塞          │ 非阻塞             │   │
+│  │ 适用场景       │ 连接少、业务重   │ 连接多、业务轻     │   │
+│  │ 复杂度         │ 简单             │ 复杂               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  性能对比：                                                   │
+│  BIO：1 万连接 → 1 万线程 → 内存爆炸                       │
+│  NIO：1 万连接 → 1 个线程（可扩展）→ 高效               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## AIO 模型
+
+### AIO 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    AIO 模型原理                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  AIO = Asynchronous I/O                                       │
+│  与 NIO 的区别：                                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ NIO：同步非阻塞                                        │   │
+│  │ - 用户线程发起 IO，系统内核完成 IO                     │   │
+│  │ - 用户线程需要不断轮询或等待就绪事件                    │   │
+│  │ - read()/write() 立即返回，不阻塞                      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ AIO：异步非阻塞                                        │   │
+│  │ - 用户线程发起 IO，立即返回                            │   │
+│  │ - 系统内核完成 IO 后回调通知用户线程                   │   │
+│  │ - 用户线程完全不阻塞                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### AIO 代码示例
+
+```java
+// AIO 服务端
+public class AioServer {
+    public static void main(String[] args) throws IOException {
+        AsynchronousServerSocketChannel server = AsynchronousServerSocketChannel.open()
+            .bind(new InetSocketAddress(8080));  // [!code highlight]
+
+        server.accept(null, new CompletionHandler<AsynchronousSocketChannel, Object>() {
+            @Override
+            public void completed(AsynchronousSocketChannel client, Object attachment) {
+                server.accept(null, this);  // 继续接受下一个连接
+
+                ByteBuffer buffer = ByteBuffer.allocate(1024);
+                client.read(buffer, null, new CompletionHandler<Integer, Object>() {
+                    @Override
+                    public void completed(Integer result, Object attachment) {
+                        if (result > 0) {
+                            buffer.flip();
+                            client.write(buffer);  // [!code highlight]
+                            buffer.clear();
+                            client.read(buffer, null, this);  // 继续读
+                        }
+                    }
+
+                    @Override
+                    public void failed(Throwable exc, Object attachment) { }
+                });
+            }
+
+            @Override
+            public void failed(Throwable exc, Object attachment) { }
+        });
+
+        System.in.read();  // 防止主线程退出
+    }
+}
+```
+
+## 模型选择
+
+### 选择建议
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    I/O 模型选择                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  BIO：                                                        │
+│  ✓ 实现简单                                                   │
+│  ✓ 适合连接数少、业务处理耗时的场景                            │
+│  ✗ 不适合高并发场景                                          │
+│  → 小型系统、管理系统、工具类                                 │
+│                                                                  │
+│  NIO：                                                        │
+│  ✓ 单线程处理大量连接                                         │
+│  ✓ 适合高并发、低流量的场景                                    │
+│  ✗ 编程复杂，需要处理半包、粘包                              │
+│  → Netty、Mina、RPC 框架                                      │
+│                                                                  │
+│  AIO：                                                        │
+│  ✓ 编程相对简单                                               │
+│  ✓ 适合高并发、高流量的场景                                    │
+│  ✗ 仅 Windows 支持较好，Linux 支持有限                        │
+│  → 待成熟，Netty 正在整合                                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+选择合适的 I/O 模型是高性能网络编程的基础。
+
+**模型对比**：
+
+| 模型 | 阻塞 | 线程模型 | 适用场景 |
+|---|---|---|---|
+| BIO | 同步阻塞 | 一连接一线程 | 低并发 |
+| NIO | 同步非阻塞 | 多路复用 | 高并发 |
+| AIO | 异步非阻塞 | 回调驱动 | 高并发 |
+
+**选择建议**：
+
+- 低并发：BIO
+- 高并发：NIO / AIO
+- 生产级：Netty（NIO）
+- 了解原理：能理解框架底层

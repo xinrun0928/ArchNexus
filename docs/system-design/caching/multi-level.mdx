@@ -1,0 +1,407 @@
+---
+title: 多级缓存
+description: 构建高性能、高可用的多级缓存架构
+---
+
+# 多级缓存
+
+单机缓存扛不住，Redis 也扛不住。那就**多层缓存叠加**。
+
+多级缓存是解决高并发场景的标准方案：用本地缓存扛热点，Redis 扛共享数据，数据库做兜底。
+
+## 多级缓存架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    多级缓存架构                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                       L1: 本地缓存                         │   │
+│  │  Caffeine / Guava Cache                                   │   │
+│  │  - 热点数据                                              │   │
+│  │  - 零网络开销                                            │   │
+│  │  - 内存有限，不共享                                      │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                    │
+│                              ▼                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    L2: 分布式缓存                         │   │
+│  │  Redis / Memcached                                        │   │
+│  │  - 共享缓存                                              │   │
+│  │  - 大容量                                                │   │
+│  │  - 网络开销                                              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                    │
+│                              ▼                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    L3: 数据库                              │   │
+│  │  MySQL / PostgreSQL                                        │   │
+│  │  - 数据源                                                │   │
+│  │  - 兜底                                                  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  命中率：L1 > L2 > L3                                           │
+│  容量：L1 < L2 < L3                                             │
+│  延迟：L1 < L2 < L3                                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## L1 本地缓存
+
+### Caffeine 配置
+
+```java
+@Configuration
+public class CaffeineConfig {
+    @Bean
+    public Cache<String, Product> productCache() {
+        return Caffeine.newBuilder()
+            // 容量
+            .maximumSize(10_000)
+            // 写入后过期
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            // 访问后过期
+            .expireAfterAccess(2, TimeUnit.MINUTES)
+            // 刷新
+            .refreshAfterWrite(1, TimeUnit.MINUTES)
+            // 开启统计
+            .recordStats()
+            // 监听器
+            .removalListener((key, value, cause) -> {
+                log.info("缓存移除: key={}, value={}, cause={}", key, value, cause);
+            })
+            .build();
+    }
+
+    @Bean
+    public LoadingCache<String, User> userCache(ProductRepository repository) {
+        return Caffeine.newBuilder()
+            .maximumSize(50_000)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .recordStats()
+            .build(id -> repository.findById(id));
+    }
+}
+```
+
+### 统计监控
+
+```java
+// 缓存统计
+@Service
+public class CacheStatsService {
+    @Autowired
+    private Cache<String, Object> productCache;
+
+    public CacheStats getStats() {
+        CacheStats stats = new CacheStats();
+        stats.setRequestCount(productCache.stats().requestCount());
+        stats.setHitCount(productCache.stats().hitCount());
+        stats.setMissCount(productCache.stats().missCount());
+        stats.setHitRate(productCache.stats().hitRate());
+        stats.setEvictionCount(productCache.stats().evictionCount());
+        return stats;
+    }
+}
+```
+
+## L2 分布式缓存
+
+### Redis 配置
+
+```java
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
+
+        // 开启事务
+        template.setEnableTransactionSupport(true);
+        template.afterPropertiesSet();
+
+        return template;
+    }
+}
+```
+
+## 多级缓存实现
+
+### 核心实现
+
+```java
+@Service
+public class MultiLevelCacheService {
+    // L1: 本地缓存
+    @Autowired
+    private Cache<String, Product> l1Cache;
+
+    // L2: Redis
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // L3: 数据库
+    @Autowired
+    private ProductRepository productRepository;
+
+    private static final String L2_PREFIX = "cache:product:";
+    private static final Duration L2_TTL = Duration.ofMinutes(30);
+    private static final Duration L1_TTL = Duration.ofMinutes(1);
+
+    public Product getProduct(Long productId) {
+        String l1Key = "product:" + productId;
+        String l2Key = L2_PREFIX + productId;
+
+        // 1. 查询 L1
+        Product product = l1Cache.getIfPresent(l1Key);
+        if (product != null) {
+            log.debug("L1 命中: {}", productId);
+            return product;
+        }
+
+        // 2. 查询 L2
+        product = (Product) redisTemplate.opsForValue().get(l2Key);
+        if (product != null) {
+            log.debug("L2 命中: {}", productId);
+            // 回填 L1
+            l1Cache.put(l1Key, product);
+            return product;
+        }
+
+        // 3. L2 未命中，查 L3
+        log.debug("L3 查询: {}", productId);
+        product = productRepository.findById(productId);
+
+        if (product != null) {
+            // 回填 L2 和 L1
+            redisTemplate.opsForValue().set(l2Key, product, L2_TTL);
+            l1Cache.put(l1Key, product);
+        }
+
+        return product;
+    }
+
+    // 更新：删除所有层级的缓存
+    public void updateProduct(Product product) {
+        String l1Key = "product:" + product.getId();
+        String l2Key = L2_PREFIX + product.getId();
+
+        // 1. 更新数据库
+        productRepository.save(product);
+
+        // 2. 删除 L1
+        l1Cache.invalidate(l1Key);
+
+        // 3. 删除 L2
+        redisTemplate.delete(l2Key);
+
+        log.info("缓存失效: productId={}", product.getId());
+    }
+}
+```
+
+### 异步预热
+
+```java
+@Service
+public class CacheWarmerService {
+    @Autowired
+    private Cache<String, Product> l1Cache;
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    @Autowired
+    private ProductRepository productRepository;
+
+    private static final String L2_PREFIX = "cache:product:";
+    private static final Duration L2_TTL = Duration.ofMinutes(30);
+
+    // 启动时预热
+    @PostConstruct
+    public void warmUp() {
+        log.info("开始缓存预热...");
+        long start = System.currentTimeMillis();
+
+        // 1. 预热 L2
+        warmUpL2();
+
+        // 2. 预热热点数据到 L1
+        warmUpL1();
+
+        long elapsed = System.currentTimeMillis() - start;
+        log.info("缓存预热完成，耗时: {}ms", elapsed);
+    }
+
+    private void warmUpL2() {
+        // 预加载最近访问的数据到 Redis
+        List<Product> hotProducts = productRepository.findHotProducts(1000);
+        for (Product product : hotProducts) {
+            String key = L2_PREFIX + product.getId();
+            redisTemplate.opsForValue().set(key, product, L2_TTL);
+        }
+        log.info("L2 预热完成: {} 条", hotProducts.size());
+    }
+
+    private void warmUpL1() {
+        // 只预热最热门的 N 条数据
+        List<Product> topProducts = productRepository.findTopProducts(100);
+        for (Product product : topProducts) {
+            String key = "product:" + product.getId();
+            l1Cache.put(key, product);
+        }
+        log.info("L1 预热完成: {} 条", topProducts.size());
+    }
+}
+```
+
+## 缓存一致性
+
+### 缓存失效策略
+
+```java
+@Service
+public class CacheConsistencyService {
+    @Autowired
+    private Cache<String, Product> l1Cache;
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 更新后删除缓存
+    public void updateProduct(Product product) {
+        String l1Key = "product:" + product.getId();
+        String l2Key = "cache:product:" + product.getId();
+
+        // 1. 更新数据库
+        productRepository.save(product);
+
+        // 2. 删除 L1
+        l1Cache.invalidate(l1Key);
+
+        // 3. 删除 L2
+        redisTemplate.delete(l2Key);
+
+        // 4. 延迟再删除一次（延迟双删）
+        CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS)
+            .execute(() -> redisTemplate.delete(l2Key));
+    }
+}
+```
+
+### 分布式锁保护
+
+```java
+@Service
+public class DistributedLockCacheService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 获取分布式锁
+    public Boolean acquireLock(String key, Duration timeout) {
+        return redisTemplate.opsForValue()
+            .setIfAbsent(key, Thread.currentThread().getId(), timeout);
+    }
+
+    // 释放分布式锁
+    public void releaseLock(String key) {
+        redisTemplate.delete(key);
+    }
+
+    // 缓存加载（带锁）
+    public Product loadWithLock(Long productId) {
+        String lockKey = "lock:product:" + productId;
+        String cacheKey = "product:" + productId;
+
+        // 尝试获取锁
+        Boolean acquired = acquireLock(lockKey, Duration.ofSeconds(10));
+
+        try {
+            if (Boolean.TRUE.equals(acquired)) {
+                // 获取到锁，加载数据
+                Product product = productRepository.findById(productId);
+                if (product != null) {
+                    redisTemplate.opsForValue().set(cacheKey, product, Duration.ofMinutes(30));
+                }
+                return product;
+            } else {
+                // 未获取到锁，等待后重试
+                Thread.sleep(100);
+                return getFromCache(productId);
+            }
+        } finally {
+            if (Boolean.TRUE.equals(acquired)) {
+                releaseLock(lockKey);
+            }
+        }
+    }
+}
+```
+
+## 监控与告警
+
+### 缓存监控指标
+
+```java
+@Service
+public class CacheMonitorService {
+    @Autowired
+    private Cache<String, Object> l1Cache;
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 收集缓存指标
+    public CacheMetrics collectMetrics() {
+        CacheMetrics metrics = new CacheMetrics();
+
+        // L1 统计
+        CacheStats l1Stats = l1Cache.stats();
+        metrics.setL1HitCount(l1Stats.hitCount());
+        metrics.setL1MissCount(l1Stats.missCount());
+        metrics.setL1HitRate(l1Stats.hitRate());
+
+        // L2 统计
+        Properties info = redisTemplate.getConnectionFactory()
+            .getConnection().serverCommands().info("stats");
+        metrics.setL2Hits(Long.parseLong(info.getProperty("keyspace_hits", "0")));
+        metrics.setL2Misses(Long.parseLong(info.getProperty("keyspace_misses", "0")));
+        metrics.setL2HitRate(calculateHitRate(metrics.getL2Hits(), metrics.getL2Misses()));
+
+        // 整体命中率
+        long totalHits = metrics.getL1HitCount() + metrics.getL2Hits();
+        long totalMisses = metrics.getL1MissCount() + metrics.getL2Misses();
+        metrics.setTotalHitRate(calculateHitRate(totalHits, totalMisses));
+
+        return metrics;
+    }
+
+    private double calculateHitRate(long hits, long misses) {
+        if (hits + misses == 0) return 0;
+        return (double) hits / (hits + misses);
+    }
+}
+```
+
+## 总结
+
+多级缓存是高并发系统的标准方案。
+
+**架构要点**：
+
+| 层级 | 组件 | 命中率 | 容量 | 延迟 |
+|---|---|---|---|---|
+| L1 | Caffeine | 最高 | 小 | 微秒级 |
+| L2 | Redis | 中 | 大 | 毫秒级 |
+| L3 | 数据库 | 最低 | 无上限 | 毫秒~秒级 |
+
+**实现要点**：
+
+- L1 缓存热点数据，定期刷新
+- L2 缓存共享数据，有 TTL
+- 更新时删除所有层级缓存
+- 做好监控和告警

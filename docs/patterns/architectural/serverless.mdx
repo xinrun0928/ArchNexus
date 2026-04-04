@@ -1,0 +1,603 @@
+---
+title: Serverless 架构
+description: 函数即服务的架构模式
+---
+
+# Serverless 架构
+
+你的电商系统，平时 QPS 只有 100，但双十一峰值 QPS 可能达到 10 万。你需要为这峰值准备服务器，但平时这些服务器 99% 的时间都是空闲的。
+
+问题是：**为什么要为 1% 的峰值，浪费 99% 的资源？**
+
+Serverless 架构正是为了解决这个问题：**你只关心业务逻辑，服务器的事交给云厂商**。
+
+## 问题背景
+
+### 传统架构的资源浪费
+
+```
+传统架构的资源分配：
+
+实际 QPS
+│                    ╭───────── 双十一峰值
+│                    │
+│ 10k ───────────────╯
+│
+│
+│
+│    ╭─────────────────── 平时
+│────╯                     QPS: 100
+└─────────────────────────────────────── 时间
+
+服务器配置：需要能扛 10k QPS
+资源利用率：100 / 10k = 1%
+浪费：99%
+```
+
+问题分析：
+
+- **峰值浪费**：为峰值预留资源，平时大量闲置
+- **运维成本**：需要管理服务器、扩容缩容
+- **成本固定**：不管用不用，服务器都要钱
+- **开发效率**：需要关心服务器配置
+
+## Serverless 架构的核心
+
+```
+核心思想：
+┌─────────────────────────────────────────────────────────────────┐
+│                      Serverless 架构                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                        Cloud                             │   │
+│   │                                                          │   │
+│   │   ┌──────────┐   ┌──────────┐   ┌──────────┐            │   │
+│   │   │ Function │   │ Function │   │ Function │            │   │
+│   │   │    A     │   │    B     │   │    C     │            │   │
+│   │   └──────────┘   └──────────┘   └──────────┘            │   │
+│   │                                                          │   │
+│   │   ┌──────────────────────────────────────────────────┐  │   │
+│   │   │              Auto Scaling                         │  │   │
+│   │   │         (自动扩缩容，按需分配)                    │  │   │
+│   │   └──────────────────────────────────────────────────┘  │   │
+│   │                                                          │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│   用户只付函数执行的费用，不用为闲置资源付钱                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键概念**：
+
+1. **Function as a Service (FaaS)**：函数即服务
+2. **Backend as a Service (BaaS)**：后端即服务
+3. **Cold Start**：冷启动延迟
+4. **Stateless**：函数无状态
+
+## 代码实现
+
+### AWS Lambda 示例
+
+```java
+// ===== AWS Lambda 函数 =====
+
+// Lambda 处理器
+public class OrderHandler implements RequestHandler<OrderRequest, OrderResponse> {
+
+    @Autowired
+    private OrderService orderService;
+
+    @Override
+    public OrderResponse handleRequest(OrderRequest request, Context context) {
+        // Lambda 冷启动时才会执行依赖注入
+        // 每次调用函数，都会创建一个新的执行环境
+
+        try {
+            Order order = orderService.createOrder(request);
+            return OrderResponse.success(order);
+        } catch (Exception e) {
+            return OrderResponse.error(e.getMessage());
+        }
+    }
+}
+
+// 事件驱动的 Lambda
+public class S3EventHandler implements RequestHandler<S3Event, Void> {
+
+    @Override
+    public Void handleRequest(S3Event event, Context context) {
+        for (S3EventNotificationRecord record : event.getRecords()) {
+            String bucket = record.getS3().getBucket().getName();
+            String key = record.getS3().getObject().getKey();
+
+            // 处理上传的文件
+            processUploadedFile(bucket, key);
+        }
+        return null;
+    }
+}
+
+// API Gateway 触发器
+// GET /orders/{orderId} -> Lambda 函数
+public class GetOrderHandler implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+
+    @Override
+    public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent event, Context context) {
+        String orderId = event.getPathParameters().get("orderId");
+
+        Order order = orderService.getOrder(orderId);
+
+        return APIGatewayProxyResponseEvent.builder()
+            .withStatusCode(200)
+            .withBody(toJson(order))
+            .build();
+    }
+}
+```
+
+### Spring Cloud Function
+
+```java
+// ===== Spring Cloud Function =====
+
+@Configuration
+public class OrderFunctionConfiguration {
+
+    @Bean
+    public Function<OrderRequest, OrderResponse> createOrder() {
+        return request -> {
+            // 创建订单逻辑
+            return orderService.createOrder(request);
+        };
+    }
+
+    @Bean
+    public Function<String, Order> getOrder() {
+        return orderId -> orderService.getOrder(orderId);
+    }
+
+    @Bean
+    public Function<OrderEvent, List<OrderNotification>> processOrderEvent() {
+        return event -> {
+            // 处理订单事件，发送通知
+            return notificationService.process(event);
+        };
+    }
+}
+
+// 声明式函数
+@SpringBootApplication
+public class OrderFunctionApplication {
+    public static void main(String[] args) {
+        SpringCloudFunctionApplicationRunner.run(OrderFunctionApplication.class, args);
+    }
+}
+```
+
+### 本地状态管理
+
+```java
+// ===== 外部状态存储 =====
+
+// 函数应该是无状态的，状态存储在外部服务
+public class StatefulFunctionHandler {
+
+    @Autowired
+    private DynamoDB dynamoDB;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Override
+    public OrderResponse handleRequest(OrderRequest request, Context context) {
+        // 从 Redis 获取用户会话
+        UserSession session = redisTemplate.opsForValue()
+            .get("session:" + request.getSessionId());
+
+        // 查询数据库
+        Order order = dynamoDB.query(Order.class)
+            .where("orderId").eq(request.getOrderId())
+            .execute();
+
+        return OrderResponse.success(order);
+    }
+}
+
+// 使用外部存储维护函数状态
+public class OrderProcessingFunction {
+
+    private static final Map<String, OrderProcessingState> processingStates = new ConcurrentHashMap<>();
+
+    @Override
+    public StepFunctionResponse handleRequest(StepFunctionEvent event, Context context) {
+        String executionId = event.getExecutionId();
+
+        // 从外部存储获取状态
+        OrderProcessingState state = getState(executionId);
+
+        // 根据当前状态处理
+        switch (state.getCurrentStep()) {
+            case "INIT" -> state = handleInit(event, state);
+            case "PAYMENT" -> state = handlePayment(event, state);
+            case "INVENTORY" -> state = handleInventory(event, state);
+            case "COMPLETED" -> state = handleCompleted(event, state);
+        }
+
+        // 保存状态
+        saveState(executionId, state);
+
+        return StepFunctionResponse.continueNext();
+    }
+}
+```
+
+### 分步处理（Step Functions）
+
+```java
+// ===== AWS Step Functions =====
+
+// 状态机定义
+{
+  "Comment": "订单处理状态机",
+  "StartAt": "ValidateOrder",
+  "States": {
+    "ValidateOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:validate-order",
+      "Next": "ProcessPayment"
+    },
+    "ProcessPayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:process-payment",
+      "Next": "UpdateInventory"
+    },
+    "UpdateInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:update-inventory",
+      "Next": "CreateLogistics"
+    },
+    "CreateLogistics": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:create-logistics",
+      "Next": "SendNotification"
+    },
+    "SendNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:send-notification",
+      "End": true
+    }
+  }
+}
+
+// Step Functions 编排
+public class OrderOrchestrator {
+
+    public void startOrderWorkflow(Order order) {
+        Map<String, Object> input = Map.of(
+            "orderId", order.getId(),
+            "customerId", order.getCustomerId(),
+            "items", order.getItems(),
+            "step", "INIT"
+        );
+
+        sfnClient.startExecution(
+            StartExecutionRequest.builder()
+                .stateMachineArn("order-processing-sfn")
+                .input(toJson(input))
+                .build()
+        );
+    }
+}
+```
+
+## Serverless 架构的变体
+
+### BaaS (Backend as a Service)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      BaaS 模式                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌─────────────┐                                               │
+│   │   Client     │                                               │
+│   └──────┬──────┘                                               │
+│          │                                                       │
+│          │ Firebase / Supabase / AWS Amplify                     │
+│          │                                                       │
+│          ▼                                                       │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                                                          │   │
+│   │  - 认证 (Firebase Auth)                                │   │
+│   │  - 数据库 (Firestore, Supabase DB)                      │   │
+│   │  - 存储 (Firebase Storage)                             │   │
+│   │  - API Gateway (Firebase Functions)                    │   │
+│   │  - 推送通知 (FCM)                                       │   │
+│   │                                                          │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│   前端直接和后端服务交互，不需要自己搭建服务器                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 混合架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      混合架构                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐   │
+│   │  Lambda      │     │  Lambda      │     │  Lambda      │   │
+│   │  Functions   │     │  Functions   │     │  Functions   │   │
+│   │  (事件驱动)  │     │  (核心业务)  │     │  (异步任务)  │   │
+│   └──────────────┘     └──────┬───────┘     └──────────────┘   │
+│                               │                                  │
+│   ┌───────────────────────────┴──────────────────────────────┐  │
+│   │                      持久服务                              │  │
+│   │                                                        │  │
+│   │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐       │  │
+│   │  │ RDS    │  │ S3     │  │ DynamoDB│ │ Redis │       │  │
+│   │  │        │  │        │  │        │  │        │       │  │
+│   │  └────────┘  └────────┘  └────────┘  └────────┘       │  │
+│   │                                                        │  │
+│   └────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│   核心业务用 ECS/EC2，边缘功能用 Lambda                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Serverless 架构的优势与挑战
+
+### 优势
+
+| 优势 | 说明 |
+|---|---|
+| 按需付费 | 只需为实际执行时间付费 |
+| 无运维 | 不需要管理服务器 |
+| 自动扩缩容 | 根据请求量自动调整 |
+| 高可用 | 云厂商保证可用性 |
+| 开发效率 | 专注业务逻辑 |
+
+### 挑战
+
+| 挑战 | 说明 |
+|---|---|
+| 冷启动延迟 | 函数首次调用有延迟 |
+| 执行时长限制 | 有最大执行时间限制 |
+| 无状态 | 需要外部存储管理状态 |
+| 调试困难 | 本地测试和生产环境差异 |
+| 厂商锁定 | 依赖特定云厂商 |
+
+## 常见问题
+
+### 问题一：冷启动延迟
+
+```java
+// 问题：冷启动可能导致超时
+public class ColdStartDemoHandler implements RequestHandler<...> {
+
+    // Spring 初始化慢
+    @Autowired
+    private HeavyService heavyService;
+
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 第一次调用可能要几秒钟
+        return heavyService.process(request);
+    }
+}
+
+// 解决方案 1：减少依赖
+public class FastStartHandler implements RequestHandler<...> {
+    // 不使用 Spring，只用轻量级库
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        return doProcess(request);
+    }
+}
+
+// 解决方案 2：预置并发
+// 配置预留实例，保持函数常驻
+
+// 解决方案 3：异步处理
+public class AsyncHandler implements RequestHandler<...> {
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 立即返回，后续异步处理
+        sqs.sendMessage(queueUrl, request);
+        return Response.accepted();
+    }
+}
+```
+
+### 问题二：长时间运行任务
+
+```java
+// 问题：Lambda 最大执行时间 15 分钟
+public class LongRunningHandler implements RequestHandler<...> {
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 超过 15 分钟会超时
+        processLargeDataset(request.getData());
+    }
+}
+
+// 解决方案：分片处理
+public class ShardedHandler implements RequestHandler<ShardingRequest, ShardResult> {
+
+    @Override
+    public ShardResult handleRequest(ShardingRequest request, Context context) {
+        // 只处理一个分片
+        String shardId = request.getShardId();
+        List<Item> items = fetchShardItems(shardId);
+
+        return processShard(items);
+    }
+}
+
+// 使用 S3 Select 分片读取大文件
+public class S3SelectHandler implements RequestHandler<...> {
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 使用 S3 Select 只读取需要的部分
+        S3SelectObjectContentRequest selectRequest = S3SelectObjectContentRequest.builder()
+            .bucket("my-bucket")
+            .key("large-file.csv")
+            .expression("SELECT * FROM s3object WHERE status = 'PENDING'")
+            .expressionType(ExpressionType.SQL)
+            .inputSerialization(InputSerialization.builder().csv(csv -> {}).build())
+            .build();
+
+        S3SelectObjectContentResult result = s3Client.selectObjectContent(selectRequest);
+        return processResult(result);
+    }
+}
+```
+
+### 问题三：函数间调用
+
+```java
+// 问题：直接调用可能超时
+public class OrderHandler implements RequestHandler<...> {
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 直接调用另一个 Lambda，可能超时
+        InventoryResponse inventory = inventoryLambda.invoke(request);
+        PaymentResponse payment = paymentLambda.invoke(request);
+    }
+}
+
+// 解决方案 1：异步调用
+public class AsyncOrderHandler implements RequestHandler<...> {
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 发送消息到队列，异步处理
+        sqs.sendMessage(queueUrl, request);
+        return Response.accepted();
+    }
+}
+
+// 解决方案 2：Step Functions 编排
+public class OrchestratedHandler implements RequestHandler<...> {
+    @Override
+    public Response handleRequest(Request request, Context context) {
+        // 启动状态机执行
+        sfnClient.startExecution(executionRequest);
+        return Response.started();
+    }
+}
+```
+
+## Serverless 架构的实际应用
+
+### 实时文件处理
+
+```java
+// S3 触发 Lambda 处理上传的文件
+public class ImageProcessingHandler implements RequestHandler<S3Event, Void> {
+
+    @Override
+    public Void handleRequest(S3Event event, Context context) {
+        for (S3EventNotificationRecord record : event.getRecords()) {
+            String bucket = record.getS3().getBucket().getName();
+            String key = URLDecoder.decode(record.getS3().getObject().getKey(), StandardCharsets.UTF_8);
+
+            // 获取原图
+            S3Object s3Object = s3Client.getObject(GetObjectRequest.builder()
+                .bucket(bucket)
+                .key(key)
+                .build());
+
+            // 处理图片
+            BufferedImage original = ImageIO.read(s3Object.getObjectContent());
+            BufferedImage thumbnail = createThumbnail(original, 200);
+            BufferedImage medium = createThumbnail(original, 800);
+
+            // 上传处理后的图片
+            uploadToS3(bucket, key + "-thumb.jpg", thumbnail);
+            uploadToS3(bucket, key + "-medium.jpg", medium);
+
+            // 生成元数据
+            String metadata = generateMetadata(original);
+            dynamoDB.putItem(TableName, Map.of(
+                "key", AttributeValue.builder().s(key).build(),
+                "metadata", AttributeValue.builder().s(metadata).build()
+            ));
+        }
+        return null;
+    }
+}
+```
+
+### 定时任务
+
+```java
+// CloudWatch Events 触发定时任务
+public class ScheduledTaskHandler implements RequestHandler<ScheduledEvent, Void> {
+
+    @Override
+    public Void handleRequest(ScheduledEvent event, Context context) {
+        // 每天凌晨清理过期数据
+        LocalDateTime cutoff = LocalDateTime.now().minusDays(30);
+
+        // 分批处理，避免超时
+        String lastEvaluatedKey = null;
+        do {
+            QueryResponse response = dynamoDB.scan(ScanRequest.builder()
+                .tableName("sessions")
+                .filterExpression("lastAccessTime < :cutoff")
+                .expressionAttributeValues(Map.of(":cutoff", AttributeValue.builder()
+                    .s(cutoff.toString()).build()))
+                .build());
+
+            for (Map<String, AttributeValue> item : response.items()) {
+                dynamoDB.deleteItem(DeleteItemRequest.builder()
+                    .tableName("sessions")
+                    .key(Map.of("sessionId", item.get("sessionId")))
+                    .build());
+            }
+
+            lastEvaluatedKey = response.lastEvaluatedKey() != null ?
+                response.lastEvaluatedKey().get("sessionId").s() : null;
+
+        } while (lastEvaluatedKey != null);
+
+        return null;
+    }
+}
+```
+
+## 总结
+
+Serverless 架构通过函数即服务的模式，让你只关心业务逻辑，不用操心服务器运维。
+
+**核心要点**：
+
+- 函数无状态，状态存储在外部服务
+- 按需付费，只需为执行时间付费
+- 自动扩缩容，根据请求量调整
+- 适合事件驱动、异步处理的场景
+
+**优势**：
+
+- 成本优化：只为实际使用付费
+- 无运维：不需要管理服务器
+- 自动扩缩容：零到峰值无缝切换
+- 高可用：云厂商保证
+
+**挑战**：
+
+- 冷启动延迟
+- 执行时长限制
+- 厂商锁定
+- 调试困难
+
+**适用场景**：
+
+- 事件驱动的处理（如 S3 触发、消息队列）
+- 定时任务（如数据清理、报表生成）
+- Web API（特别是低流量场景）
+- 实时数据处理（如日志分析）

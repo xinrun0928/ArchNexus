@@ -1,0 +1,385 @@
+---
+title: 跨分片查询
+description: 分库分表后跨节点查询的解决方案
+---
+
+# 跨分片查询
+
+分库分表后，最痛苦的事情是什么？**跨分片查询**。
+
+当你的查询条件不包含分片键，或者需要聚合多个分片的数据时，麻烦就来了。
+
+## 跨分片查询的本质
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    跨分片查询的本质                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  不带分片键的查询 = 全分片扫描                                  │
+│                                                                  │
+│  查询：SELECT * FROM orders WHERE status = 'PAID'                │
+│                                                                  │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐           │
+│  │分片 0   │  │分片 1   │  │分片 2   │  │分片 3   │           │
+│  │ 扫描    │  │ 扫描    │  │ 扫描    │  │ 扫描    │           │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘           │
+│       └───────────┼───────────┼───────────┘                    │
+│                   ▼                                            │
+│            ┌──────────────┐                                   │
+│            │ 结果聚合     │                                   │
+│            └──────────────┘                                   │
+│                                                                  │
+│  问题：分片越多，扫描越多，性能越差                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 跨分片查询策略
+
+### 策略一：并发查询 + 聚合
+
+```
+原理：并行查询所有分片，然后在应用层聚合结果
+
+适用场景：
+• 分片数量有限（< 10 个）
+• 查询频率不高
+• 结果集较小
+```
+
+```java
+public class CrossShardQueryService {
+    @Autowired
+    private ShardingDataSource dataSource;
+
+    // 并发查询所有分片
+    public List<Order> getOrdersByStatus(String status) {
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        List<CompletableFuture<List<Order>>> futures = new ArrayList<>();
+
+        for (String shardName : dataSource.getAllShardNames()) {
+            CompletableFuture<List<Order>> future = CompletableFuture.supplyAsync(() -> {
+                JdbcTemplate template = dataSource.getJdbcTemplate(shardName);
+                return template.query(
+                    "SELECT * FROM t_order WHERE status = ?",
+                    (rs, rowNum) -> mapRow(rs),
+                    status
+                );
+            }, executor);
+            futures.add(future);
+        }
+
+        // 等待所有分片完成
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        // 聚合结果
+        return futures.stream()
+            .flatMap(f -> f.join().stream())
+            .collect(Collectors.toList());
+    }
+
+    // 并发聚合统计
+    public OrderStatistics getOrderStatistics() {
+        List<CompletableFuture<OrderStatistics>> futures = dataSource.getAllShardNames().stream()
+            .map(shard -> CompletableFuture.supplyAsync(() -> {
+                JdbcTemplate template = dataSource.getJdbcTemplate(shard);
+                return template.queryForObject(
+                    "SELECT COUNT(*) as cnt, SUM(amount) as total " +
+                    "FROM t_order GROUP BY status",
+                    (rs, rowNum) -> new OrderStatistics(
+                        rs.getInt("cnt"),
+                        rs.getBigDecimal("total")
+                    )
+                );
+            }))
+            .collect(Collectors.toList());
+
+        // 聚合统计
+        return aggregateStatistics(futures.stream()
+            .map(CompletableFuture::join)
+            .collect(Collectors.toList()));
+    }
+}
+```
+
+### 策略二：异构索引表
+
+```
+原理：冗余一份数据，按另一个维度分片
+
+示例：
+┌─────────────────────────────────────────────────────────┐
+│ 原始表：t_order_{user_id % 4}                          │
+│ 主键：order_id                                       │
+│ 分片键：user_id                                     │
+│                                                      │
+│ 异构索引表：t_order_by_status_{status}               │
+│ 主键：order_id                                      │
+│ 分片键：status                                     │
+│ 存储：order_id, user_id, amount, ...                │
+└─────────────────────────────────────────────────────────┘
+```
+
+```java
+// 异构索引表写入
+@Service
+public class OrderService {
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Transactional
+    public Order createOrder(Order order) {
+        // 1. 写入主表（按 user_id 分片）
+        Order saved = orderRepository.save(order);
+
+        // 2. 写入异构索引表（按 status 分片）
+        OrderIndex index = new OrderIndex();
+        index.setOrderId(saved.getId());
+        index.setUserId(saved.getUserId());
+        index.setStatus(saved.getStatus());
+        index.setAmount(saved.getAmount());
+        orderIndexRepository.save(index);
+
+        return saved;
+    }
+}
+
+// 按 status 查询（使用索引表）
+public List<Order> getOrdersByStatus(String status, int page, int pageSize) {
+    // 1. 从索引表查出 order_id 列表（带分片信息）
+    List<OrderIndex> indices = orderIndexRepository.findByStatus(
+        status, page * pageSize, pageSize);
+
+    if (indices.isEmpty()) {
+        return Collections.emptyList();
+    }
+
+    // 2. 按分片键分组
+    Map<Long, List<Long>> ordersByShard = indices.stream()
+        .collect(Collectors.groupingBy(
+            idx -> idx.getUserId() % SHARD_COUNT,
+            Collectors.mapping(OrderIndex::getOrderId, Collectors.toList())
+        ));
+
+    // 3. 批量查询各分片
+    List<Order> results = new ArrayList<>();
+    for (Map.Entry<Long, List<Long>> entry : ordersByShard.entrySet()) {
+        Long shardId = entry.getKey();
+        List<Long> orderIds = entry.getValue();
+        List<Order> orders = orderRepository.findByIdsInShard(shardId, orderIds);
+        results.addAll(orders);
+    }
+
+    return results;
+}
+```
+
+### 策略三：搜索引擎
+
+```
+原理：使用 Elasticsearch 存储全量数据，MySQL 只做分片存储
+
+查询流程：
+1. 请求先到 ES，根据条件查询
+2. ES 返回命中的 ID 和分片路由信息
+3. 根据路由信息到对应分片获取完整数据
+4. 返回给用户
+```
+
+```java
+// ES + MySQL 双写
+@Service
+public class OrderSearchService {
+    @Autowired
+    private ElasticsearchRestTemplate esTemplate;
+    @Autowired
+    private OrderRepository orderRepository;
+
+    public void indexOrder(Order order) {
+        // 写入 ES（全量字段，支持各种查询）
+        OrderDocument doc = new OrderDocument(order);
+        esTemplate.save(doc);
+    }
+
+    public List<Order> search(String keyword, int page, int size) {
+        // 1. ES 查询
+        NativeQuery query = NativeQuery.builder()
+            .withQuery(q -> q.bool(b -> b
+                .must(m -> m.match(mc -> mc.field("status").query(keyword)))
+            ))
+            .withPageable(PageRequest.of(page, size))
+            .build();
+
+        Page<OrderDocument> docs = esTemplate.search(query, OrderDocument.class);
+
+        // 2. 按分片分组
+        Map<Long, List<Long>> ordersByShard = docs.stream()
+            .map(SearchHit::getContent)
+            .collect(Collectors.groupingBy(
+                doc -> doc.getUserId() % SHARD_COUNT,
+                Collectors.mapping(OrderDocument::getId, Collectors.toList())
+            ));
+
+        // 3. 从 MySQL 分片获取完整数据
+        return ordersByShard.entrySet().stream()
+            .flatMap(entry -> {
+                Long shardId = entry.getKey();
+                List<Long> orderIds = entry.getValue();
+                return orderRepository.findByIdsInShard(shardId, orderIds).stream();
+            })
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### 策略四：汇总表
+
+```
+原理：预先计算并存储聚合结果
+
+示例：订单统计表
+┌─────────────────────────────────────────────────────────┐
+│ order_statistics                                       │
+│ ├─ id                                                │
+│ ├─ date (按天分片)                                    │
+│ ├─ merchant_id                                        │
+│ ├─ order_count                                       │
+│ ├─ total_amount                                      │
+│ └─ avg_amount                                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+```java
+// 定时计算汇总表
+@Service
+public class StatisticsService {
+    @Autowired
+    private ShardingDataSource dataSource;
+    @Autowired
+    private StatisticsRepository statisticsRepository;
+
+    @Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点
+    public void calculateYesterdayStatistics() {
+        LocalDate yesterday = LocalDate.now().minusDays(1);
+        String dateStr = yesterday.format(DateTimeFormatter.BASIC_ISO_DATE);
+
+        // 并发查询所有分片
+        Map<Long, Map<String, StatisticsData>> shardStats = new ConcurrentHashMap<>();
+
+        dataSource.getAllShardNames().parallelStream().forEach(shard -> {
+            JdbcTemplate template = dataSource.getJdbcTemplate(shard);
+            String sql = """
+                SELECT merchant_id,
+                       COUNT(*) as order_count,
+                       SUM(amount) as total_amount,
+                       AVG(amount) as avg_amount
+                FROM t_order
+                WHERE DATE(created_at) = ?
+                GROUP BY merchant_id
+                """;
+            List<StatisticsData> stats = template.query(sql,
+                (rs, rowNum) -> new StatisticsData(
+                    rs.getLong("merchant_id"),
+                    rs.getInt("order_count"),
+                    rs.getBigDecimal("total_amount")
+                ),
+                dateStr
+            );
+            shardStats.put(shard.hashCode(), stats.stream()
+                .collect(Collectors.toMap(StatisticsData::getMerchantId, s -> s)));
+        });
+
+        // 聚合各分片结果
+        Map<Long, StatisticsData> mergedStats = new HashMap<>();
+        shardStats.values().forEach(stats -> {
+            stats.forEach((merchantId, stat) -> {
+                mergedStats.merge(merchantId, stat, (a, b) ->
+                    new StatisticsData(merchantId,
+                        a.getOrderCount() + b.getOrderCount(),
+                        a.getTotalAmount().add(b.getTotalAmount())
+                    ));
+            });
+        });
+
+        // 写入汇总表
+        for (Map.Entry<Long, StatisticsData> entry : mergedStats.entrySet()) {
+            StatisticsData stat = entry.getValue();
+            StatisticsEntity entity = new StatisticsEntity();
+            entity.setDate(dateStr);
+            entity.setMerchantId(entry.getKey());
+            entity.setOrderCount(stat.getOrderCount());
+            entity.setTotalAmount(stat.getTotalAmount());
+            statisticsRepository.save(entity);
+        }
+    }
+}
+```
+
+## 分页跨分片查询
+
+```
+问题：SELECT * FROM orders WHERE status = 'PAID' ORDER BY created_at DESC LIMIT 1000, 20
+
+分析：
+1. 需要查询所有分片
+2. 每个分片取前 1020 条
+3. 汇总到内存（1020 * 分片数 条）
+4. 内存中排序
+5. 取第 1001-1020 条
+
+问题：深分页时数据量巨大
+```
+
+```java
+// 游标分页（推荐）
+public class CursorPaginationService {
+    public Page<Order> getOrdersByCursor(String status, Long lastId, int pageSize) {
+        // 查询时带上上一页最后一条的 ID
+        List<Order> orders = jdbcTemplate.query(
+            "SELECT * FROM t_order " +
+            "WHERE status = ? AND id < ? " +
+            "ORDER BY id DESC LIMIT ?",
+            (rs, rowNum) -> mapRow(rs),
+            status, lastId != null ? lastId : Long.MAX_VALUE, pageSize
+        );
+
+        // 返回下一页游标
+        Long nextCursor = orders.isEmpty() ? null :
+            orders.get(orders.size() - 1).getId();
+
+        return new Page<>(orders, nextCursor);
+    }
+}
+
+// 前端调用示例
+public Page<Order> getOrders(String status, Long cursor, int pageSize) {
+    Long lastId = cursor != null ? Long.parseLong(cursor) : null;
+    return getOrdersByCursor(status, lastId, pageSize);
+}
+```
+
+## 总结
+
+跨分片查询是分库分表后的主要挑战。
+
+**核心策略**：
+
+| 策略 | 适用场景 | 代价 |
+|---|---|---|
+| 并发查询 + 聚合 | 分片数少，数据量小 | 延迟增加 |
+| 异构索引表 | 特定维度查询多 | 存储翻倍，维护复杂 |
+| ES 搜索 | 复杂查询，全文搜索 | 引入新组件，延迟 |
+| 汇总表 | 统计查询 | 数据非实时 |
+
+**最佳实践**：
+
+- 尽量让查询带上分片键
+- 避免深分页，使用游标分页
+- 统计查询使用预计算
+- 复杂查询考虑 ES
+
+**建议**：
+
+- 先优化查询模式
+- 必要时才做跨分片查询
+- 使用异步处理非实时查询

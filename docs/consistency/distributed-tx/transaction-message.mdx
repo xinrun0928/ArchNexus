@@ -1,0 +1,434 @@
+---
+title: 事务消息
+description: 基于消息队列的可靠事务方案
+---
+
+# 事务消息
+
+你的分布式事务需要可靠消息，但本地消息表太麻烦。
+
+问题出在哪？**事务消息是更优雅的可靠消息方案**。
+
+事务消息由消息队列提供原生支持，实现更简单可靠。
+
+## 事务消息原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    事务消息原理                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  核心思想：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  「消息队列作为协调者，                                │   │
+│  │    保证业务操作和消息发送的原子性」                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  ┌─────────────┐         ┌─────────────┐              │   │
+│  │  │  发送方    │         │   MQ 集群   │              │   │
+│  │  │             │◀──────▶│              │              │   │
+│  │  │             │  事务消息│              │              │   │
+│  │  │             │         │              │              │   │
+│  │  │  BEGIN      │         │  存储消息   │              │   │
+│  │  │    │       │────────▶│  (prepared)│              │   │
+│  │  │  业务操作  │         │              │              │   │
+│  │  │    │       │         │              │              │   │
+│  │  │  COMMIT/   │         │              │              │   │
+│  │  │  ROLLBACK   │         │              │              │   │
+│  │  │    │       │         │              │              │   │
+│  │  │    │       │◀────────│  投递/删除  │              │   │
+│  │  └─────────────┘         └─────────────┘              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## RocketMQ 事务消息
+
+### 事务消息流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RocketMQ 事务消息流程                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  阶段一：发送半消息                                    │   │
+│  │                                                         │   │
+│  │  producer.sendHalfMessage(message)                     │   │
+│  │           │                                            │   │
+│  │           ▼                                            │   │
+│  │  消息状态：Prepared（暂不可见）                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  阶段二：执行本地事务                                 │   │
+│  │                                                         │   │
+│  │  localTransaction.execute(message)                     │   │
+│  │           │                                            │   │
+│  │     ┌─────┴─────┐                                     │   │
+│  │     ▼           ▼                                      │   │
+│  │  成功        失败                                      │   │
+│  │     │           │                                      │   │
+│  │     ▼           ▼                                      │   │
+│  │  COMMIT      ROLLBACK                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  阶段三：确认消息状态                                  │   │
+│  │                                                         │   │
+│  │  - COMMIT：消息对消费者可见                           │   │
+│  │  - ROLLBACK：消息被删除                               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  阶段四：回查（补偿）                                 │   │
+│  │                                                         │   │
+│  │  MQ 发现 Prepared 消息长时间未确认                    │   │
+│  │  → 回查 producer.checkLocalTransaction()             │   │
+│  │  → 确定最终状态                                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 生产者实现
+
+```java
+// RocketMQ 事务消息生产者
+@Service
+public class TransactionalProducerService {
+    @Autowired
+    private RocketMQTemplate rocketMQTemplate;
+
+    public void sendTransferMessage(TransferRequest request) {
+        String transactionId = UUID.randomUUID().toString();
+
+        // 构建消息
+        Message<TransferMessage> message = MessageBuilder
+            .withPayload(new TransferMessage(
+                transactionId,
+                request.getFromAccount(),
+                request.getToAccount(),
+                request.getAmount()))
+            .setHeader("transactionId", transactionId)
+            .build();
+
+        // 发送事务消息（半消息）
+        TransactionSendResult result = rocketMQTemplate.sendMessageInTransaction(
+            "transfer-topic",
+            message,
+            // 事务执行器
+            (msg, arg) -> {
+                // 执行本地事务
+                try {
+                    executeLocalTransaction(request);
+                    return TransactionStatus.COMMIT;  // 成功，提交消息
+                } catch (Exception e) {
+                    log.error("本地事务执行失败", e);
+                    return TransactionStatus.ROLLBACK;  // 失败，回滚消息
+                }
+            },
+            request
+        );
+
+        System.out.println("发送结果: " + result.getSendStatus());
+    }
+
+    // 本地事务
+    @Transactional
+    public void executeLocalTransaction(TransferRequest request) {
+        // 1. 扣减余额
+        accountService.debit(request.getFromAccount(), request.getAmount());
+
+        // 2. 增加余额
+        accountService.credit(request.getToAccount(), request.getAmount());
+    }
+
+    // 回查方法（实现 TransactionListenerFactory）
+    @Bean
+    public TransactionListenerFactory transactionListenerFactory() {
+        return (producer, msg, arg) -> new TransactionListener() {
+            @Override
+            public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+                // 发送时的回调，与上面 sendMessageInTransaction 的回调相同
+                return LocalTransactionState.UNKNOWN;
+            }
+
+            @Override
+            public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+                // MQ 回查：根据消息 ID 查询本地事务状态
+                String transactionId = msg.getTransactionId();
+                TransactionLog log = transactionLogRepository.findById(transactionId);
+
+                if (log == null) {
+                    return LocalTransactionState.ROLLBACK;
+                }
+
+                if (log.getStatus() == TransactionStatus.COMMITTED) {
+                    return LocalTransactionState.COMMIT;
+                }
+
+                if (log.getStatus() == TransactionStatus.ROLLED_BACK) {
+                    return LocalTransactionState.ROLLBACK;
+                }
+
+                return LocalTransactionState.UNKNOWN;
+            }
+        };
+    }
+}
+```
+
+### 消费者实现
+
+```java
+// 事务消息消费者
+@Service
+public class TransferConsumer {
+    @Autowired
+    private AccountService accountService;
+
+    @RocketMQMessageListener(
+        topic = "transfer-topic",
+        consumerGroup = "transfer-consumer-group",
+        concurrency = "10"
+    )
+    public void consume(TransferMessage message, Acknowledgment acknowledgment) {
+        try {
+            // 处理消息
+            processMessage(message);
+
+            // 确认消息
+            acknowledgment.acknowledge();
+        } catch (Exception e) {
+            // 处理失败，消息会被重试
+            log.error("处理消息失败: {}", message, e);
+            throw e;
+        }
+    }
+
+    private void processMessage(TransferMessage message) {
+        // 幂等检查
+        if (processed(message.getTransactionId())) {
+            return;
+        }
+
+        // 处理业务
+        // ...
+
+        // 记录已处理
+        markAsProcessed(message.getTransactionId());
+    }
+}
+```
+
+## RabbitMQ 事务消息
+
+### 确认机制
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RabbitMQ 事务消息                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  RabbitMQ 使用 publisher confirms 机制：                        │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  1. 开启 confirm 模式                                  │   │
+│  │     channel.confirmSelect()                            │   │
+│  │                                                         │   │
+│  │  2. 发送消息                                          │   │
+│  │     channel.basicPublish(...)                         │   │
+│  │                                                         │   │
+│  │  3. 等待确认                                          │   │
+│  │     channel.waitForConfirms()                        │   │
+│  │                                                         │   │
+│  │  4. 确认成功                                          │   │
+│  │     → 提交本地事务                                     │   │
+│  │                                                         │   │
+│  │  5. 确认失败                                          │   │
+│  │     → 重新发送或回滚                                   │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### RabbitMQ 实现
+
+```java
+// RabbitMQ 事务消息
+@Service
+public class RabbitMQTransactionalService {
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private ConnectionFactory connectionFactory;
+
+    public void sendTransferMessage(TransferRequest request) {
+        String transactionId = UUID.randomUUID().toString();
+
+        try {
+            // 1. 开启事务模式
+            Channel channel = connectionFactory.createConnection().createChannel();
+            channel.txSelect();
+
+            try {
+                // 2. 发送消息
+                rabbitTemplate.convertAndSend(
+                    "transfer-exchange",
+                    "transfer-routing-key",
+                    request,
+                    msg -> {
+                        msg.getMessageProperties().setTransactionId(transactionId);
+                        return msg;
+                    }
+                );
+
+                // 3. 执行本地事务
+                executeLocalTransaction(request);
+
+                // 4. 提交事务
+                channel.txCommit();
+
+            } catch (Exception e) {
+                // 回滚
+                channel.txRollback();
+                throw e;
+            } finally {
+                channel.close();
+            }
+        } catch (Exception e) {
+            log.error("发送消息失败", e);
+            throw e;
+        }
+    }
+
+    @Transactional
+    public void executeLocalTransaction(TransferRequest request) {
+        // 本地事务
+        accountService.debit(request.getFromAccount(), request.getAmount());
+        accountService.credit(request.getToAccount(), request.getAmount());
+    }
+}
+```
+
+## Kafka 事务消息
+
+### Kafka 事务
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Kafka 事务消息                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Kafka 支持Exactly-Once 语义：                                  │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  配置：                                                 │   │
+│  │  producerProps.put("enable.idempotence", true)       │   │
+│  │  producerProps.put("acks", "all")                      │   │
+│  │  producerProps.put("transactional.id", "producer-1")  │   │
+│  │                                                         │   │
+│  │  使用：                                                 │   │
+│  │  producer.initTransactions();                           │   │
+│  │  producer.beginTransaction();                          │   │
+│  │  producer.send(record);                                │   │
+│  │  producer.commitTransaction();                         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Kafka 实现
+
+```java
+// Kafka 事务消息
+@Service
+public class KafkaTransactionalService {
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Transactional
+    public void sendTransferMessage(TransferRequest request) {
+        // 1. 执行本地事务
+        accountService.debit(request.getFromAccount(), request.getAmount());
+        accountService.credit(request.getToAccount(), request.getAmount());
+
+        // 2. 发送消息（在同一事务中）
+        kafkaTemplate.send("transfer-topic", request.getTransactionId(), request);
+    }
+
+    // Kafka 消费者
+    @KafkaListener(topics = "transfer-topic", groupId = "transfer-group")
+    @Transactional
+    public void consume(TransferRequest request) {
+        // Kafka 支持事务消费，可以和本地操作一起提交
+        processTransfer(request);
+    }
+}
+```
+
+## 事务消息对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    事务消息对比                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌────────────┬────────────┬────────────┬──────────────┐         │
+│  │ 特性        │ RocketMQ │ RabbitMQ │ Kafka        │         │
+│  ├────────────┼────────────┼────────────┼──────────────┤         │
+│  │ 事务消息   │ 原生支持  │ Confirm   │ 事务 API     │         │
+│  │ 回查机制   │ 支持       │ 不支持    │ 不支持      │         │
+│  │ 实现复杂度 │ 中        │ 高        │ 中           │         │
+│  │ 性能       │ 高        │ 中        │ 高           │         │
+│  └────────────┴────────────┴────────────┴──────────────┘         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+事务消息是实现可靠消息的标准方案。
+
+**原理**：
+
+- 半消息 + 本地事务 + 确认/回滚
+- MQ 回查确保最终一致
+
+**RocketMQ 事务消息**：
+
+- 原生事务消息支持
+- 回查机制完善
+- 实现较简单
+
+**RabbitMQ 事务消息**：
+
+- Confirm 机制
+- 需要额外处理回查
+- 实现较复杂
+
+**Kafka 事务**：
+
+- Exactly-Once 语义
+- 结合消费位移管理
+- 适合大数据场景

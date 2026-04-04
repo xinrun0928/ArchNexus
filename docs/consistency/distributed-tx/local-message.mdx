@@ -1,0 +1,413 @@
+---
+title: 本地消息表
+description: 基于数据库的可靠消息方案
+---
+
+# 本地消息表
+
+你的分布式事务需要最终一致性，但不想引入额外的消息队列。
+
+问题出在哪？**本地消息表是实现最终一致性的经典方案**。
+
+本地消息表是「同一数据库本地事务 + 消息表」的组合。
+
+## 本地消息表原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    本地消息表原理                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  核心思想：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  「把消息表放在业务数据库中，                         │   │
+│  │    业务操作和消息记录在同一个事务中，                │   │
+│  │    保证业务和消息的原子性」                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │         业务表 ──────────────────────────────────┐     │   │
+│  │              │                                      │     │   │
+│  │              │ 同一事务                           │     │   │
+│  │              ▼                                      │     │   │
+│  │         消息表 ◀────────────────────────────────┘     │   │
+│  │                                                         │   │
+│  │  消息表字段：                                         │   │
+│  │  - id, message_id, content, status, retry_count, ...  │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 工作流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    本地消息表工作流程                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 1：执行业务 + 记录消息                           │   │
+│  │                                                         │   │
+│  │  BEGIN TRANSACTION                                      │   │
+│  │      UPDATE account SET balance = balance - 100 ...       │   │
+│  │      INSERT INTO message (status='pending') ...           │   │
+│  │  COMMIT                                                │   │
+│  │                                                         │   │
+│  │  两个操作在同一事务中，保证原子性                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 2：异步投递消息                                 │   │
+│  │                                                         │   │
+│  │  后台任务扫描 pending 消息，投递到 MQ                  │   │
+│  │  投递成功则更新状态为 sent                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  步骤 3：消费方确认                                   │   │
+│  │                                                         │   │
+│  │  消费方处理完成后回执，发送方更新状态为 completed    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 数据库表设计
+
+### 消息表
+
+```sql
+-- 消息表
+CREATE TABLE local_message (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    message_id VARCHAR(64) NOT NULL UNIQUE COMMENT '消息唯一 ID',
+    topic VARCHAR(128) NOT NULL COMMENT '消息主题',
+    message_body TEXT NOT NULL COMMENT '消息体',
+    status VARCHAR(32) NOT NULL DEFAULT 'PENDING' COMMENT '状态：PENDING/SENT/CONSUMED/FAILED',
+    retry_count INT DEFAULT 0 COMMENT '重试次数',
+    max_retry INT DEFAULT 3 COMMENT '最大重试次数',
+    create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    expire_time DATETIME COMMENT '过期时间',
+
+    INDEX idx_status (status),
+    INDEX idx_create_time (create_time),
+    INDEX idx_message_id (message_id)
+) COMMENT '本地消息表';
+```
+
+### 业务表
+
+```sql
+-- 账户表
+CREATE TABLE account (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    account_no VARCHAR(32) NOT NULL UNIQUE,
+    balance DECIMAL(15,2) NOT NULL DEFAULT 0,
+    frozen_balance DECIMAL(15,2) NOT NULL DEFAULT 0,
+    create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_account_no (account_no)
+) COMMENT '账户表';
+```
+
+## 实现代码
+
+### 业务操作 + 消息记录
+
+```java
+// 转账服务
+@Service
+public class TransferService {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Transactional
+    public void transfer(String fromAccountNo, String toAccountNo, BigDecimal amount) {
+        String messageId = UUID.randomUUID().toString();
+
+        // 1. 扣减转出账户余额
+        String sql = """
+            UPDATE account
+            SET balance = balance - ?
+            WHERE account_no = ? AND balance >= ?
+            """;
+        int updated = jdbcTemplate.update(sql, amount, fromAccountNo, amount);
+        if (updated == 0) {
+            throw new InsufficientBalanceException("余额不足");
+        }
+
+        // 2. 增加转入账户余额
+        String sql2 = """
+            UPDATE account
+            SET balance = balance + ?
+            WHERE account_no = ?
+            """;
+        jdbcTemplate.update(sql2, amount, toAccountNo);
+
+        // 3. 记录消息（同一事务）
+        String insertSql = """
+            INSERT INTO local_message (message_id, topic, message_body, status, create_time)
+            VALUES (?, ?, ?, 'PENDING', NOW())
+            """;
+        String messageBody = JSON.toJSONString(new TransferMessage(
+            fromAccountNo, toAccountNo, amount, messageId));
+        jdbcTemplate.update(insertSql, messageId, "transfer-topic", messageBody);
+
+        // 事务提交后，消息状态为 PENDING
+    }
+}
+```
+
+### 消息投递
+
+```java
+// 消息投递服务
+@Service
+public class Message投递Service {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Scheduled(fixedDelay = 1000)  // 每秒扫描
+    public void pollAndSend() {
+        // 1. 扫描 pending 消息
+        String querySql = """
+            SELECT id, message_id, topic, message_body
+            FROM local_message
+            WHERE status = 'PENDING' AND retry_count < max_retry
+            ORDER BY create_time ASC
+            LIMIT 100
+            FOR UPDATE SKIP LOCKED
+            """;
+
+        List<Message> messages = jdbcTemplate.query(querySql, (rs, rowNum) -> {
+            Message msg = new Message();
+            msg.setId(rs.getLong("id"));
+            msg.setMessageId(rs.getString("message_id"));
+            msg.setTopic(rs.getString("topic"));
+            msg.setMessageBody(rs.getString("message_body"));
+            return msg;
+        });
+
+        // 2. 投递消息
+        for (Message msg : messages) {
+            try {
+                kafkaTemplate.send(msg.getTopic(), msg.getMessageId(), msg.getMessageBody());
+
+                // 3. 更新状态
+                String updateSql = """
+                    UPDATE local_message
+                    SET status = 'SENT', update_time = NOW()
+                    WHERE id = ?
+                    """;
+                jdbcTemplate.update(updateSql, msg.getId());
+            } catch (Exception e) {
+                // 4. 增加重试次数
+                String retrySql = """
+                    UPDATE local_message
+                    SET retry_count = retry_count + 1, update_time = NOW()
+                    WHERE id = ?
+                    """;
+                jdbcTemplate.update(retrySql, msg.getId());
+            }
+        }
+    }
+}
+```
+
+### 消息消费
+
+```java
+// 消息消费
+@Service
+public class TransferConsumer {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @KafkaListener(topics = "transfer-topic", groupId = "transfer-consumer")
+    public void consume(String key, String message) {
+        TransferMessage transferMsg = JSON.parseObject(message, TransferMessage.class);
+
+        try {
+            // 处理消息
+            processTransfer(transferMsg);
+
+            // 发送回执
+            sendAck(transferMsg.getMessageId());
+        } catch (Exception e) {
+            // 处理失败，消息会被重试
+            throw e;
+        }
+    }
+
+    // 发送回执
+    private void sendAck(String messageId) {
+        // 可以通过 MQ 回执
+        kafkaTemplate.send("transfer-ack-topic", messageId, "ACK");
+    }
+}
+
+// 回执消费
+@Service
+public class AckConsumer {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @KafkaListener(topics = "transfer-ack-topic", groupId = "transfer-ack-consumer")
+    public void consume(String messageId) {
+        // 更新消息状态为已消费
+        String sql = """
+            UPDATE local_message
+            SET status = 'CONSUMED', update_time = NOW()
+            WHERE message_id = ?
+            """;
+        jdbcTemplate.update(sql, messageId);
+    }
+}
+```
+
+## 定时扫描与补偿
+
+```java
+// 定时补偿任务
+@Service
+public class Message补偿Service {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Scheduled(fixedDelay = 60000)  // 每分钟
+    public void compensate() {
+        // 1. 查询超时未确认的消息
+        String querySql = """
+            SELECT id, message_id, topic, message_body, retry_count, max_retry
+            FROM local_message
+            WHERE status = 'SENT'
+            AND update_time < DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            AND retry_count < max_retry
+            FOR UPDATE SKIP LOCKED
+            LIMIT 100
+            """;
+
+        List<Message> messages = jdbcTemplate.query(querySql, (rs, rowNum) -> {
+            Message msg = new Message();
+            msg.setId(rs.getLong("id"));
+            msg.setMessageId(rs.getString("message_id"));
+            msg.setTopic(rs.getString("topic"));
+            msg.setMessageBody(rs.getString("message_body"));
+            msg.setRetryCount(rs.getInt("retry_count"));
+            return msg;
+        });
+
+        // 2. 重新投递
+        for (Message msg : messages) {
+            try {
+                kafkaTemplate.send(msg.getTopic(), msg.getMessageId(), msg.getMessageBody());
+
+                // 更新重试次数
+                String updateSql = """
+                    UPDATE local_message
+                    SET retry_count = retry_count + 1, update_time = NOW()
+                    WHERE id = ?
+                    """;
+                jdbcTemplate.update(updateSql, msg.getId());
+            } catch (Exception e) {
+                log.error("补偿投递失败: {}", msg.getMessageId(), e);
+            }
+        }
+
+        // 3. 标记死信
+        String deadLetterSql = """
+            UPDATE local_message
+            SET status = 'FAILED', update_time = NOW()
+            WHERE status = 'SENT'
+            AND retry_count >= max_retry
+            AND update_time < DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            """;
+        jdbcTemplate.update(deadLetterSql);
+    }
+}
+```
+
+## 适用场景
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    本地消息表适用场景                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  优点：                                                        │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │ ✓ 实现简单，无需额外基础设施                           │   │
+│  │ ✓ 可靠消息，基于数据库事务                           │   │
+│  │ ✓ 消息可查询、可追溯                                  │   │
+│  │ ✓ 支持失败重试                                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  缺点：                                                        │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │ ✗ 需要定时任务扫描                                    │   │
+│  │ ✗ 消息表与业务表共用数据库                           │   │
+│  │ ✗ 不适合跨数据库场景                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  适用场景：                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │ ✓ 单体数据库内的跨表操作                             │   │
+│  │ ✓ 需要可靠消息但不想引入 MQ                        │   │
+│  │ ✓ 最终一致性可接受的场景                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+本地消息表是实现最终一致性的经典方案。
+
+**原理**：
+
+- 业务操作和消息记录在同一事务
+- 消息状态机：PENDING → SENT → CONSUMED
+- 定时扫描补偿
+
+**优点**：
+
+- 实现简单
+- 可靠消息
+- 可查询追溯
+
+**缺点**：
+
+- 需要定时任务
+- 依赖数据库
+- 不适合跨库场景
+
+**适用场景**：
+
+- 单库跨表操作
+- 最终一致性可接受
+- 需要可靠消息

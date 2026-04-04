@@ -1,0 +1,332 @@
+---
+title: 线程 vs 协程 vs 异步
+description: Java 并发模型的演进与选择
+---
+
+# 线程 vs 协程 vs 异步
+
+你的系统要处理 10 万并发连接，每个连接需要占用一个线程吗？
+
+问题出在哪？**线程是昂贵的资源，创建和切换都有开销**。
+
+理解线程、协程、异步的区别，是选择合适并发模型的基础。
+
+## 并发模型演进
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    并发模型演进                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 同步多线程                                           │   │
+│  │ 10 万连接 = 10 万线程                                   │   │
+│  │ 问题：线程栈内存消耗大，上下文切换慢                     │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. IO 多路复用（NIO）                                 │   │
+│  │ 单线程监听多个连接，事件驱动                           │   │
+│  │ 问题：编程复杂，回调地狱                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 异步（CompletableFuture / Reactor）                │   │
+│  │ 非阻塞 IO + 回调                                        │   │
+│  │ 问题：异步编程复杂，调试困难                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 4. 协程（Kotlin Coroutine / Loom）                   │   │
+│  │ 轻量级并发，原生语法                                  │   │
+│  │ 优势：既有同步的简洁，又有异步的性能                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 线程模型
+
+### 同步多线程
+
+```java
+// 同步多线程模型
+public class SyncMultiThread {
+    private final ExecutorService executor = Executors.newFixedThreadPool(100);
+
+    // 线程栈大小：1MB
+    // 10 万连接需要：100GB 内存（不可行）
+    public void handleConnection(Socket socket) {
+        executor.submit(() -> {
+            try {
+                // 同步 IO
+                InputStream in = socket.getInputStream();
+                OutputStream out = socket.getOutputStream();
+                byte[] buffer = new byte[1024];
+                while (true) {
+                    int n = in.read(buffer);  // 阻塞
+                    if (n > 0) {
+                        out.write(buffer, 0, n);
+                    }
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+}
+```
+
+### 线程池模型
+
+```java
+// 线程池模型
+public class ThreadPoolModel {
+    // CPU 密集型：线程数 = CPU 核心数 + 1
+    // IO 密集型：线程数 = CPU 核心数 * 期望 CPU 利用率 * (1 + 平均等待时间 / 平均工作时间)
+    // 示例：CPU = 8，IO 等待 = 80%，工作时间 = 20%
+    // 线程数 = 8 * 1 * (1 + 80/20) = 40
+    private final ExecutorService executor = new ThreadPoolExecutor(
+        40,             // 核心线程数
+        100,            // 最大线程数
+        60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(1000),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
+}
+```
+
+### 线程模型的优缺点
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    线程模型优缺点                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  优点：                                                        │
+│  ✓ 编程模型简单（同步代码）                                    │
+│  ✓ 易于理解和调试                                              │
+│  ✓ 适合 CPU 密集型任务                                        │
+│                                                                  │
+│  缺点：                                                        │
+│  ✗ 线程创建和销毁开销大                                       │
+│  ✗ 上下文切换成本高                                           │
+│  ✗ 内存消耗大（每个线程 1MB 栈）                             │
+│  ✗ 线程数受限于系统资源                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 协程模型
+
+### 协程的概念
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    协程的概念                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  协程（Coroutine）：轻量级的并发原语                          │
+│                                                                  │
+│  对比：                                                        │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 线程：操作系统调度，需要内核态切换                        │   │
+│  │ 协程：用户态调度，无需内核态切换                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  特点：                                                        │
+│  - 轻量：每个协程只需几 KB 栈空间                           │
+│  - 高效：切换无需内核态切换                                   │
+│  - 挂起：协程可以挂起和恢复                                 │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Java 协程（Loom）
+
+```java
+// Java 虚拟线程（Loom）
+public class VirtualThreadDemo {
+    public static void main(String[] args) throws Exception {
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            // 100 万虚拟线程，每个只需几 KB
+            for (int i = 0; i < 1_000_000; i++) {
+                final int id = i;
+                executor.submit(() -> {
+                    try {
+                        // 模拟 IO 操作
+                        Thread.sleep(Duration.ofSeconds(1));
+                        System.out.println("Task " + id + " completed");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return null;
+                });
+            }
+        }
+    }
+}
+
+// 使用结构化并发
+public class StructuredConcurrency {
+    public String process() throws InterruptedException {
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+            Supplier<String> user = scope.fork(() -> fetchUser());
+            Supplier<String> order = scope.fork(() -> fetchOrder());
+
+            scope.join();
+            return user.get() + "," + order.get();
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+```
+
+### 协程的优缺点
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    协程模型优缺点                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  优点：                                                        │
+│  ✓ 极高的并发能力（百万级）                                    │
+│  ✓ 极低的内存消耗（KB 级栈）                                  │
+│  ✓ 同步的编程体验                                              │
+│  ✓ 减少线程数，降低上下文切换                                  │
+│                                                                  │
+│  缺点：                                                        │
+│  ✗ 需要语言/框架支持                                           │
+│  ✗ 阻塞操作需要特殊处理（虚拟线程中会自动切换）               │
+│  ✗ 调试工具不完善                                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 异步模型
+
+### 异步编程模型
+
+```java
+// CompletableFuture 异步
+public class AsyncDemo {
+    public CompletableFuture<String> getData() {
+        return CompletableFuture.supplyAsync(() -> {
+            // 在线程池中执行
+            return fetchFromService();
+        });
+    }
+
+    // 链式调用
+    public CompletableFuture<String> process() {
+        return getData()
+            .thenApply(this::transform)
+            .thenApply(this::enrich)
+            .exceptionally(ex -> {
+                log.error("处理失败", ex);
+                return "default";
+            });
+    }
+
+    // 并行执行
+    public CompletableFuture<String> parallel() {
+        CompletableFuture<String> userFuture = getUser();
+        CompletableFuture<String> orderFuture = getOrder();
+
+        return CompletableFuture.allOf(userFuture, orderFuture)
+            .thenApply(v ->
+                userFuture.join() + "," + orderFuture.join()
+            );
+    }
+}
+```
+
+### 响应式编程（Reactor）
+
+```java
+// WebFlux 响应式编程
+@Service
+public class ReactiveService {
+    public Mono<User> getUser(Long id) {
+        return userRepository.findById(id)
+            .switchIfEmpty(Mono.error(new UserNotFoundException(id)));
+    }
+
+    public Flux<Order> getUserOrders(Long userId) {
+        return orderRepository.findByUserId(userId);
+    }
+
+    // 组合多个数据源
+    public Mono<UserDetail> getUserDetail(Long userId) {
+        return Mono.zip(
+            getUser(userId),
+            getUserOrders(userId).collectList()
+        ).map(tuple -> new UserDetail(tuple.getT1(), tuple.getT2()));
+    }
+}
+```
+
+### 异步的优缺点
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    异步模型优缺点                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  优点：                                                        │
+│  ✓ 非阻塞 IO，资源利用率高                                     │
+│  ✓ 适合 IO 密集型任务                                          │
+│  ✓ 适合高并发场景                                              │
+│                                                                  │
+│  缺点：                                                        │
+│  ✗ 编程模型复杂（回调地狱）                                    │
+│  ✗ 调试困难                                                    │
+│  ✗ 堆栈追踪不清晰                                              │
+│  ✗ 线程安全要求高                                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 模型对比与选择
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    并发模型对比                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────┬───────────┬──────────┬─────────────┐         │
+│  │ 模型     │ 并发能力  │ 内存消耗  │ 编程复杂度  │         │
+│  ├──────────┼───────────┼──────────┼─────────────┤         │
+│  │ 同步线程 │ 低        │ 高        │ 低          │         │
+│  │ 协程     │ 高        │ 低        │ 低          │         │
+│  │ 异步     │ 高        │ 低        │ 高          │         │
+│  └──────────┴───────────┴──────────┴─────────────┘         │
+│                                                                  │
+│  选择建议：                                                    │
+│  CPU 密集型 → 线程池 / 协程                                   │
+│  IO 密集型 → NIO / 协程 / 异步                               │
+│  高并发连接 → NIO / 协程                                      │
+│  团队熟悉度低 → 避免过早上异步                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+不同的并发模型适用于不同的场景。
+
+**核心对比**：
+
+| 模型 | 并发能力 | 内存消耗 | 编程复杂度 | 适用场景 |
+|---|---|---|---|---|
+| 同步线程 | 低 | 高 | 低 | CPU 密集型 |
+| 协程 | 极高 | 极低 | 低 | IO 密集型 |
+| 异步 | 高 | 低 | 高 | 高并发 IO |
+
+**选择建议**：
+
+- 小规模系统：同步线程池
+- 大规模 IO：协程或异步
+- Java 新项目：优先考虑虚拟线程
+- 团队能力有限：避免过早上异步

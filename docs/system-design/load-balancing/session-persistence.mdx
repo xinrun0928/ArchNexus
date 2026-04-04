@@ -1,0 +1,424 @@
+---
+title: 会话保持策略
+description: 确保同一用户的请求路由到同一服务器
+---
+
+# 会话保持策略
+
+用户登录了你的电商网站，购物车里有 10 件商品。下一秒刷新页面，购物车空了。
+
+原因：负载均衡把请求分发到了另一台服务器，而那台服务器上没有用户的会话数据。
+
+这就是会话保持要解决的问题：**让同一用户的请求，路由到同一台服务器**。
+
+## 会话保持的必要性
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    会话保持的场景                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  需要会话保持：                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ✓ 用户登录状态（Session）                                │   │
+│  │ ✓ 购物车数据                                            │   │
+│  │ ✓ 性能优化（本地缓存、连接池）                          │   │
+│  │ ✓ 分布式锁（基于本地锁）                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  不需要会话保持：                                               │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ✓ 无状态 API                                            │   │
+│  │ ✓ 静态资源                                              │   │
+│  │ ✓ 已将会话存储在外部（Redis、DB）                      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 会话保持策略
+
+### 源 IP 哈希
+
+```
+原理：基于客户端 IP 计算哈希，确定路由目标
+示例：hash(192.168.1.100) % 4 = 2 → Server C
+
+优点：实现简单
+缺点：
+- NAT 环境下不准确（多个用户共享 IP）
+- 服务器变更时影响范围大
+```
+
+```nginx
+upstream backend {
+    ip_hash;
+    server 127.0.0.1:8001;
+    server 127.0.0.1:8002;
+    server 127.0.0.1:8003;
+}
+```
+
+### Cookie 会话保持
+
+```
+原理：在 Cookie 中标记路由目标
+流程：
+1. 首次请求：LB 选择 Server A，添加 Cookie
+2. 后续请求：LB 读取 Cookie，路由到 Server A
+
+优点：精确到用户
+缺点：
+- 需要修改 Cookie
+- Cookie 被禁用时失效
+```
+
+```nginx
+upstream backend {
+    server 127.0.0.1:8001;
+    server 127.0.0.1:8002;
+}
+
+server {
+    listen 80;
+
+    # 使用默认的 cookie 会话保持
+    proxy_cookie_path ~* / "/; RouteId=$route";
+    proxy_pass http://backend;
+}
+```
+
+```java
+// 自定义 Cookie 会话保持
+public class CookieBasedSessionPersistence {
+    private static final String SESSION_COOKIE = "JSESSIONID";
+
+    public Server select(Request request, List<Server> servers) {
+        String sessionId = extractSessionId(request);
+
+        if (sessionId == null) {
+            // 无 session，选择服务器并生成 session
+            Server server = loadBalancer.select();
+            return server;
+        }
+
+        // 根据 session 选择服务器
+        Server server = sessionRoute.get(sessionId);
+        if (server == null || !server.isHealthy()) {
+            // session 未绑定或服务器不健康，重新选择
+            server = loadBalancer.select();
+            sessionRoute.put(sessionId, server);
+        }
+
+        return server;
+    }
+
+    private String extractSessionId(Request request) {
+        Cookie cookie = request.getCookie(SESSION_COOKIE);
+        return cookie != null ? cookie.getValue() : null;
+    }
+}
+```
+
+### URL 参数会话保持
+
+```
+原理：在 URL 中携带路由参数
+示例：https://example.com/page?route=server_a
+
+优点：不依赖 Cookie
+缺点：URL 不美观，SEO 不友好
+```
+
+### 一致性哈希会话保持
+
+```
+原理：使用一致性哈希环确定路由
+特点：
+- 服务器变更时，影响范围最小
+- 可以自定义哈希函数
+```
+
+```java
+public class ConsistentHashSessionPersistence {
+    private final TreeMap<Long, Server> ring = new TreeMap<>();
+    private final int virtualNodes;
+
+    public ConsistentHashSessionPersistence(List<Server> servers, int virtualNodes) {
+        this.virtualNodes = virtualNodes;
+        for (Server server : servers) {
+            addServer(server);
+        }
+    }
+
+    public Server select(String sessionId) {
+        long hash = hash(sessionId);
+        Map.Entry<Long, Server> entry = ring.ceilingEntry(hash);
+        if (entry == null) {
+            entry = ring.firstEntry();
+        }
+        return entry.getValue();
+    }
+
+    public void addServer(Server server) {
+        for (int i = 0; i < virtualNodes; i++) {
+            long hash = hash(server.getAddress() + "#" + i);
+            ring.put(hash, server);
+        }
+    }
+
+    public void removeServer(Server server) {
+        for (int i = 0; i < virtualNodes; i++) {
+            long hash = hash(server.getAddress() + "#" + i);
+            ring.remove(hash);
+        }
+    }
+}
+```
+
+## 外部会话存储
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    外部会话存储                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────┐                                                    │
+│  │   LB    │                                                   │
+│  └────┬────┘                                                    │
+│       │ 无状态分发                                              │
+│       ▼                                                         │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │              后端服务器集群                            │       │
+│  │                                                       │       │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐               │       │
+│  │  │Server A │  │Server B │  │Server C │               │       │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘               │       │
+│  │       │            │            │                      │       │
+│  │       └────────────┼────────────┘                      │       │
+│  │                    ▼                                    │       │
+│  │              ┌─────────┐                                │       │
+│  │              │  Redis  │ ←── 共享会话存储               │       │
+│  │              └─────────┘                                │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                                                                  │
+│  优势：                                                        │
+│  - 无需会话保持                                                │
+│  - 服务器可随时扩缩容                                          │
+│  - 会话永不丢失                                                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Spring Session + Redis
+
+```java
+// 配置 Spring Session
+@Configuration
+@EnableRedisHttpSession
+public class SessionConfig {
+    @Bean
+    public LettuceConnectionFactory connectionFactory() {
+        return new LettuceConnectionFactory(new RedisStandaloneConfiguration("localhost", 6379));
+    }
+}
+
+// 使用 Session
+@RestController
+public class CartController {
+    @GetMapping("/cart/add")
+    public String addToCart(HttpSession session, @RequestParam String item) {
+        @SuppressWarnings("unchecked")
+        List<String> cart = (List<String>) session.getAttribute("cart");
+        if (cart == null) {
+            cart = new ArrayList<>();
+        }
+        cart.add(item);
+        session.setAttribute("cart", cart);
+        return "Added to cart";
+    }
+
+    @GetMapping("/cart/view")
+    public List<String> viewCart(HttpSession session) {
+        @SuppressWarnings("unchecked")
+        List<String> cart = (List<String>) session.getAttribute("cart");
+        return cart != null ? cart : Collections.emptyList();
+    }
+}
+```
+
+### 无状态 JWT
+
+```java
+// 使用 JWT 实现无状态会话
+@RestController
+public class AuthController {
+    @Autowired
+    private JwtTokenProvider tokenProvider;
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody LoginRequest request) {
+        // 验证用户
+        User user = userService.authenticate(request);
+
+        // 生成 JWT
+        String token = tokenProvider.generateToken(user);
+
+        // 返回 token，客户端自行保存
+        return ResponseEntity.ok(new JwtResponse(token));
+    }
+}
+
+public class JwtTokenProvider {
+    private final String secret;
+    private final long expirationMs;
+
+    public String generateToken(User user) {
+        Date now = new Date();
+        Date expiryDate = new Date(now.getTime() + expirationMs);
+
+        return Jwts.builder()
+            .setSubject(user.getId().toString())
+            .claim("username", user.getUsername())
+            .claim("roles", user.getRoles())
+            .setIssuedAt(now)
+            .setExpiration(expiryDate)
+            .signWith(SignatureAlgorithm.HS512, secret)
+            .compact();
+    }
+}
+```
+
+## 会话保持的问题
+
+### 问题一：服务器故障时的会话丢失
+
+```
+问题：即使有会话保持，故障节点的会话数据也会丢失
+
+解决方案：
+1. 外部会话存储（Redis）
+2. 复制会话（多节点存储同一会话）
+3. 快速摘除 + 会话重建
+```
+
+```java
+// 故障时保护会话
+public class SessionProtectionFilter {
+    @Autowired
+    private SessionStore sessionStore;
+
+    @Autowired
+    private LoadBalancer loadBalancer;
+
+    @Override
+    public void onServerFailure(Server server) {
+        // 1. 立即摘除服务器
+        loadBalancer.remove(server);
+
+        // 2. 将会话转移到健康服务器
+        Set<String> affectedSessions = sessionStore.getSessionsForServer(server);
+        for (String sessionId : affectedSessions) {
+            Session session = sessionStore.get(sessionId);
+            Server newServer = loadBalancer.select();
+            sessionStore.moveTo(sessionId, newServer);
+        }
+    }
+}
+```
+
+### 问题二：会话倾斜
+
+```
+问题：某些服务器会话过多，负载不均
+
+原因：
+- 用户访问不均匀
+- 哈希不均匀
+
+解决方案：
+1. 使用虚拟节点改善哈希分布
+2. 定期监控会话分布
+3. 动态调整哈希环
+```
+
+```java
+// 监控会话分布
+public class SessionDistributionMonitor {
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    public void start() {
+        scheduler.scheduleAtFixedRate(() -> {
+            Map<Server, Integer> distribution = getSessionDistribution();
+
+            // 检查倾斜
+            double average = distribution.values().stream()
+                .mapToInt(Integer::intValue).average().orElse(0);
+
+            for (Map.Entry<Server, Integer> entry : distribution.entrySet()) {
+                double deviation = Math.abs(entry.getValue() - average) / average;
+                if (deviation > 0.5) {
+                    log.warn("会话倾斜：服务器 {} 会话数 {}，平均值 {}", 
+                        entry.getKey(), entry.getValue(), average);
+                }
+            }
+        }, 0, 5, TimeUnit.MINUTES);
+    }
+}
+```
+
+### 问题三：冷启动
+
+```
+问题：新加入的服务器没有会话，流量全部打到其他服务器
+
+解决方案：
+1. 预热：新服务器先低流量，逐步增加
+2. 会话复制：新服务器从其他节点复制会话
+3. 接受：允许短时间负载不均
+```
+
+## 最佳实践
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    会话保持最佳实践                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  优先选择：外部会话存储                                          │
+│  ────────────────────────────────────────────────────────────   │
+│  • 使用 Redis 存储会话                                          │
+│  • 无状态分发给所有服务器                                        │
+│  • 会话持久化，故障不丢失                                       │
+│                                                                  │
+│  如果必须会话保持：                                             │
+│  ────────────────────────────────────────────────────────────   │
+│  • 优先使用 Cookie 会话保持                                      │
+│  • 使用一致性哈希减少变更影响                                    │
+│  • 监控会话分布，发现倾斜                                        │
+│                                                                  │
+│  不要使用：                                                     │
+│  ────────────────────────────────────────────────────────────   │
+│  • 源 IP 哈希（NAT 环境下不准确）                               │
+│  • 本地会话存储（故障会丢失）                                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+会话保持是保证用户体验的重要机制。
+
+**核心要点**：
+
+- 优先使用外部会话存储（Redis）
+- 次选 Cookie 会话保持或一致性哈希
+- 避免源 IP 哈希（NAT 问题）
+- 监控会话分布，防止倾斜
+
+**选择建议**：
+
+- 有状态服务：外部会话存储
+- 微服务：JWT 无状态
+- 需要会话保持：一致性哈希
+- 大型企业：分布式会话管理

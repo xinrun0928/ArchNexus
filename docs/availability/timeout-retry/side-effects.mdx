@@ -1,0 +1,486 @@
+---
+title: 重试的副作用
+description: 重试可能带来的问题与应对策略
+---
+
+# 重试的副作用
+
+你的系统加了重试机制，但上线后问题更多了。
+
+问题出在哪？**重试有副作用，没有正确处理**。
+
+重试是一把双刃剑，用不好会适得其反。
+
+## 重试的副作用
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    重试的副作用                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 副作用 1：重试风暴                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 大量客户端同时重试，可能压垮服务                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 副作用 2：幂等性问题                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 重试导致重复操作（重复下单、重复支付）                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 副作用 3：资源占用                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 重试占用连接、线程、内存，可能导致资源耗尽              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 副作用 4：用户体验差                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 用户等待时间长，体验差                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 副作用 5：数据不一致                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ 部分请求成功、部分失败，导致数据不一致                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 副作用一：重试风暴
+
+### 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    重试风暴                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  场景：10000 个客户端调用同一个服务                           │
+│                                                                  │
+│  假设服务在 t=0 故障                                          │
+│  假设重试次数 = 3，重试间隔 = 1s                               │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  t=0: 10000 个请求同时失败                            │   │
+│  │  t=1: 10000 个重试同时发起                            │   │
+│  │  t=2: 10000 个重试再次失败                            │   │
+│  │  t=3: 10000 × 3 = 30000 个重试同时发起                │   │
+│  │                                                         │   │
+│  │  结果：服务被压垮，无法恢复                             │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 解决方案
+
+```java
+// 解决方案一：指数退避 + 抖动
+@Service
+public class JitterRetryService {
+    private final Random random = new Random();
+    private final long baseInterval = 1000;
+
+    public void retryWithJitter() {
+        int maxAttempts = 3;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                callService();
+                return;
+            } catch (Exception e) {
+                if (attempt == maxAttempts) {
+                    throw e;
+                }
+
+                // 指数退避 + 随机抖动
+                long interval = (long)(baseInterval * Math.pow(2, attempt - 1));
+                long jitter = (long)(random.nextDouble() * interval);
+                long actualInterval = interval + jitter;
+
+                Thread.sleep(actualInterval);
+            }
+        }
+    }
+}
+
+// 解决方案二：熔断器保护
+@Service
+public class CircuitBreakerRetryService {
+    private final CircuitBreaker circuitBreaker;
+
+    public void retryWithCircuitBreaker() {
+        circuitBreaker.execute(() -> {
+            // 熔断器会自动限流
+            return callService();
+        });
+    }
+}
+
+// 解决方案三：限流
+@Service
+public class RateLimitedRetryService {
+    private final RateLimiter rateLimiter;
+
+    public void retryWithRateLimit() {
+        if (rateLimiter.tryAcquire()) {
+            return callService();
+        } else {
+            throw new ServiceBusyException("服务繁忙，请稍后重试");
+        }
+    }
+}
+```
+
+## 副作用二：幂等性问题
+
+### 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    幂等性问题                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  场景：用户下单接口                                              │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  用户点击「下单」                                        │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  请求发出                                               │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  超时 ──▶ 重试                                          │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  实际下单成功，但用户看到超时                           │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  重试发起 ──▶ 再次下单成功！                           │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  重复订单！                                            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 解决方案
+
+```java
+// 解决方案一：幂等键
+@Service
+public class IdempotentOrderService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public Order createOrder(OrderRequest request) {
+        String idempotentKey = request.getIdempotentKey();
+
+        // 检查是否已处理
+        String existing = (String) redisTemplate.opsForValue().get(idempotentKey);
+        if (existing != null) {
+            return JSON.parseObject(existing, Order.class);
+        }
+
+        // 执行下单
+        Order order = doCreateOrder(request);
+
+        // 记录幂等键
+        redisTemplate.opsForValue().set(
+            idempotentKey,
+            JSON.toJSONString(order),
+            Duration.ofDays(7)
+        );
+
+        return order;
+    }
+}
+
+// 生成幂等键
+public class IdempotentKeyGenerator {
+    public static String generate(String userId, String action, String requestId) {
+        // 格式：idempotent:{userId}:{action}:{requestId}
+        return "idempotent:" + userId + ":" + action + ":" + requestId;
+    }
+}
+
+// 客户端使用
+public class OrderClient {
+    public void createOrder() {
+        OrderRequest request = new OrderRequest();
+        request.setIdempotentKey(IdempotentKeyGenerator.generate(
+            userId, "createOrder", UUID.randomUUID().toString()
+        ));
+
+        // HTTP Header 传递幂等键
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Idempotent-Key", request.getIdempotentKey());
+
+        restTemplate.postForEntity(url, request, Order.class);
+    }
+}
+```
+
+### 服务端幂等处理
+
+```java
+// 服务端幂等拦截
+@Component
+public class IdempotentInterceptor implements HandlerInterceptor {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        String idempotentKey = request.getHeader("X-Idempotent-Key");
+        if (idempotentKey != null) {
+            String cached = (String) redisTemplate.opsForValue().get(idempotentKey);
+            if (cached != null) {
+                // 返回缓存结果
+                response.setContentType("application/json");
+                response.getWriter().write(cached);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response,
+            Object handler, Exception ex) {
+        String idempotentKey = request.getHeader("X-Idempotent-Key");
+        if (idempotentKey != null && response.getStatus() == 200) {
+            // 记录结果
+            redisTemplate.opsForValue().set(
+                idempotentKey,
+                response.getContentAsString(),
+                Duration.ofDays(7)
+            );
+        }
+    }
+}
+```
+
+## 副作用三：资源占用
+
+### 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    资源占用问题                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  重试会占用更多资源：                                           │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  连接：每个请求占用一个连接，重试 N 次 = N 个连接占用     │   │
+│  │  线程：每个请求占用一个线程，重试 N 次 = N 个线程占用    │   │
+│  │  内存：重试请求和响应占用内存                           │   │
+│  │  超时累积：总超时时间 = 每次超时 × 重试次数              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  问题：资源耗尽导致新请求也无法处理                           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 解决方案
+
+```java
+// 解决方案：限制并发重试
+@Service
+public class LimitedRetryService {
+    private final Semaphore semaphore = new Semaphore(10);  // 最多 10 个并发重试
+
+    public void retryWithLimit() {
+        if (!semaphore.tryAcquire()) {
+            throw new TooManyRetriesException("重试并发过高");
+        }
+
+        try {
+            for (int i = 0; i < maxAttempts; i++) {
+                try {
+                    callService();
+                    return;
+                } catch (Exception e) {
+                    if (i == maxAttempts - 1) {
+                        throw e;
+                    }
+                    Thread.sleep(getBackoffInterval(i));
+                }
+            }
+        } finally {
+            semaphore.release();
+        }
+    }
+}
+```
+
+## 副作用四：用户体验
+
+### 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    用户体验问题                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  问题：重试等待时间长，用户体验差                               │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  单次超时：3s                                          │   │
+│  │  重试次数：3                                           │   │
+│  │  重试间隔：1s, 2s, 4s                                  │   │
+│  │                                                         │   │
+│  │  用户等待：3s + 1s + 3s + 2s + 3s + 4s = 16s          │   │
+│  │                                                         │   │
+│  │  结果：用户等待 16 秒，体验很差                         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 解决方案
+
+```java
+// 解决方案：快速失败 + 降级
+@Service
+public class UserFriendlyRetryService {
+
+    // 用户同步请求：超时后直接失败，不重试
+    public String callForUser() {
+        try {
+            return restTemplate.getForObject(url, String.class);
+        } catch (Exception e) {
+            // 快速失败，返回降级结果
+            log.warn("请求失败，返回降级数据");
+            return getFallbackData();
+        }
+    }
+
+    // 后台任务：可以重试
+    public void callForBackground() {
+        retryTemplate.execute(context -> {
+            return restTemplate.getForObject(url, String.class);
+        });
+    }
+}
+```
+
+## 副作用五：数据不一致
+
+### 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    数据不一致问题                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  场景：转账操作                                                │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  用户 A 向用户 B 转账 100 元                            │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  第一次请求：A 余额 -100，B 余额 +100                  │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  响应超时                                              │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  重试请求：A 余额 -100，B 余额 +100                  │   │
+│  │    │                                                    │   │
+│  │    ▼                                                    │   │
+│  │  结果：A 余额 -200，B 余额 +200！                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 解决方案
+
+```java
+// 解决方案：分布式事务 + 幂等
+@Service
+public class TransferService {
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    public void transfer(TransferRequest request) {
+        // 生成事务 ID
+        String transactionId = request.getTransactionId();
+
+        // 检查是否已处理（幂等）
+        if (isProcessed(transactionId)) {
+            log.info("事务已处理: {}", transactionId);
+            return;
+        }
+
+        // 执行转账
+        transactionTemplate.execute(status -> {
+            try {
+                doTransfer(request);
+
+                // 记录处理完成
+                markAsProcessed(transactionId);
+                return null;
+            } catch (Exception e) {
+                status.setRollbackOnly();
+                throw e;
+            }
+        });
+    }
+
+    private void doTransfer(TransferRequest request) {
+        // 扣款
+        accountService.debit(request.getFromAccount(), request.getAmount());
+        // 存款
+        accountService.credit(request.getToAccount(), request.getAmount());
+    }
+}
+```
+
+## 总结
+
+重试有副作用，需要正确处理。
+
+**主要副作用**：
+
+- 重试风暴
+- 幂等性问题
+- 资源占用
+- 用户体验差
+- 数据不一致
+
+**解决方案**：
+
+| 副作用 | 解决方案 |
+|---|---|
+| 重试风暴 | 指数退避 + 抖动 |
+| 幂等性 | 幂等键 |
+| 资源占用 | 并发限制 |
+| 用户体验 | 快速失败 |
+| 数据不一致 | 分布式事务 |
+
+**最佳实践**：
+
+- 幂等操作才能重试
+- 限制重试次数和间隔
+- 添加抖动避免重试风暴
+- 监控重试成功率

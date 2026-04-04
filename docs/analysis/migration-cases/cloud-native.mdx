@@ -1,0 +1,431 @@
+---
+title: 云原生迁移
+description: 将应用迁移到云原生架构的实践
+---
+
+# 云原生迁移
+
+你的应用想上云，但不知道该怎么做。
+
+云原生不是简单地把应用部署到云上，而是重构应用架构以充分利用云的优势。
+
+## 云原生核心概念
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    云原生核心要素                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Cloud Native Computing Foundation（CNCF）定义：       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  云原生应用具有以下特征：                             │   │
+│  │                                                         │   │
+│  │  - 容器化：应用及其依赖打包在一起                    │   │
+│  │  - 微服务：服务细粒度，独立部署和扩展                │   │
+│  │  - 服务网格：服务间通信基础设施                      │   │
+│  │  - 不可变基础设施：基础设施不可变，易于复制           │   │
+│  │  - 声明式 API：描述期望状态，平台负责实现            │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 迁移路径
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    云原生迁移成熟度模型                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Level 1：虚拟化部署                                             │
+│  - 将物理机迁移到虚拟机                                      │
+│  - 提升资源利用率                                           │
+│                                                                  │
+│  Level 2：容器化                                              │
+│  - 应用容器化（Docker）                                    │
+│  - 标准化部署                                               │
+│                                                                  │
+│  Level 3：编排                                                │
+│  - 使用 Kubernetes 管理容器                               │
+│  - 实现弹性伸缩                                           │
+│                                                                  │
+│  Level 4：微服务                                              │
+│  - 服务拆分                                               │
+│  - 服务发现                                               │
+│                                                                  │
+│  Level 5：云原生全家桶                                         │
+│  - 服务网格（Istio）                                    │
+│  - 可观测性（Prometheus + Grafana）                    │
+│  - GitOps 部署                                           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 容器化
+
+### Dockerfile 最佳实践
+
+```dockerfile
+# 多阶段构建
+# 构建阶段
+FROM maven:3.8 AS builder
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:go-offline
+COPY src ./src
+RUN mvn package -DskipTests
+
+# 运行阶段
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+
+# 安全：非 root 用户
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
+# 优化：复制 jar
+COPY --from=builder /app/target/*.jar app.jar
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1
+
+# 入口
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+```yaml
+# Kubernetes Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: myapp
+          image: myregistry/myapp:v1.0.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "production"
+```
+
+## Kubernetes 迁移
+
+### 应用配置迁移
+
+```yaml
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myapp-config
+data:
+  application.yml: |
+    server:
+      port: 8080
+    spring:
+      datasource:
+        url: jdbc:mysql://mysql:3306/mydb
+  log-level: INFO
+
+---
+# Secret（使用 base64 编码）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: myapp-secrets
+type: Opaque
+data:
+  # echo -n "password" | base64
+  db-password: cGFzc3dvcmQ=
+  api-key: YXBpLWtleS1oZXJl
+```
+
+```java
+// 从 Kubernetes ConfigMap 加载配置
+@SpringBootApplication
+public class App {
+    public static void main(String[] args) {
+        SpringApplication.run(App.class, args);
+    }
+}
+
+// application.yml
+spring:
+  cloud:
+    kubernetes:
+      config:
+        enabled: true
+        paths: /etc/kubernetes/config
+      secrets:
+        enabled: true
+        paths: /etc/kubernetes/secrets
+```
+
+### 服务发现
+
+```yaml
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+spec:
+  selector:
+    app: myapp
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+    - host: myapp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 80
+```
+
+## 存储迁移
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    云原生存储方案                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 有状态数据                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  选项 1：云数据库服务                                   │   │
+│  │  - RDS (MySQL, PostgreSQL)                           │   │
+│  │  - 云托管，减少运维负担                               │   │
+│  │                                                         │   │
+│  │  选项 2：Kubernetes 持久卷                              │   │
+│  │  - 云盘（NFS, EBS）                                  │   │
+│  │  - 需要 StatefulSet 管理                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 无状态数据                                              │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 对象存储（OSS, S3）                                 │   │
+│  │  - 缓存（Redis, Memcached）                           │   │
+│  │  - 消息队列（Kafka, RocketMQ）                       │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```yaml
+# StatefulSet - 有状态服务
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "fast-storage"
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+## 可观测性
+
+```yaml
+# Prometheus + Grafana 监控
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+
+---
+# 应用暴露指标
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+```
+
+## GitOps 部署
+
+```yaml
+# ArgoCD Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/myorg/myapp
+    targetRevision: main
+    path: k8s/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+## 迁移检查清单
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    云原生迁移检查清单                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 应用改造                                               │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  [ ] 应用无状态化（不依赖本地文件存储）                │   │
+│  │  [ ] 配置外部化（不硬编码配置）                        │   │
+│  │  [ ] 健康检查端点实现                                  │   │
+│  │  [ ] 优雅停机实现                                     │   │
+│  │  [ ] 日志标准化输出（stdout）                        │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 容器化                                               │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  [ ] Dockerfile 编写                                  │   │
+│  │  [ ] 多阶段构建优化                                  │   │
+│  │  [ ] 非 root 用户运行                                │   │
+│  │  [ ] 健康检查配置                                    │   │
+│  │  [ ] 资源限制设置                                    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Kubernetes 部署                                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  [ ] Deployment / StatefulSet 配置                    │   │
+│  │  [ ] Service 配置                                     │   │
+│  │  [ ] ConfigMap / Secret 配置                         │   │
+│  │  [ ] Ingress 配置                                     │   │
+│  │  [ ] HPA 自动扩缩容配置                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+云原生迁移是架构现代化的重要步骤。
+
+**核心要素**：
+
+- 容器化：标准化部署
+- 微服务：独立部署扩展
+- 服务网格：通信基础设施
+- 声明式 API：期望状态管理
+
+**迁移路径**：
+
+1. 虚拟化：提升资源利用率
+2. 容器化：标准化应用打包
+3. 编排：Kubernetes 管理
+4. 微服务：架构拆分
+5. 云原生全家桶：完整能力
+
+**核心认知**：云原生不是一蹴而就，需要循序渐进。先容器化，再 Kubernetes，最后微服务和服务网格。每一步都要充分验证后再前进。

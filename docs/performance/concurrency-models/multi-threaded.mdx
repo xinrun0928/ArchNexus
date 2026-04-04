@@ -1,0 +1,350 @@
+---
+title: 多线程模型
+description: Java 多线程编程模型与实践
+---
+
+# 多线程模型
+
+你的系统要处理并发请求，但线程创建和上下文切换拖慢了性能。
+
+问题出在哪？**没有选择合适的线程模型**。
+
+## 线程模型分类
+
+### 按线程创建方式
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    线程创建方式                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 继承 Thread                                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ public class MyThread extends Thread {                   │   │
+│  │     public void run() { ... }                          │   │
+│  │ }                                                     │   │
+│  │ new MyThread().start();                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│  缺点：无法继承其他类，任务与线程耦合                          │
+│                                                                  │
+│  2. 实现 Runnable                                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ public class MyTask implements Runnable {               │   │
+│  │     public void run() { ... }                          │   │
+│  │ }                                                     │   │
+│  │ new Thread(new MyTask()).start();                      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│  缺点：无法返回结果，无法抛异常                                │
+│                                                                  │
+│  3. 实现 Callable + Future                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ public class MyCallable implements Callable<Result> {     │   │
+│  │     public Result call() throws Exception { ... }        │   │
+│  │ }                                                     │   │
+│  │ Future<Result> future = executor.submit(new MyCallable());│   │
+│  │ Result result = future.get();                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 按线程池类型
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    线程池类型                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ newFixedThreadPool(n)                                   │   │
+│  │ - 固定大小线程池                                       │   │
+│  │ - 核心线程数 = 最大线程数 = n                         │   │
+│  │ - 队列无界                                            │   │
+│  │ - 适合：CPU 密集型任务                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ newCachedThreadPool()                                  │   │
+│  │ - 弹性线程池                                          │   │
+│  │ - 核心线程数 = 0，最大线程数 = Integer.MAX_VALUE        │   │
+│  │ - 线程空闲 60s 后回收                                │   │
+│  │ - 适合：短任务、并发量不确定                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ newScheduledThreadPool(n)                              │   │
+│  │ - 定时任务线程池                                       │   │
+│  │ - 支持延迟和周期性任务                                 │   │
+│  │ - 适合：定时任务、延迟任务                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ newSingleThreadExecutor()                               │   │
+│  │ - 单线程线程池                                         │   │
+│  │ - 保证任务顺序执行                                    │   │
+│  │ - 适合：需要保证顺序的任务                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 线程池参数
+
+### 参数详解
+
+```java
+// 线程池参数
+public class ThreadPoolExecutorDemo {
+    public ExecutorService createThreadPool() {
+        return new ThreadPoolExecutor(
+            10,             // corePoolSize：核心线程数
+            50,             // maximumPoolSize：最大线程数
+            60L,            // keepAliveTime：空闲线程存活时间
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(1000),  // 任务队列
+            new ThreadFactory() {             // 线程工厂
+                private AtomicInteger count = new AtomicInteger(0);
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r);
+                    t.setName("worker-" + count.incrementAndGet());
+                    return t;
+                }
+            },
+            new ThreadPoolExecutor.CallerRunsPolicy()  // 拒绝策略
+        );
+    }
+}
+```
+
+### 线程池参数计算
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    线程池参数计算                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  CPU 密集型：                                                  │
+│  线程数 = CPU 核心数 + 1                                       │
+│                                                                  │
+│  IO 密集型：                                                  │
+│  线程数 = CPU 核心数 × 期望 CPU 利用率 × (1 + 平均等待时间 / 平均工作时间)  │
+│                                                                  │
+│  示例：                                                         │
+│  CPU 核心数 = 8                                                │
+│  期望 CPU 利用率 = 80%                                          │
+│  平均等待时间 = 400ms                                           │
+│  平均工作时间 = 100ms                                           │
+│  线程数 = 8 × 0.8 × (1 + 400/100) = 32                      │
+│                                                                  │
+│  队列选择：                                                    │
+│  - 无界队列（LinkedBlockingQueue）：任务多时内存可能溢出        │
+│  - 有界队列（ArrayBlockingQueue）：需要配合拒绝策略            │
+│  - 同步队列（SynchronousQueue）：每个任务必须立即被消费        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 线程池使用实践
+
+### 正确使用线程池
+
+```java
+// 正确使用线程池
+@Service
+public class ThreadPoolUsage {
+    private final ExecutorService executor = new ThreadPoolExecutor(
+        10, 50, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(1000),
+        new ThreadFactoryBuilder().setNameFormat("biz-worker-%d").build(),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
+
+    // 提交任务
+    public void submitTask(Runnable task) {
+        executor.submit(task);
+    }
+
+    public <T> Future<T> submitTask(Callable<T> task) {
+        return executor.submit(task);
+    }
+
+    // 关闭线程池
+    public void shutdown() {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+        }
+    }
+}
+```
+
+### 避免线程池误用
+
+```java
+// 错误一：在任务中捕获异常
+public class WrongUsage1 {
+    private final ExecutorService executor = Executors.newFixedThreadPool(10);
+
+    public void wrongMethod() {
+        executor.submit(() -> {
+            try {
+                doSomething();
+            } catch (Exception e) {
+                // 异常被吞掉了！
+            }
+        });
+    }
+
+    // 正确做法：使用 Future 获取异常
+    public void correctMethod() {
+        Future<?> future = executor.submit(() -> doSomething());
+        try {
+            future.get();
+        } catch (ExecutionException e) {
+            // 处理异常
+        }
+    }
+}
+
+// 错误二：使用Executors创建线程池
+public class WrongUsage2 {
+    // 错误：使用 Executors 创建线程池
+    // 内存溢出风险
+
+    // 正确：使用 ThreadPoolExecutor 创建有界线程池
+    private final ExecutorService executor = new ThreadPoolExecutor(
+        10, 50, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(1000)
+    );
+}
+```
+
+## 线程池监控
+
+```java
+// 线程池监控
+@Service
+public class ThreadPoolMonitor {
+    private final ThreadPoolExecutor executor;
+
+    public ThreadPoolMonitor() {
+        executor = new ThreadPoolExecutor(10, 50, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(1000));
+    }
+
+    // 监控指标
+    public Map<String, Object> getMetrics() {
+        Map<String, Object> metrics = new HashMap<>();
+        metrics.put("activeCount", executor.getActiveCount());
+        metrics.put("poolSize", executor.getPoolSize());
+        metrics.put("queueSize", executor.getQueue().size());
+        metrics.put("completedTaskCount", executor.getCompletedTaskCount());
+        metrics.put("largestPoolSize", executor.getLargestPoolSize());
+        return metrics;
+    }
+
+    // 告警
+    @Scheduled(fixedRate = 60000)
+    public void check() {
+        if (executor.getActiveCount() >= executor.getMaximumPoolSize()) {
+            log.warn("线程池已满，active={}, max={}",
+                executor.getActiveCount(), executor.getMaximumPoolSize());
+        }
+
+        if (executor.getQueue().size() > 800) {
+            log.warn("任务队列积压，size={}", executor.getQueue().size());
+        }
+    }
+}
+```
+
+## Fork/Join 框架
+
+### Fork/Join 适用场景
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Fork/Join 框架                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  适用场景：                                                    │
+│  - 分治算法（归并排序、快速排序）                             │
+│  - 递归任务（遍历树、计算斐波那契）                          │
+│  - 并行计算（MapReduce）                                      │
+│                                                                  │
+│  特点：                                                        │
+│  - 工作窃取：空闲线程从其他线程窃取任务                       │
+│  - 双端队列：每个线程有自己的任务队列                        │
+│  - 减少竞争：任务只从自己的队列和全局队列获取                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```java
+// Fork/Join 示例：并行求和
+public class SumTask extends RecursiveTask<Long> {
+    private final long[] array;
+    private final int start, end;
+    private static final int THRESHOLD = 10000;
+
+    public SumTask(long[] array, int start, int end) {
+        this.array = array;
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected Long compute() {
+        if (end - start <= THRESHOLD) {
+            long sum = 0;
+            for (int i = start; i < end; i++) {
+                sum += array[i];
+            }
+            return sum;
+        }
+
+        int mid = (start + end) / 2;
+        SumTask left = new SumTask(array, start, mid);
+        SumTask right = new SumTask(array, mid, end);
+        left.fork();
+        right.fork();
+
+        return left.join() + right.join();
+    }
+}
+
+// 使用
+ForkJoinPool pool = new ForkJoinPool();
+long result = pool.invoke(new SumTask(array, 0, array.length));
+```
+
+## 总结
+
+选择合适的线程模型是并发编程的基础。
+
+**线程池类型**：
+
+| 类型 | 适用场景 |
+|---|---|
+| FixedThreadPool | CPU 密集型 |
+| CachedThreadPool | 短任务、低并发 |
+| ScheduledThreadPool | 定时任务 |
+| SingleThreadExecutor | 顺序任务 |
+
+**参数计算**：
+
+- CPU 密集型：核心数 + 1
+- IO 密集型：核心数 × 利用率 × (1 + 等待/工作)
+
+**最佳实践**：
+
+- 使用 ThreadPoolExecutor 而非 Executors
+- 合理设置队列大小
+- 监控线程池状态
+- 处理异常
+- 优雅关闭

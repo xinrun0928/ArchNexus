@@ -1,0 +1,381 @@
+---
+title: 资源利用率
+description: 系统资源的使用与优化
+---
+
+# 资源利用率
+
+你的服务器有 64 个 CPU 核心，但利用率只有 10%。QPS 却上不去。
+
+问题出在哪？**资源利用率低说明资源没有被充分利用**，可能是代码没有并行化，或者配置不合理。
+
+资源利用率是诊断系统瓶颈的重要指标。
+
+## CPU 利用率
+
+### CPU 利用率的含义
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CPU 利用率解读                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  CPU 利用率 = CPU 忙碌时间 / 总时间                              │
+│                                                                  │
+│  类型：                                                         │
+│  - User Time：用户态代码执行                                    │
+│  - System Time：内核态代码执行（系统调用）                      │
+│  - Wait Time：等待 IO（不是真正计算）                          │
+│  - Idle Time：空闲                                             │
+│                                                                  │
+│  top 命令解读：                                                │
+│  us: User Time（用户态）                                       │
+│  sy: System Time（内核态）                                     │
+│  wa: Wait Time（等待 IO）                                      │
+│  id: Idle Time（空闲）                                         │
+│  st: Stolen Time（虚拟机被宿主机占用）                         │
+│                                                                  │
+│  示例：us=70, sy=10, wa=5, id=15                               │
+│  → CPU 真实使用率 = 70 + 10 = 80%                              │
+│  → 15% 空闲，可以接受                                          │
+│  → 5% 等待 IO，有 IO 瓶颈                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### CPU 利用率监控
+
+```bash
+# 查看 CPU 使用率
+top
+# %Cpu(s): 25.0 us,  5.0 sy,  0.0 ni, 68.0 id,  2.0 wa,  0.0 hi,  0.0 si,  0.0 st
+
+# 按 CPU 核心查看
+top -H
+
+# mpstat 查看每个核心
+mpstat -P ALL
+
+# pidstat 进程级 CPU 监控
+pidstat -p <pid> 1
+```
+
+### CPU 利用率异常分析
+
+```java
+// CPU 利用率异常分析
+public class CpuUtilizationAnalyzer {
+    public String analyze(CpuMetrics metrics) {
+        double userTime = metrics.getUserTime();
+        double systemTime = metrics.getSystemTime();
+        double waitTime = metrics.getWaitTime();
+        double idleTime = metrics.getIdleTime();
+
+        // CPU 利用率 = 100 - Idle
+        double utilization = 100 - idleTime;
+
+        // 分析
+        if (utilization > 90) {
+            if (waitTime > 50) {
+                return "CPU 压力主要来自等待 IO，需要优化 IO 性能";
+            } else if (userTime > 80) {
+                return "CPU 压力主要来自计算，需要优化算法或增加 CPU";
+            } else {
+                return "CPU 整体负载高，需要容量评估";
+            }
+        } else if (utilization < 30) {
+            if (waitTime > 20) {
+                return "CPU 大量时间在等待 IO，可能有 IO 瓶颈";
+            } else {
+                return "CPU 利用率低，可能是单线程瓶颈或锁竞争";
+            }
+        } else {
+            return "CPU 利用率正常";
+        }
+    }
+}
+```
+
+### CPU 利用率优化
+
+```java
+// 优化一：充分利用多核
+public class MultiCoreOptimization {
+    // 错误：单线程处理
+    public void processSingleThread(List<Data> dataList) {
+        for (Data data : dataList) {
+            process(data);  // 串行处理
+        }
+    }
+
+    // 正确：并行处理
+    public void processMultiThread(List<Data> dataList) {
+        // 使用线程池并行处理
+        ForkJoinPool pool = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+        pool.submit(() ->
+            dataList.parallelStream().forEach(this::process)
+        ).join();
+    }
+}
+
+// 优化二：减少上下文切换
+public class ContextSwitchOptimization {
+    // 错误：频繁创建线程
+    public void createThreadPerTask(List<Task> tasks) {
+        for (Task task : tasks) {
+            new Thread(() -> task.execute()).start();
+        }
+    }
+
+    // 正确：线程池复用
+    public void threadPoolTask(List<Task> tasks) {
+        ExecutorService pool = Executors.newFixedThreadPool(100);
+        for (Task task : tasks) {
+            pool.submit(task::execute);
+        }
+    }
+}
+```
+
+## 内存利用率
+
+### 内存利用率的含义
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    内存利用率解读                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  内存使用 = 进程内存 + 内核缓存 + 缓冲区                        │
+│                                                                  │
+│  free 命令解读：                                               │
+│              total        used        free      shared    buff/cache   available │
+│  Mem:     65536000     45000000     5000000     100000     15536000     18000000 │
+│                                                                  │
+│  - total：总内存                                               │
+│  - used：已使用（进程 + 缓存）                                  │
+│  - free：完全空闲                                              │
+│  - buff/cache：缓冲区 + 页缓存                                  │
+│  - available：实际可用（free + 可回收的缓存）                   │
+│                                                                  │
+│  关注指标：                                                    │
+│  - used / total：基础使用率                                     │
+│  - available：实际可用内存                                      │
+│  - Swap used：交换区使用（不应该频繁使用）                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 内存监控
+
+```bash
+# 查看内存使用
+free -h
+
+# 查看详细内存信息
+cat /proc/meminfo
+
+# vmstat 内存统计
+vmstat 1
+
+# pidstat 进程内存监控
+pidstat -p <pid> -r 1
+```
+
+### 内存利用率异常分析
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    内存利用率异常                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 内存泄漏                                                   │
+│     - 现象：内存持续增长，不释放                                 │
+│     - 排查：dump heap，分析对象引用                             │
+│                                                                  │
+│  2. 内存不足                                                   │
+│     - 现象：频繁 OOM，JVM 触发 Full GC                        │
+│     - 排查：查看堆内存配置，增加堆大小                          │
+│                                                                  │
+│  3. 内存碎片                                                   │
+│     - 现象：used 高但 available 也高                           │
+│     - 排查：jemalloc / tcmalloc 替代 glibc                     │
+│                                                                  │
+│  4. Swap 使用过多                                              │
+│     - 现象：si/so 不为 0                                       │
+│     - 原因：物理内存不足                                        │
+│     - 解决：增加物理内存或减少内存使用                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## IO 利用率
+
+### IO 利用率的含义
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    IO 利用率解读                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  IO 利用率 = IO 操作时间 / 总时间                              │
+│                                                                  │
+│  iostat 命令解读：                                             │
+│  Device:         tps    kB_read/s    kB_wrtn/s    kB_read    kB_wrtn   %util │
+│  sda:          25.00      200.00       100.00      10000      5000      5.00  │
+│                                                                  │
+│  - tps：每秒 IO 操作数                                         │
+│  - kB_read/s：每秒读取 KB                                     │
+│  - kB_wrtn/s：每秒写入 KB                                     │
+│  - %util：设备利用率（接近 100% 说明 IO 饱和）                 │
+│                                                                  │
+│  iowait（top 中的 wa）：                                       │
+│  - CPU 等待 IO 完成的时间比例                                  │
+│  - iowait 高 + util 高 → 磁盘 IO 瓶颈                         │
+│  - iowait 高 + util 低 → 磁盘空闲，可能是网络 IO               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### IO 监控
+
+```bash
+# 查看 IO 统计
+iostat -x 1
+
+# 查看 IO 操作
+iotop
+
+# blktrace 跟踪 IO
+blktrace -d /dev/sda
+```
+
+### IO 利用率优化
+
+```java
+// 优化一：顺序写代替随机写
+public class IoOptimization {
+
+    // 错误：频繁随机写入
+    public void randomWrite(List<Log> logs) {
+        for (Log log : logs) {
+            // 每次都 seek 到文件末尾
+            randomAccessFile.seek(file.length());
+            randomAccessFile.write(log.toBytes());
+        }
+    }
+
+    // 正确：批量顺序写入
+    public void sequentialWrite(List<Log> logs) {
+        BufferedWriter writer = new BufferedWriter(
+            new FileWriter("/path/to/log", true));
+        for (Log log : logs) {
+            writer.write(log.toString());
+            writer.newLine();
+        }
+        writer.flush();
+    }
+}
+
+// 优化二：异步 IO
+public class AsyncIoOptimization {
+    @Async
+    public CompletableFuture<Void> asyncWrite(Log log) {
+        // 异步写入，不阻塞主线程
+        kafkaTemplate.send("logs", log.getKey(), log.toString());
+        return CompletableFuture.completedFuture(null);
+    }
+}
+```
+
+## 网络带宽利用率
+
+### 网络带宽监控
+
+```bash
+# 查看网络带宽使用
+nload
+
+# 查看连接统计
+netstat -an | awk '/^tcp/ {++S[$NF]} END {for(a in S) print a, S[a]}'
+
+# 查看活跃连接数
+ss -s
+
+# 抓包分析
+tcpdump -i eth0 -w /tmp/capture.pcap
+```
+
+### 网络带宽优化
+
+```java
+// 优化一：数据压缩
+public class NetworkOptimization {
+    // 压缩请求
+    public void sendCompressedRequest(byte[] data) {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzip = new GZIPOutputStream(baos)) {
+            gzip.write(data);
+        }
+        byte[] compressed = baos.toByteArray();
+        // compressed.length << data.length
+        sendRequest(compressed);
+    }
+
+    // 压缩响应
+    @GetMapping(value = "/api/data", produces = "application/gzip")
+    public byte[] getCompressedData() {
+        byte[] data = fetchData();
+        return compress(data);
+    }
+}
+
+// 优化二：连接复用
+public class ConnectionPoolingOptimization {
+    private final CloseableHttpClient httpClient;
+
+    // 错误：每次请求新建连接
+    public String wrongRequest(String url) throws IOException {
+        try (CloseableHttpClient client = HttpClients.createDefault()) {
+            HttpGet request = new HttpGet(url);
+            try (CloseableHttpResponse response = client.execute(request)) {
+                return EntityUtils.toString(response.getEntity());
+            }
+        }
+    }
+
+    // 正确：连接池复用
+    public String rightRequest(String url) throws IOException {
+        try (CloseableHttpResponse response = httpClient.execute(new HttpGet(url))) {
+            return EntityUtils.toString(response.getEntity());
+        }
+    }
+}
+```
+
+## 总结
+
+资源利用率是诊断系统性能的基础。
+
+**核心指标**：
+
+| 资源 | 监控命令 | 异常阈值 |
+|---|---|---|
+| CPU | `top`, `vmstat` | > 80% |
+| 内存 | `free -h` | available < 20% |
+| IO | `iostat -x` | util > 80% |
+| 网络 | `nload` | > 70% |
+
+**常见问题**：
+
+- CPU 高 + IO 低：计算瓶颈
+- CPU 低 + IO 高：IO 瓶颈
+- CPU 高 + Swap 高：内存不足
+- 网络带宽高：考虑压缩
+
+**优化方向**：
+
+- CPU：并行化、减少上下文切换
+- 内存：减少分配、对象池、合适的 GC
+- IO：异步 IO、批量操作、SSD
+- 网络：压缩、连接池、协议优化

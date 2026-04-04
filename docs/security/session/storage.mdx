@@ -1,0 +1,339 @@
+---
+title: 会话存储策略
+description: Session 的存储方案与最佳实践
+---
+
+# 会话存储策略
+
+你的系统有多个服务器，但用户登录后刷新页面又要求重新登录。
+
+问题出在哪？**Session 没有正确存储共享**。
+
+Session 存储是分布式系统的关键问题。
+
+## Session 存储方式
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Session 存储方式                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 应用内存存储                                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Session 存储在应用服务器的内存中                     │   │
+│  │                                                         │   │
+│  │  ✓ 最简单                                            │   │
+│  │  ✓ 性能最好                                         │   │
+│  │  ✗ 不支持分布式                                      │   │
+│  │  ✗ 重启后 Session 丢失                              │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. Redis 存储（推荐）                                 │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Session 存储在 Redis 中                             │   │
+│  │                                                         │   │
+│  │  ✓ 支持分布式                                        │   │
+│  │  ✓ 性能好                                           │   │
+│  │  ✓ 支持 Session 过期和失效                          │   │
+│  │  ✗ 需要额外组件                                      │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 数据库存储                                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Session 存储在数据库中                             │   │
+│  │                                                         │   │
+│  │  ✓ 持久化可靠                                       │   │
+│  │  ✗ 性能较低                                         │   │
+│  │  ✗ 不适合高并发场景                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 4. JWT 无状态存储                                    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  Session 信息存储在客户端 Token 中                     │   │
+│  │                                                         │   │
+│  │  ✓ 无需服务端存储                                   │   │
+│  │  ✓ 支持水平扩展                                     │   │
+│  │  ✗ Token 泄露风险                                   │   │
+│  │  ✗ 无法主动失效                                     │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Redis Session 存储
+
+```java
+// Spring Session + Redis 配置
+@Configuration
+@EnableRedisHttpSession(
+    maxInactiveIntervalInSeconds = 1800  // 30 分钟
+)
+public class RedisSessionConfig {
+    // Spring Session 会自动配置
+}
+
+// 自定义 Session 属性
+@Service
+public class SessionService {
+
+    @Autowired
+    private HttpSession session;
+
+    public void setUser(Long userId, User user) {
+        session.setAttribute("userId", userId);
+        session.setAttribute("user", user);
+    }
+
+    public User getUser() {
+        return (User) session.getAttribute("user");
+    }
+
+    public Long getUserId() {
+        return (Long) session.getAttribute("userId");
+    }
+}
+```
+
+### Redis Session 序列化配置
+
+```java
+// JSON 序列化（支持分布式调试）
+@Configuration
+public class RedisSessionSerializerConfig {
+    @Bean
+    public RedisSerializer<Object> springSessionDefaultRedisSerializer() {
+        return new GenericJackson2JsonRedisSerializer(
+            new ObjectMapper()
+                .activateDefaultTyping(
+                    SimpleAbstractTypeResolver
+                        .INSTANCE,
+                    ObjectMapper.DefaultTyping.NON_FINAL)
+                .setSerializationInclusion(JsonInclude.Include.NON_NULL)
+        );
+    }
+}
+```
+
+## Session 共享配置
+
+```yaml
+# application.yml 多服务器配置
+spring:
+  session:
+    store-type: redis
+    redis:
+      namespace: myapp:session
+
+  data:
+    redis:
+      host: redis-host
+      port: 6379
+      password: ${REDIS_PASSWORD}
+      timeout: 1000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+```
+
+```java
+// 多个 Redis 节点配置
+@Configuration
+public class RedisClusterConfig {
+    @Bean
+    public RedisConnectionFactory connectionFactory() {
+        RedisClusterConfiguration config = new RedisClusterConfiguration();
+        config.addNodeAddress(
+            "redis-node-1:6379",
+            "redis-node-2:6379",
+            "redis-node-3:6379");
+
+        return new LettuceConnectionFactory(config);
+    }
+}
+```
+
+## Session 集群方案
+
+### Redis Cluster
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Redis Cluster 方案                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │              客户端                                     │   │
+│  │                 │                                        │   │
+│  │                 ▼                                        │   │
+│  │         ┌───────────────┐                              │   │
+│  │         │  Redis      │                              │   │
+│  │         │  Cluster    │                              │   │
+│  │         └──────┬───────┘                              │   │
+│  │                │                                      │   │
+│  │      ┌─────────┼─────────┐                           │   │
+│  │      ▼         ▼         ▼                            │   │
+│  │   主节点1    主节点2    主节点3                        │   │
+│  │                                                         │   │
+│  │  自动分片：Slot 16384 个，分配到不同主节点              │   │
+│  │  高可用：每个主节点有从节点，主节点故障自动切换          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Redis Sentinel
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Redis Sentinel 方案                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │              客户端                                     │   │
+│  │                 │                                        │   │
+│  │                 ▼                                        │   │
+│  │         ┌───────────────┐                              │   │
+│  │         │  Sentinel    │                              │   │
+│  │         │  Monitor     │                              │   │
+│  │         └──────┬───────┘                              │   │
+│  │                │                                      │   │
+│  │       ┌────────┴────────┐                           │   │
+│  │       ▼                 ▼                            │   │
+│  │   主节点             主节点                          │   │
+│  │       │                 │                            │   │
+│  │       └────────┬────────┘                            │   │
+│  │                ▼                                     │   │
+│  │             从节点                                  │   │
+│  │                                                         │   │
+│  │  Sentinel 监控主节点，故障时自动提升从节点为主节点    │   │
+│  │  客户端通过 Sentinel 获取当前主节点地址               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Session 过期处理
+
+```java
+// Session 过期事件处理
+@Component
+public class SessionExpiredListener {
+    @EventListener
+    public void onSessionExpired(SessionDeletedEvent event) {
+        String sessionId = event.getSessionId();
+
+        // 清理相关缓存
+        userCacheService.evictBySession(sessionId);
+
+        // 记录日志
+        log.info("Session 过期: {}", sessionId);
+
+        // 发送通知（如需要）
+        notificationService.sendSessionExpiredNotice(sessionId);
+    }
+
+    @EventListener
+    public void onSessionCreated(SessionCreatedEvent event) {
+        String sessionId = event.getSessionId();
+        log.info("Session 创建: {}", sessionId);
+    }
+}
+```
+
+## Session 存储选型决策
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Session 存储选型决策表                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────────┬────────────────┬────────────────────┐    │
+│  │ 场景                │ 推荐方案        │ 原因              │    │
+│  ├──────────────────────┼────────────────┼────────────────────┤    │
+│  │ 单机应用           │ 内存存储        │ 简单够用          │    │
+│  ├──────────────────────┼────────────────┼────────────────────┤    │
+│  │ 多服务器           │ Redis          │ 性能好，支持分布式 │    │
+│  ├──────────────────────┼────────────────┼────────────────────┤    │
+│  │ 高并发              │ Redis Cluster  │ 支持水平扩展      │    │
+│  ├──────────────────────┼────────────────┼────────────────────┤    │
+│  │ 高可用              │ Redis Sentinel │ 自动故障切换      │    │
+│  ├──────────────────────┼────────────────┼────────────────────┤    │
+│  │ 无状态 API         │ JWT            │ 减少服务端存储    │    │
+│  └──────────────────────┴────────────────┴────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 性能优化
+
+```java
+// Session 懒序列化
+@Configuration
+public class LazySessionConfig {
+    @Bean
+    public RedisSerializer<Object> sessionValueSerializer() {
+        return new JdkSerializationRedisSerializer();
+    }
+
+    // 避免在 Session 中存储大对象
+    @Service
+    public class OptimizedSessionService {
+        @Autowired
+        private HttpSession session;
+
+        // 存储 ID，而非完整对象
+        public void setUser(User user) {
+            session.setAttribute("userId", user.getId());
+            // 用户详情从缓存/数据库获取
+        }
+
+        public User getUser() {
+            Long userId = (Long) session.getAttribute("userId");
+            return userCache.get(userId);
+        }
+    }
+}
+```
+
+## 总结
+
+Session 存储是分布式系统的关键问题。
+
+**存储方式**：
+
+- 内存：简单但不持久
+- Redis：推荐，性能好支持分布式
+- 数据库：持久但性能低
+- JWT：无状态，适合 API 服务
+
+**高可用方案**：
+
+- Redis Cluster：分片 + 高可用
+- Redis Sentinel：主从 + 自动切换
+
+**优化要点**：
+
+- Session 内容尽量小
+- 使用懒加载
+- 合理设置过期时间
+- 处理 Session 过期事件
+
+**核心认知**：Session 存储不是选型问题，而是分布式系统的基础设施问题。选择 Redis 是大多数场景的最佳选择。

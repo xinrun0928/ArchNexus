@@ -1,0 +1,293 @@
+---
+title: 并发控制策略选择
+description: 如何根据场景选择合适的并发控制策略
+---
+
+# 并发控制策略选择
+
+乐观锁还是悲观锁？这不是一个技术问题，而是一个业务问题。
+
+并发控制策略的选择需要综合考虑业务特点、数据特征和系统要求。
+
+## 选择决策树
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    并发控制策略选择决策树                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                    选择并发控制策略                                      │
+│                         │                                            │
+│              ┌──────────┴──────────┐                              │
+│              ▼                          ▼                          │
+│     冲突概率高？                  冲突概率低？                      │
+│              │                          │                          │
+│     ┌────────┴────────┐        ┌────────┴────────┐                │
+│     ▼                 ▼        ▼                 ▼                │
+│   悲观锁           乐观锁      乐观锁            不加锁           │
+│  +重试优化       +重试优化     首选                            │
+│              │                          │                          │
+│     ┌────────┴────────┐        ┌────────┴────────┐                │
+│     ▼                 ▼        ▼                 ▼                │
+│  锁粒度粗     锁粒度细       重试成本低     重试成本高           │
+│  减少竞争     增加并发       乐观锁         需要悲观锁           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 评估维度
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    评估维度                                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 冲突概率                                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  估算方法：                                           │   │
+│  │  并发用户数 × 访问同一数据的概率                   │   │
+│  │                                                         │   │
+│  │  示例：                                               │   │
+│  │  - 100 个并发用户，访问不同用户数据 → 冲突低      │   │
+│  │  - 100 个并发用户，抢购同一商品 → 冲突高         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 2. 重试成本                                           │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 事务长度：事务越长，重试成本越高              │   │
+│  │  - 业务连续性：能否接受中间失败              │   │
+│  │  - 用户体验：是否需要立即给用户反馈         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 3. 数据一致性要求                                     │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │                                                         │   │
+│  │  - 强一致性：必须使用悲观锁或严格乐观锁         │   │
+│  │  - 最终一致性：可以使用宽松的乐观锁           │   │
+│  │  - 允许少量不一致：可以考虑其他策略         │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 典型场景选择
+
+### 场景一：用户资料更新
+
+```java
+/**
+ * 场景：用户修改自己的个人资料
+ * 特点：每个用户只操作自己的数据，冲突概率极低
+ * 选择：乐观锁（版本号）
+ */
+
+@Service
+public class UserProfileService {
+    @Autowired private UserRepository userRepository;
+
+    @Transactional
+    public void updateProfile(String userId, UserProfile profile, Long version) {
+        User user = userRepository.findById(userId)
+            .orElseThrow(() -> new UserNotFoundException(userId));
+
+        // 版本号检查
+        if (!user.getVersion().equals(version)) {
+            throw new OptimisticLockException("数据已被修改");
+        }
+
+        user.setName(profile.getName());
+        user.setEmail(profile.getEmail());
+        user.setPhone(profile.getPhone());
+
+        userRepository.save(user);
+    }
+}
+```
+
+### 场景二：库存扣减
+
+```java
+/**
+ * 场景：电商秒杀扣减库存
+ * 特点：大量并发抢同一商品，冲突概率极高
+ * 选择：悲观锁 + Redis Lua
+ */
+
+@Service
+public class InventoryService {
+    @Autowired private RedisTemplate<String, String> redisTemplate;
+
+    private static final String STOCK_KEY = "inventory:stock:";
+
+    // Redis Lua 脚本：原子扣减
+    public boolean deductStock(Long productId, int quantity) {
+        String key = STOCK_KEY + productId;
+
+        String script = """
+            local stock = tonumber(redis.call('GET', KEYS[1]) or 0)
+            if stock >= tonumber(ARGV[1]) then
+                redis.call('DECRBY', KEYS[1], ARGV[1])
+                return 1
+            else
+                return 0
+            end
+            """;
+
+        RedisScript<Long> redisScript = new RedisScript<>(script, Long.class);
+        Long result = redisTemplate.execute(redisScript,
+            List.of(key), String.valueOf(quantity));
+
+        return result != null && result == 1;
+    }
+
+    // 扣减成功后，异步更新数据库
+    @Transactional
+    public void syncInventory(Long productId, int quantity) {
+        // 使用悲观锁更新数据库
+        Optional<Product> product = productRepository.findByIdWithLock(productId);
+        if (product.isPresent()) {
+            Product p = product.get();
+            p.setStock(p.getStock() - quantity);
+            productRepository.save(p);
+        }
+    }
+}
+```
+
+### 场景三：账户余额更新
+
+```java
+/**
+ * 场景：银行转账
+ * 特点：金额必须精确，不允许丢失更新
+ * 选择：悲观锁（按固定顺序加锁）
+ */
+
+@Service
+public class BankTransferService {
+    @Transactional
+    public void transfer(String fromAccountId, String toAccountId,
+                        BigDecimal amount) {
+        // 按 ID 排序获取锁，避免死锁
+        String firstId = fromAccountId.compareTo(toAccountId) < 0
+            ? fromAccountId : toAccountId;
+        String secondId = fromAccountId.compareTo(toAccountId) < 0
+            ? toAccountId : fromAccountId;
+
+        Account first = accountRepository.findByIdWithLock(firstId)
+            .orElseThrow(() -> new AccountNotFoundException(firstId));
+        Account second = accountRepository.findByIdWithLock(secondId)
+            .orElseThrow(() -> new AccountNotFoundException(secondId));
+
+        Account from = fromAccountId.equals(firstId) ? first : second;
+        Account to = fromAccountId.equals(firstId) ? second : first;
+
+        if (from.getBalance().compareTo(amount) < 0) {
+            throw new InsufficientBalanceException();
+        }
+
+        from.setBalance(from.getBalance().subtract(amount));
+        to.setBalance(to.getBalance().add(amount));
+
+        accountRepository.save(from);
+        accountRepository.save(to);
+    }
+}
+```
+
+### 场景四：乐观锁 + 降级策略
+
+```java
+/**
+ * 场景：订单状态更新
+ * 特点：冲突概率中等，希望在高并发时保持可用
+ * 选择：乐观锁 + 降级到悲观锁
+ */
+
+@Service
+public class OrderStatusService {
+    private static final int OPTIMISTIC_MAX_RETRIES = 3;
+
+    @Transactional
+    public void updateOrderStatus(String orderId, OrderStatus newStatus,
+                                 Long expectedVersion) {
+        Order order = orderRepository.findById(orderId)
+            .orElseThrow(() -> new OrderNotFoundException(orderId));
+
+        // 尝试乐观锁更新
+        if (order.getVersion().equals(expectedVersion)) {
+            order.setStatus(newStatus);
+            orderRepository.save(order);
+            return;
+        }
+
+        // 乐观锁失败，降级为悲观锁
+        pessimisticUpdate(orderId, newStatus);
+    }
+
+    @Transactional
+    public void pessimisticUpdate(String orderId, OrderStatus newStatus) {
+        Order order = orderRepository.findByIdWithLock(orderId)
+            .orElseThrow(() -> new OrderNotFoundException(orderId));
+
+        order.setStatus(newStatus);
+        orderRepository.save(order);
+    }
+}
+```
+
+## 混合策略
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    混合策略                                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  核心数据：悲观锁                                       │   │
+│  │  - 金额、库存、账户余额                           │   │
+│  │  - 不允许任何不一致                               │   │
+│  │                                                         │   │
+│  │  辅助数据：乐观锁                                     │   │
+│  │  - 用户资料、配置信息                           │   │
+│  │  - 允许少量不一致                               │   │
+│  │                                                         │   │
+│  │  统计数据：最终一致                                 │   │
+│  │  - 访问量、点赞数                               │   │
+│  │  - 允许延迟更新                               │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+并发控制策略的选择取决于业务特点。
+
+**选择原则**：
+
+- 冲突少 + 重试成本低：乐观锁
+- 冲突多 + 不允许失败：悲观锁
+- 业务多样性：混合策略
+
+**关键评估维度**：
+
+- 冲突概率
+- 重试成本
+- 一致性要求
+
+**实践建议**：
+
+- 先用乐观锁，性能不够再加悲观锁
+- 悲观锁要按固定顺序加锁
+- 核心数据用悲观锁，辅助数据用乐观锁

@@ -1,0 +1,561 @@
+---
+title: Sidecar 模式
+description: 将横切关注点剥离到独立进程的架构模式
+---
+
+# Sidecar 模式
+
+你正在开发一个微服务，需要添加日志、监控、限流、重试、熔断……每加一个功能，你都要改一次业务代码。几个服务还好，但如果有一百个服务，这个改动量就爆炸了。
+
+更糟糕的是：如果日志格式改了，或者监控方式升级了，你要在所有服务里改一遍。
+
+Sidecar 模式正是为了解决这个问题：**把横切关注点下沉到独立进程，让业务代码只关心业务**。
+
+## 问题背景
+
+### 传统做法：库嵌入
+
+```java
+// 每个服务都要引入这些库
+public class OrderService {
+    private final Logger logger = LoggerFactory.getLogger(OrderService.class);
+    private final Metrics metrics = Metrics.getInstance();
+    private final CircuitBreaker circuitBreaker = CircuitBreaker.getInstance();
+    private final RateLimiter rateLimiter = RateLimiter.getInstance();
+
+    public Order create(OrderRequest request) {
+        rateLimiter.acquire();  // 限流
+
+        long start = System.currentTimeMillis();
+        try {
+            logger.info("创建订单: {}", request);
+
+            circuitBreaker.execute(() -> {
+                Order order = orderRepository.save(request.toOrder());
+                metrics.increment("order.created");
+                return order;
+            });
+        } finally {
+            metrics.record("order.create.time", System.currentTimeMillis() - start);
+        }
+    }
+}
+```
+
+问题分析：
+
+- **代码耦合**：横切关注点和业务代码混在一起
+- **重复代码**：每个服务都要写同样的日志、监控、限流代码
+- **升级困难**：库升级要在所有服务改
+- **语言绑定**：某些库可能只支持特定语言
+
+## Sidecar 模式的核心
+
+```
+核心思想：
+┌─────────────────────────────────────────────────────────────────┐
+│                        Sidecar 模式                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   Service A                                                      │
+│   ┌────────────────┐     ┌────────────────┐                     │
+│   │   Business     │     │    Sidecar     │                     │
+│   │   Logic        │     │   (代理进程)   │                     │
+│   │                │     │                │                     │
+│   │   处理业务     │◀───▶│   日志收集     │                     │
+│   │                │     │   监控上报     │                     │
+│   │                │     │   限流熔断     │                     │
+│   │                │     │   配置下发     │                     │
+│   └────────────────┘     └────────────────┘                     │
+│          │                        │                              │
+│          │                        │                              │
+│          ▼                        ▼                              │
+│   ┌─────────────────────────────────────┐                       │
+│   │           Localhost网络              │                       │
+│   └─────────────────────────────────────┘                       │
+│                                                                  │
+│   Service B ─── 同样的 Sidecar                                  │
+│   Service C ─── 同样的 Sidecar                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键特点**：
+
+1. **进程隔离**：Sidecar 与主服务进程分离
+2. **独立部署**：Sidecar 可以独立升级
+3. **语言无关**：主服务可以用任何语言
+4. **共享生命周期**：Sidecar 与主服务一起部署、扩缩容
+
+## 代码实现
+
+### Envoy Sidecar 配置
+
+```yaml title="envoy-sidecar.yaml"
+static_resources:
+  listeners:
+    - address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 9901
+
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: order_service
+                codec_type: AUTO
+
+                # 路由配置
+                route_config:
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: original_service
+
+                # 过滤器链
+                http_filters:
+                  # 限流
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.http_filters.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: http_local_rate_limiter
+                      token_bucket:
+                        max_tokens: 1000
+                        tokens_per_fill: 100
+                        fill_interval: 1s
+
+                  # 熔断
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthorization
+                      failure_mode_allow: true
+
+                  # 路由
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+                # 追踪
+                tracing:
+                  provider:
+                    name: envoy.tracers.zipkin
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.ZipkinConfig
+                      collector_cluster: zipkin
+                      collector_endpoint: /api/v2/spans
+
+  clusters:
+    - name: original_service
+      connect_timeout: 5s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      hosts:
+        - socket_address:
+            address: 127.0.0.1
+            port_value: 8080
+
+    - name: zipkin
+      connect_timeout: 1s
+      type: STRICT_DNS
+      hosts:
+        - socket_address:
+            address: zipkin
+            port_value: 9411
+```
+
+### 业务服务：纯业务逻辑
+
+```java
+// 业务服务：只关心业务，不关心横切关注点
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @PostMapping
+    public Order create(@RequestBody CreateOrderRequest request) {
+        // 执行业务逻辑
+        Order order = orderService.create(request);
+        return order;
+    }
+
+    @GetMapping("/{id}")
+    public Order get(@PathVariable Long id) {
+        return orderService.findById(id);
+    }
+}
+
+// 服务本身不需要任何日志、监控、限流代码
+// 所有横切关注点都由 Sidecar 处理
+```
+
+### 自定义 Sidecar 实现
+
+```java
+// Sidecar 代理服务
+public class SidecarProxy {
+    private final HttpClient httpClient;
+    private final MetricsCollector metrics;
+    private final CircuitBreaker circuitBreaker;
+    private final RateLimiter rateLimiter;
+
+    public SidecarProxy(Config config) {
+        this.httpClient = HttpClient.newHttpClient();
+        this.metrics = new MetricsCollector(config.getMetricsEndpoint());
+        this.circuitBreaker = new CircuitBreaker(
+            config.getFailureThreshold(),
+            config.getRecoveryTimeout()
+        );
+        this.rateLimiter = new RateLimiter(
+            config.getRequestsPerSecond()
+        );
+    }
+
+    public Response intercept(Request request) {
+        // 1. 限流检查
+        if (!rateLimiter.tryAcquire()) {
+            return Response.status(429).entity("Rate limit exceeded").build();
+        }
+
+        // 2. 熔断检查
+        if (circuitBreaker.isOpen()) {
+            return Response.status(503).entity("Service unavailable").build();
+        }
+
+        // 3. 记录开始时间
+        long startTime = System.currentTimeMillis();
+
+        try {
+            // 4. 转发请求
+            Response response = httpClient.forward(request);
+
+            // 5. 记录指标
+            metrics.record("request.success", System.currentTimeMillis() - startTime);
+            circuitBreaker.recordSuccess();
+
+            return response;
+        } catch (Exception e) {
+            // 6. 处理失败
+            metrics.record("request.failure", e);
+            circuitBreaker.recordFailure();
+            throw e;
+        }
+    }
+}
+```
+
+### Kubernetes 部署
+
+```yaml title="order-service.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+        # 业务容器
+        - name: order-service
+          image: myrepo/order-service:v1.0.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+        # Sidecar 容器：日志收集
+        - name: envoy-sidecar
+          image: envoyproxy/envoy:v1.25.0
+          ports:
+            - containerPort: 9901
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+
+        # Sidecar 容器：日志收集
+        - name: log-collector
+          image: myrepo/fluentd-sidecar:v1.0
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log
+
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: envoy-config
+        - name: logs
+          emptyDir: {}
+```
+
+## Sidecar vs 库（Library）
+
+| 维度 | Sidecar | 库（Library） |
+|---|---|---|
+| 侵入性 | 无 | 有 |
+| 语言无关 | ✅ | ❌（特定语言） |
+| 独立升级 | ✅ | ❌ |
+| 资源占用 | 较高（额外进程） | 低 |
+| 性能开销 | 额外网络跳转 | 低 |
+| 管理复杂度 | 较高 | 低 |
+
+```
+Sidecar：推荐用于
+- 多语言微服务架构
+- 需要统一横切关注点的场景
+- 需要快速迭代的功能
+
+Library：推荐用于
+- 单体应用或小型服务
+- 对性能要求极高的场景
+- 团队熟悉该语言
+```
+
+## Sidecar 的实际应用
+
+### 服务网格（Istio/Linkerd）
+
+```yaml title="Istio VirtualService"
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: order-service
+spec:
+  hosts:
+    - order-service
+  http:
+    - match:
+        - headers:
+            x-request-type:
+              exact: "vip"
+      route:
+        - destination:
+            host: order-service-vip
+            subset: v2
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+      timeout: 10s
+    - route:
+        - destination:
+            host: order-service
+            subset: v1
+      rate_limits:
+        - maxRequests: 100
+          unit: second
+```
+
+### 分布式追踪
+
+```java
+// Sidecar 注入追踪头
+public class TracingSidecar {
+    public Response handle(Request request) {
+        // 提取或生成 Trace ID
+        String traceId = request.getHeader("x-b3-traceid");
+        if (traceId == null) {
+            traceId = UUID.randomUUID().toString();
+        }
+
+        // 生成 Span ID
+        String spanId = UUID.randomUUID().toString();
+
+        // 添加追踪头
+        request.setHeader("x-b3-traceid", traceId);
+        request.setHeader("x-b3-spanid", spanId);
+        request.setHeader("x-b3-parentspanid", "");
+
+        // 转发请求
+        Response response = forward(request);
+
+        // 上报追踪数据
+        tracingReporter.report(traceId, spanId, response);
+
+        return response;
+    }
+}
+```
+
+### 配置中心
+
+```java
+// 配置热加载 Sidecar
+public class ConfigSidecar {
+    private final Map<String, Object> config = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler =
+        Executors.newSingleThreadScheduledExecutor();
+
+    public ConfigSidecar(String configServerUrl) {
+        // 定期拉取配置
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                Map<String, Object> newConfig = fetchConfig(configServerUrl);
+                updateConfig(newConfig);
+            } catch (Exception e) {
+                log.error("拉取配置失败", e);
+            }
+        }, 0, 30, TimeUnit.SECONDS);
+    }
+
+    // 本地配置查询
+    public Object get(String key, Object defaultValue) {
+        return config.getOrDefault(key, defaultValue);
+    }
+
+    private void updateConfig(Map<String, Object> newConfig) {
+        config.clear();
+        config.putAll(newConfig);
+        log.info("配置已更新: {} 个配置项", newConfig.size());
+    }
+}
+
+// 业务代码使用配置
+public class OrderService {
+    private final ConfigSidecar config;
+
+    public OrderService(ConfigSidecar config) {
+        this.config = config;
+    }
+
+    public void process() {
+        int maxRetries = (int) config.get("order.maxRetries", 3);
+        long timeout = (long) config.get("order.timeout", 5000);
+        // 业务逻辑
+    }
+}
+```
+
+## Sidecar 的部署模式
+
+### 共享 Sidecar（默认）
+
+```
+Pod A ──┐
+        ├── 共享同一个 Envoy Sidecar
+Pod B ──┘
+
+优点：资源利用率高
+缺点：隔离性差
+```
+
+### 专属 Sidecar
+
+```
+Pod A ─── Envoy A
+Pod B ─── Envoy B
+
+优点：隔离性好，可独立配置
+缺点：资源占用高
+```
+
+### 链式 Sidecar
+
+```
+Pod ─── Sidecar A ─── Sidecar B ─── Sidecar C
+         (日志)      (监控)      (安全)
+
+优点：职责单一，易于维护
+缺点：延迟增加
+```
+
+## 常见问题
+
+### 问题一：Sidecar 通信开销
+
+```java
+// 错误：Sidecar 之间频繁通信
+request -> Envoy A -> App A -> Envoy A -> Envoy B -> App B
+
+// 正确：优化 Sidecar 拓扑
+request -> Envoy A -> App A -> Envoy B -> App B
+           (本地)           (网络)
+```
+
+### 问题二：Sidecar 资源管理
+
+```yaml
+# 为 Sidecar 预留资源
+resources:
+  reservations:
+    # 确保 Sidecar 有足够的资源
+    memory: 64Mi
+    cpu: 50m
+```
+
+### 问题三：Sidecar 故障处理
+
+```java
+// Sidecar 故障时的降级策略
+public class SidecarFaultTolerance {
+    private volatile boolean sidecarAvailable = true;
+
+    public Response handle(Request request) {
+        if (!sidecarAvailable) {
+            // Sidecar 不可用，直接放行
+            return forwardToAppDirectly(request);
+        }
+
+        try {
+            return sidecar.intercept(request);
+        } catch (Exception e) {
+            // Sidecar 故障，降级
+            sidecarAvailable = false;
+            scheduleHealthCheck();
+            return forwardToAppDirectly(request);
+        }
+    }
+}
+```
+
+## 总结
+
+Sidecar 模式通过将横切关注点剥离到独立进程，实现了业务代码与基础设施的解耦。
+
+**核心要点**：
+
+- Sidecar 与主服务共享主机，但独立进程
+- 接管日志、监控、限流、熔断等横切关注点
+- 业务代码保持简洁，只关心业务
+- Sidecar 可独立升级，不影响业务
+
+**优势**：
+
+- 无语言绑定
+- 独立部署和升级
+- 统一的横切关注点
+- 故障隔离
+
+**挑战**：
+
+- 额外的资源消耗
+- 网络延迟增加
+- 运维复杂度上升
+- Sidecar 自身的高可用
+
+**适用场景**：
+
+- 多语言微服务架构
+- 需要统一管理横切关注点
+- 需要快速迭代的功能
+- 服务网格（Istio/Linkerd）

@@ -1,0 +1,446 @@
+---
+title: 健康检查最佳实践
+description: 健康检查的系统性最佳实践
+---
+
+# 健康检查最佳实践
+
+你的健康检查时好时坏，不知道该信哪个。
+
+问题出在哪？**没有遵循健康检查的最佳实践**。
+
+健康检查是 Kubernetes 判断服务是否健康的唯一依据，需要精心设计。
+
+## 健康检查设计原则
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    健康检查设计原则                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  原则一：分层设计                                              │
+│  ───────────────────                                          │
+│  存活探针：检查进程是否存活                                    │
+│  就绪探针：检查服务是否就绪                                    │
+│  启动探针：检查启动是否完成                                    │
+│                                                                  │
+│  原则二：职责分离                                              │
+│  ───────────────────                                          │
+│  每种探针只检查自己该检查的内容                               │
+│  不要让存活探针检查外部依赖                                    │
+│                                                                  │
+│  原则三：快速响应                                              │
+│  ───────────────────                                          │
+│  健康检查应该简单、快速                                       │
+│  不要在探针中执行复杂逻辑                                     │
+│                                                                  │
+│  原则四：避免误判                                              │
+│  ───────────────────                                          │
+│  设置合理的超时                                               │
+│  设置合理的重试                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 完整健康检查实现
+
+### Spring Boot Actuator 配置
+
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true  # 启用 K8s 探针
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+```
+
+### 自定义健康检查
+
+```java
+// 完整的健康检查实现
+@Configuration
+public class HealthCheckConfig {
+
+    @Bean
+    public HealthIndicatorRegistry healthIndicatorRegistry(
+            List<HealthIndicator> healthIndicators) {
+        return new HealthIndicatorRegistryFactory()
+            .create(healthIndicators);
+    }
+}
+
+// 数据库健康检查
+@Component
+public class DatabaseHealthIndicator implements HealthIndicator {
+
+    @Autowired
+    private DataSource dataSource;
+
+    @Override
+    public Health health() {
+        try (Connection connection = dataSource.getConnection()) {
+            PreparedStatement statement = connection.prepareStatement("SELECT 1");
+            statement.execute();
+            return Health.up()
+                .withDetail("database", "MySQL")
+                .withDetail("validationQuery", "SELECT 1")
+                .build();
+        } catch (Exception e) {
+            return Health.down()
+                .withDetail("error", e.getMessage())
+                .build();
+        }
+    }
+}
+
+// Redis 健康检查
+@Component
+public class RedisHealthIndicator implements HealthIndicator {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Override
+    public Health health() {
+        try {
+            String pong = redisTemplate.getConnectionFactory()
+                .getConnection().ping();
+            return Health.up()
+                .withDetail("redis", "PONG")
+                .build();
+        } catch (Exception e) {
+            return Health.down()
+                .withDetail("error", e.getMessage())
+                .build();
+        }
+    }
+}
+
+// 磁盘空间检查
+@Component
+public class DiskSpaceHealthIndicator implements HealthIndicator {
+
+    @Override
+    public Health health() {
+        File disk = new File("/");
+        long freeSpace = disk.getFreeSpace();
+        long totalSpace = disk.getTotalSpace();
+        double freeRatio = (double) freeSpace / totalSpace;
+
+        if (freeRatio < 0.1) {
+            return Health.down()
+                .withDetail("freeSpace", freeSpace / (1024 * 1024) + " MB")
+                .withDetail("threshold", "10%")
+                .build();
+        }
+
+        return Health.up()
+            .withDetail("freeSpace", freeSpace / (1024 * 1024) + " MB")
+            .withDetail("freeRatio", String.format("%.2f%%", freeRatio * 100))
+            .build();
+    }
+}
+```
+
+### 分层探针实现
+
+```java
+// 分层探针控制器
+@RestController
+@RequestMapping("/actuator/health")
+public class LayeredHealthController {
+
+    @GetMapping("/liveness")
+    public ResponseEntity<Map<String, Object>> liveness() {
+        Map<String, Object> result = new HashMap<>();
+        result.put("status", "UP");
+        result.put("timestamp", System.currentTimeMillis());
+
+        // 存活探针：只检查进程
+        if (isProcessAlive()) {
+            return ResponseEntity.ok(result);
+        }
+
+        result.put("status", "DOWN");
+        result.put("reason", "process not alive");
+        return ResponseEntity.status(503).body(result);
+    }
+
+    @GetMapping("/readiness")
+    public ResponseEntity<Map<String, Object>> readiness() {
+        Map<String, Object> result = new HashMap<>();
+        result.put("timestamp", System.currentTimeMillis());
+
+        boolean allHealthy = true;
+
+        // 检查数据库
+        HealthCheckResult dbHealth = checkDatabase();
+        result.put("database", dbHealth);
+        if (!dbHealth.isHealthy()) allHealthy = false;
+
+        // 检查 Redis
+        HealthCheckResult redisHealth = checkRedis();
+        result.put("redis", redisHealth);
+        if (!redisHealth.isHealthy()) allHealthy = false;
+
+        // 检查内存
+        HealthCheckResult memoryHealth = checkMemory();
+        result.put("memory", memoryHealth);
+        if (!memoryHealth.isHealthy()) allHealthy = false;
+
+        if (allHealthy) {
+            result.put("status", "UP");
+            return ResponseEntity.ok(result);
+        } else {
+            result.put("status", "DOWN");
+            return ResponseEntity.status(503).body(result);
+        }
+    }
+
+    @GetMapping("/startup")
+    public ResponseEntity<Map<String, Object>> startup() {
+        Map<String, Object> result = new HashMap<>();
+        result.put("timestamp", System.currentTimeMillis());
+
+        // 检查启动是否完成
+        if (isStartupComplete()) {
+            result.put("status", "UP");
+            return ResponseEntity.ok(result);
+        }
+
+        result.put("status", "DOWN");
+        result.put("reason", "startup not complete");
+        return ResponseEntity.status(503).body(result);
+    }
+
+    // 检查进程是否存活
+    private boolean isProcessAlive() {
+        // 简单检查：线程是否响应
+        ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+        return threadMXBean.getThreadCount() > 0;
+    }
+
+    // 检查数据库
+    private HealthCheckResult checkDatabase() {
+        try {
+            jdbcTemplate.execute("SELECT 1");
+            return new HealthCheckResult(true, "OK");
+        } catch (Exception e) {
+            return new HealthCheckResult(false, e.getMessage());
+        }
+    }
+
+    // 检查 Redis
+    private HealthCheckResult checkRedis() {
+        try {
+            redisTemplate.opsForValue().get("health");
+            return new HealthCheckResult(true, "OK");
+        } catch (Exception e) {
+            return new HealthCheckResult(false, e.getMessage());
+        }
+    }
+
+    // 检查内存
+    private HealthCheckResult checkMemory() {
+        MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
+        long used = memoryMXBean.getHeapMemoryUsage().getUsed();
+        long max = memoryMXBean.getHeapMemoryUsage().getMax();
+        double ratio = (double) used / max;
+
+        if (ratio > 0.9) {
+            return new HealthCheckResult(false, "Memory usage > 90%");
+        }
+        return new HealthCheckResult(true, String.format("%.2f%%", ratio * 100));
+    }
+
+    // 检查启动是否完成
+    private boolean isStartupComplete() {
+        return startupLatch.getCount() == 0;
+    }
+}
+
+// 检查结果
+public class HealthCheckResult {
+    private final boolean healthy;
+    private final String message;
+
+    public HealthCheckResult(boolean healthy, String message) {
+        this.healthy = healthy;
+        this.message = message;
+    }
+
+    public boolean isHealthy() { return healthy; }
+    public String getMessage() { return message; }
+}
+```
+
+## Kubernetes 配置
+
+```yaml
+# 完整的健康检查配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: order-service:latest
+        ports:
+        - containerPort: 8080
+
+        # 启动探针
+        startupProbe:
+          httpGet:
+            path: /actuator/health/startup
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12  # 60 秒内启动完成即可
+
+        # 存活探针
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+        # 就绪探针
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+          timeoutSeconds: 3
+          successThreshold: 1
+
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        # 优雅下线
+        terminationGracePeriodSeconds: 60
+
+# Service 配置
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector:
+    app: order-service
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+## 监控与告警
+
+### 健康检查监控
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: health-check-alerts
+    rules:
+      - alert: LivenessProbeFailure
+        expr: kube_pod_container_status_last_terminated_reason{reason="LivenessFailure"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Liveness 探针失败"
+          description: "Pod {{ $labels.pod }} Liveness 探针连续失败"
+
+      - alert: ReadinessProbeFailure
+        expr: kube_pod_container_status_ready == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "就绪探针失败"
+          description: "Pod {{ $labels.pod }} 就绪探针失败"
+
+      - alert: TooManyRestarts
+        expr: rate(kube_pod_container_status_restarts_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod 重启过于频繁"
+          description: "Pod {{ $labels.pod }} 重启频率过高"
+```
+
+## 健康检查排查清单
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    健康检查排查清单                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  □ 健康检查接口是否可访问                                      │
+│  □ 探针配置是否正确                                           │
+│  □ initialDelaySeconds 是否合理                                │
+│  □ 超时时间是否足够                                           │
+│  □ 检查内容是否过重                                           │
+│  □ 探针是否通过负载均衡                                       │
+│  □ 依赖服务是否可用                                           │
+│  □ 资源是否充足                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+健康检查是 Kubernetes 调度的基础。
+
+**设计原则**：
+
+- 分层设计：存活、就绪、启动探针各司其职
+- 职责分离：不要混用
+- 快速响应：检查要简单
+- 避免误判：设置合理的超时和重试
+
+**配置建议**：
+
+| 探针类型 | initialDelaySeconds | periodSeconds | failureThreshold |
+|---|---|---|---|
+| Startup | 10 | 5 | 12 |
+| Liveness | 60 | 15 | 3 |
+| Readiness | 10 | 5 | 3 |
+
+**监控要点**：
+
+- 探针失败次数
+- Pod 重启次数
+- 健康状态持续时间

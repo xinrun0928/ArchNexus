@@ -1,0 +1,427 @@
+---
+title: 缓存更新策略
+description: 保持缓存与数据源一致性的策略
+---
+
+# 缓存更新策略
+
+你更新了数据库，但缓存里的数据还是旧的。用户看到的数据不一致了。
+
+缓存更新策略，正是为了解决这个问题：**如何在数据变更时，保持缓存和数据库的一致性？**
+
+## 缓存更新的核心问题
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    缓存一致性问题                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  问题：先更新数据库还是先更新缓存？                             │
+│                                                                  │
+│  场景 1：先更新数据库，再更新缓存                               │
+│  ─────────────────────────────────────────────────────────      │
+│  T1: 更新数据库成功                                              │
+│  T2: 更新缓存失败                                                │
+│  结果：数据库是新的，缓存是旧的，数据不一致                     │
+│                                                                  │
+│  场景 2：先更新缓存，再更新数据库                               │
+│  ─────────────────────────────────────────────────────────      │
+│  T1: 更新缓存成功                                                │
+│  T2: 更新数据库失败                                              │
+│  结果：缓存是新的，数据库是旧的，数据不一致                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 策略一：Cache Aside + 删除缓存
+
+### 原理
+
+```
+推荐做法：更新数据库后删除缓存，而不是更新缓存。
+
+原因：
+1. 删除比更新简单（不需要计算新值）
+2. 即使删除失败，下次读取会重新加载
+3. 避免了并发写入时的数据覆盖问题
+```
+
+### 实现
+
+```java
+// 正确的 Cache Aside
+@Service
+public class CacheAsideCorrectService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    @Autowired
+    private ProductRepository productRepository;
+
+    public Product getProduct(Long productId) {
+        String cacheKey = "product:" + productId;
+
+        // 1. 读缓存
+        Product cached = (Product) redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 2. 缓存未命中，读数据库
+        Product product = productRepository.findById(productId);
+
+        // 3. 写入缓存
+        if (product != null) {
+            redisTemplate.opsForValue().set(cacheKey, product, Duration.ofMinutes(30));
+        }
+
+        return product;
+    }
+
+    // 更新：先更新数据库，再删除缓存
+    public void updateProduct(Product product) {
+        // 1. 更新数据库
+        productRepository.save(product);
+
+        // 2. 删除缓存（不是更新！）
+        String cacheKey = "product:" + product.getId();
+        redisTemplate.delete(cacheKey);
+    }
+}
+```
+
+### 延迟双删
+
+```
+问题：并发场景下，可能出现短暂不一致
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟双删问题                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  T1: Thread A 读数据（未命中）                                  │
+│  T2: Thread B 更新数据（删缓存）                                │
+│  T3: Thread A 写缓存（写入旧数据）                              │
+│  结果：缓存中是 Thread A 读到的旧数据                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+解决方案：延迟双删
+1. 先删除缓存
+2. 更新数据库
+3. 延迟一段时间后再删除缓存
+```
+
+```java
+// 延迟双删
+@Service
+public class DelayedDoubleDeleteService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    @Autowired
+    private ProductRepository productRepository;
+    @Autowired
+    private ScheduledExecutorService scheduler;
+
+    public void updateProduct(Product product) {
+        String cacheKey = "product:" + product.getId();
+
+        // 1. 删除缓存
+        redisTemplate.delete(cacheKey);
+
+        // 2. 更新数据库
+        productRepository.save(product);
+
+        // 3. 延迟后再删除（异步）
+        scheduler.schedule(() -> {
+            redisTemplate.delete(cacheKey);
+        }, 500, TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+## 策略二：订阅 Binlog 更新缓存
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Binlog 更新缓存                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  应用                                                          │
+│    │                                                          │
+│    ├─▶ 写 MySQL                                               │
+│    │                                                          │
+│  MySQL ──▶ Binlog ──▶ Canal ──▶ MQ ──▶ 缓存服务               │
+│                                                         │       │
+│                                                         ▼       │
+│                                                       Redis     │
+│                                                                  │
+│  优点：完全解耦，数据库和缓存无直接依赖                        │
+│  缺点：引入新组件，延迟增加                                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```java
+// Canal 配置
+@Configuration
+public class CanalConfig {
+    @Bean
+    public CanalConnector canalConnector() {
+        CanalConnector connector = Canal.connectors()
+            .newConnector()
+            .host("localhost")
+            .port(11111)
+            .destination("example")
+            .batchSize(1000)
+            .connect();
+        connector.connect();
+        connector.subscribe(".*\\..*");
+        return connector;
+    }
+}
+
+// Binlog 监听器
+@Service
+public class BinlogCacheListener {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public void onMessage(Message message) {
+        Entry entry = message.getEntries().get(0);
+        if (entry.getEntryType() == EntryType.ROWDATA) {
+            RowChange rowChange;
+            try {
+                rowChange = RowChange.parseFrom(entry.getStoreValue());
+            } catch (Exception e) {
+                return;
+            }
+
+            for (RowData rowData : rowChange.getRowDatasList()) {
+                String tableName = entry.getHeader().getTableName();
+                EventType eventType = rowChange.getEventType();
+
+                if ("product".equals(tableName)) {
+                    if (eventType == EventType.DELETE) {
+                        handleDelete(rowData);
+                    } else if (eventType == EventType.INSERT ||
+                               eventType == EventType.UPDATE) {
+                        handleInsertOrUpdate(rowData);
+                    }
+                }
+            }
+        }
+    }
+
+    private void handleInsertOrUpdate(RowData rowData) {
+        List<Column> columns = rowData.getAfterColumnsList();
+        Long productId = getColumnValue(columns, "id");
+        String cacheKey = "product:" + productId;
+
+        // 从 columns 构建缓存值
+        Product product = buildProduct(columns);
+        redisTemplate.opsForValue().set(cacheKey, product, Duration.ofMinutes(30));
+    }
+
+    private void handleDelete(RowData rowData) {
+        List<Column> columns = rowData.getBeforeColumnsList();
+        Long productId = getColumnValue(columns, "id");
+        String cacheKey = "product:" + productId;
+        redisTemplate.delete(cacheKey);
+    }
+}
+```
+
+## 策略三：基于消息队列的最终一致
+
+### 原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MQ 最终一致性                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  应用                                                          │
+│    │                                                          │
+│    ├─▶ 写数据库                                               │
+│    │                                                          │
+│    └─▶ 发消息到 MQ ──▶ 消费者更新缓存                         │
+│                                                                  │
+│  优点：解耦、可靠、可重试                                       │
+│  缺点：有延迟、复杂度增加                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 实现
+
+```java
+// 消息生产者
+@Service
+public class CacheSyncProducer {
+    @Autowired
+    private ProductRepository productRepository;
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Transactional
+    public Product updateProduct(Product product) {
+        // 1. 更新数据库
+        Product saved = productRepository.save(product);
+
+        // 2. 发送缓存更新消息
+        kafkaTemplate.send("cache-sync",
+            "product:" + product.getId(),
+            new CacheSyncMessage(product.getId(), "UPDATE")
+        );
+
+        return saved;
+    }
+
+    @Transactional
+    public void deleteProduct(Long productId) {
+        // 1. 删除数据库
+        productRepository.deleteById(productId);
+
+        // 2. 发送缓存删除消息
+        kafkaTemplate.send("cache-sync",
+            "product:" + productId,
+            new CacheSyncMessage(productId, "DELETE")
+        );
+    }
+}
+
+// 消息消费者
+@Service
+public class CacheSyncConsumer {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    @Autowired
+    private ProductRepository productRepository;
+
+    @KafkaListener(topics = "cache-sync")
+    public void handleCacheSync(CacheSyncMessage message) {
+        String cacheKey = "product:" + message.getProductId();
+
+        if ("DELETE".equals(message.getAction())) {
+            // 删除缓存
+            redisTemplate.delete(cacheKey);
+        } else if ("UPDATE".equals(message.getAction())) {
+            // 更新缓存
+            Product product = productRepository.findById(message.getProductId());
+            if (product != null) {
+                redisTemplate.opsForValue().set(cacheKey, product, Duration.ofMinutes(30));
+            } else {
+                redisTemplate.delete(cacheKey);
+            }
+        }
+    }
+}
+```
+
+## 策略四：直接更新缓存
+
+### 原理
+
+```
+直接更新缓存而不是删除缓存。
+
+适用场景：
+- 缓存值计算简单
+- 更新频率高
+- 可以接受最终一致
+```
+
+### 实现
+
+```java
+// 直接更新缓存
+@Service
+public class DirectUpdateCacheService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    @Autowired
+    private ProductRepository productRepository;
+
+    // 更新库存
+    public void decrementStock(Long productId, int quantity) {
+        String cacheKey = "product:stock:" + productId;
+
+        // 1. 更新缓存（原子操作）
+        Long newStock = redisTemplate.opsForValue().decrement(cacheKey, quantity);
+
+        // 2. 更新数据库
+        productRepository.decrementStock(productId, quantity);
+
+        // 3. 如果缓存更新失败，删除缓存
+        if (newStock == null || newStock < 0) {
+            redisTemplate.delete(cacheKey);
+        }
+    }
+
+    // 更新点赞数
+    public void incrementLikes(Long postId) {
+        String cacheKey = "post:likes:" + postId;
+
+        // 原子递增
+        redisTemplate.opsForValue().increment(cacheKey);
+
+        // 异步更新数据库
+        CompletableFuture.runAsync(() ->
+            postRepository.incrementLikes(postId)
+        );
+    }
+}
+```
+
+## 一致性级别选择
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    一致性级别选择                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  强一致性：                                                    │
+│  ───────────                                                   │
+│  • 金融交易、库存扣减                                          │
+│  • 方案：分布式锁 + 延迟双删                                   │
+│  • 延迟：毫秒级                                               │
+│                                                                  │
+│  最终一致（快速）：                                             │
+│  ─────────────────                                             │
+│  • 社交内容、评论点赞                                          │
+│  • 方案：删除缓存 + 消息队列                                   │
+│  • 延迟：秒级                                                 │
+│                                                                  │
+│  最终一致（慢）：                                               │
+│  ─────────────────                                             │
+│  • 统计数据、排行榜                                           │
+│  • 方案：Write Behind + 定期同步                               │
+│  • 延迟：分钟级                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+缓存更新策略是保证缓存和数据库一致性的关键。
+
+**核心策略**：
+
+| 策略 | 原理 | 一致性 | 复杂度 |
+|---|---|---|---|
+| 删除缓存 | 更新 DB 后删除缓存 | 最终一致 | 低 |
+| 延迟双删 | 删除缓存 + 延迟再删 | 最终一致 | 中 |
+| Binlog 订阅 | 监听 binlog 更新缓存 | 最终一致 | 高 |
+| MQ 消息 | 发送消息异步更新缓存 | 最终一致 | 中 |
+| 直接更新 | 直接更新缓存值 | 弱一致 | 低 |
+
+**选择建议**：
+
+- 大多数场景：Cache Aside + 删除缓存
+- 高并发场景：延迟双删
+- 解耦优先：Binlog 订阅或 MQ 消息
+- 一致性要求极高：分布式锁 + 延迟双删

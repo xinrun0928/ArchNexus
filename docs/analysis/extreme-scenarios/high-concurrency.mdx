@@ -1,0 +1,215 @@
+---
+title: 高并发抢购
+description: 抢购场景下的系统架构与性能优化
+---
+
+# 高并发抢购
+
+限量商品开抢，瞬间大量用户涌入，系统响应变慢甚至崩溃。
+
+高并发抢购是秒杀之外的另一个典型高并发场景，相比秒杀更强调实时性和公平性。
+
+## 抢购 vs 秒杀
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    抢购 vs 秒杀                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────────┬──────────────────────┐              │
+│  │ 特征                  │ 抢购                │ 秒杀           │              │
+│  ├──────────────────────┼──────────────────────┤              │
+│  │ 持续时间             │ 可能较长            │ 通常很短       │              │
+│  ├──────────────────────┼──────────────────────┤              │
+│  │ 用户行为             │ 持续刷新页面        │ 准点下单       │              │
+│  ├──────────────────────┼──────────────────────┤              │
+│  │ 库存量               │ 通常较大            │ 通常很小       │              │
+│  ├──────────────────────┼──────────────────────┤              │
+│  │ 限流策略             │ 相对宽松            │ 严格限流       │              │
+│  ├──────────────────────┼──────────────────────┤              │
+│  │ 强调点               │ 公平性、实时性     │ 稳定性         │              │
+│  └──────────────────────┴──────────────────────┘              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 抢购架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    抢购系统架构                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                                                         │   │
+│  │  前端层：                                               │   │
+│  │  - 静态资源 CDN                                    │   │
+│  │  - 请求排队（先到先得）                            │   │
+│  │  - 实时库存显示                                    │   │
+│  │                                                         │   │
+│  │  网关层：                                               │   │
+│  │  - 限流                                               │   │
+│  │  - 防爬                                               │   │
+│  │  - 用户识别                                           │   │
+│  │                                                         │   │
+│  │  服务层：                                               │   │
+│  │  - 库存服务：Redis + 分布式锁                       │   │
+│  │  - 订单服务：异步下单                              │   │
+│  │  - 消息服务：削峰填谷                              │   │
+│  │                                                         │   │
+│  │  数据层：                                               │   │
+│  │  - Redis：实时库存                                 │   │
+│  │  - MySQL：订单持久化                               │   │
+│  │  - Kafka：消息队列                                 │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 分布式锁
+
+```java
+// Redisson 分布式锁实现
+@Service
+public class PurchaseLockService {
+    @Autowired private RedissonClient redisson;
+
+    public boolean tryLock(Long productId, Long userId) {
+        String lockKey = "purchase:lock:" + productId + ":" + userId;
+        RLock lock = redisson.getLock(lockKey);
+
+        try {
+            // 尝试获取锁，最多等待 100ms，锁定后自动释放
+            return lock.tryLock(100, 30000, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    public void unlock(Long productId, Long userId) {
+        String lockKey = "purchase:lock:" + productId + ":" + userId;
+        RLock lock = redisson.getLock(lockKey);
+
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
+    }
+}
+
+// 抢购服务
+@Service
+public class PurchaseService {
+    @Autowired private PurchaseLockService lockService;
+    @Autowired private SeckillStockService stockService;
+    @Autowired private OrderService orderService;
+
+    public PurchaseResult purchase(Long productId, Long userId) {
+        // 1. 检查是否已购买
+        if (hasPurchased(productId, userId)) {
+            return PurchaseResult.alreadyPurchased();
+        }
+
+        // 2. 获取分布式锁
+        if (!lockService.tryLock(productId, userId)) {
+            return PurchaseResult.busy();
+        }
+
+        try {
+            // 3. 再次检查库存
+            if (!stockService.hasStock(productId)) {
+                return PurchaseResult.soldOut();
+            }
+
+            // 4. 扣减库存
+            if (!stockService.deductStock(productId, 1)) {
+                return PurchaseResult.soldOut();
+            }
+
+            // 5. 创建订单
+            Order order = orderService.createOrder(productId, userId);
+
+            return PurchaseResult.success(order);
+
+        } finally {
+            lockService.unlock(productId, userId);
+        }
+    }
+}
+```
+
+## 公平性保障
+
+```java
+// 队列排队机制
+@Service
+public class PurchaseQueueService {
+    @Autowired private RedisTemplate<String, String> redisTemplate;
+
+    private static final String QUEUE_KEY_PREFIX = "purchase:queue:";
+    private static final String RESULT_KEY_PREFIX = "purchase:result:";
+
+    // 加入排队队列
+    public int joinQueue(Long productId, Long userId) {
+        String queueKey = QUEUE_KEY_PREFIX + productId;
+
+        // 加入队列尾部
+        Long position = redisTemplate.opsForList().rightPush(
+            queueKey, userId.toString());
+
+        return position.intValue();  // 返回排队位置
+    }
+
+    // 获取抢购资格
+    public PurchaseTicket getTicket(Long productId, Long userId) {
+        String queueKey = QUEUE_KEY_PREFIX + productId;
+        String resultKey = RESULT_KEY_PREFIX + productId + ":" + userId;
+
+        // 检查是否已有结果
+        String result = redisTemplate.opsForValue().get(resultKey);
+        if (result != null) {
+            return PurchaseTicket.fromResult(result);
+        }
+
+        // 检查队列位置
+        Long position = redisTemplate.opsForList().indexOf(
+            queueKey, userId.toString());
+
+        if (position == null || position < 0) {
+            return PurchaseTicket.notInQueue();
+        }
+
+        // 查询当前可用库存
+        Long availableStock = getAvailableStock(productId);
+
+        if (position < availableStock) {
+            // 有资格抢购
+            return PurchaseTicket.eligible(position.intValue());
+        } else {
+            // 排队中
+            return PurchaseTicket.waiting(position.intValue());
+        }
+    }
+}
+```
+
+## 总结
+
+高并发抢购需要在公平性和性能之间找到平衡。
+
+**核心设计**：
+
+- 分布式锁：保证一人一号一单
+- 队列机制：保障公平性
+- Redis 库存：高性能实时扣减
+- 异步订单：削峰处理
+
+**与秒杀的差异**：
+
+- 持续时间更长
+- 更强调公平性
+- 库存量相对较大
+- 限流相对宽松
+
+**核心认知**：抢购系统的核心是公平性和实时性的平衡。队列机制可以保障公平性，但会增加延迟；锁机制可以保证准确性，但会带来性能开销。
