@@ -1,0 +1,422 @@
+---
+title: Twitter 流架构
+description: 全球最大实时社交媒体平台的信息流架构深度解析
+---
+
+# Twitter 流架构
+
+2006 年 3 月 21 日，Jack Dorsey 发出了一条只有 5 个字的 Twitter：「just setting up my twttr」。这条推文被认为是 Twitter 历史上第一条推文。
+
+那时候没有人能想到，这个「发短信给关注者」的小工具，会在十几年后成为全球最重要的信息传播平台之一——无论是伊朗绿色革命、阿拉伯之春、还是新冠疫情期间，Twitter 都是信息传播最快的平台，甚至快过传统媒体。
+
+这个故事的背景是：Twitter 面临的技术挑战，是所有社交媒体中最极端的——**如何在每秒钟处理数十万条新推文，同时让数亿用户几乎实时地看到它们**。
+
+## 公司画像
+
+Twitter（2023 年更名为 X）是全球最具影响力的实时社交媒体平台，截至 2024 年月活用户超过 **5.5 亿**，每天产生 **5 亿条**推文。用户每分钟发送约 **35 万条**推文，每秒约 **6000 条**。
+
+理解 Twitter 技术挑战的关键，在于它的**实时性要求**：
+
+- **信息流是时间线**：Twitter 的核心是「按时间顺序」的推文流，延迟超过 1 分钟用户就会有感知
+- **突发事件的信息洪峰**：重大事件（选举、灾难、体育赛事）会导致推文量瞬间暴涨 10 倍以上
+- **粉丝数量不均衡**：普通用户只有几百个粉丝，而明星账号可能有上亿粉丝——同一条推文的分发目标是完全不同的
+- **多维度推荐**：除了关注者的推文，用户还需要看到热门推文、广告、趋势话题
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **2006-2009** | 起步期 | Ruby on Rails + MySQL | 快速验证产品模型 |
+| **2009-2013** | MySQL 分片期 | MySQL 分片 + Memcache + CDN | 用户爆发式增长，单库无法支撑 |
+| **2013-2017** | 时间线重构 | Manhattan + Timeline Service + Product Zoo | 时间线读取成为瓶颈 |
+| **2017-2020** | 实时化改造 | Redis + Kafka + Heron + Flink | 实时推荐， Feed 刷新延迟降低 |
+| **2020-至今** | 新架构 | GraphQL + Blade / Rollout + 自研 Rope | 统一 API，统一时间线架构 |
+
+## 第一阶段：起步期（2006-2009）
+
+### 极简架构
+
+Twitter 创立之初，架构简单到令人发指——一台 Mac mini 服务器，跑着 Ruby on Rails，连接一个 MySQL 数据库。这台 Mac mini 撑了好几个月，直到用户增长到几万人。
+
+Twitter 早期的核心数据模型：
+
+```sql
+-- 用户表
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    screen_name VARCHAR(15) NOT NULL,
+    name VARCHAR(40) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- 关注关系表
+CREATE TABLE follows (
+    follower_id BIGINT NOT NULL,
+    followee_id BIGINT NOT NULL,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (follower_id, followee_id)
+);
+
+-- 推文表
+CREATE TABLE tweets (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id BIGINT NOT NULL,
+    body VARCHAR(280) NOT NULL,
+    created_at DATETIME NOT NULL,
+    INDEX idx_user_created (user_id, created_at DESC)
+);
+```
+
+获取用户时间线的查询：
+
+```sql
+-- 获取用户时间线：找出该用户关注的所有人发的推文
+SELECT tweets.*
+FROM tweets
+JOIN follows ON tweets.user_id = follows.followee_id
+WHERE follows.follower_id = ?
+ORDER BY tweets.created_at DESC
+LIMIT 20;
+```
+
+这个查询的问题很快就暴露了：当用户的关注者超过 100 人时，这个 JOIN 操作就慢到不可接受。
+
+### 关注数不均衡问题
+
+Twitter 早期有一个独特的问题：**用户之间的关注关系极度不均衡**。
+
+普通用户只关注几十到几百人，但很多用户关注了数千甚至数万人。当明星用户发一条推文时，Twitter 需要把这条推文「推送」给数百万粉丝。
+
+这个问题在传统的关系数据库里根本无法优雅解决——每发一条推文，都要写数百万条「分发记录」。
+
+## 第二阶段：MySQL 分片（2009-2013）
+
+### 时间线服务：Fanout
+
+2010 年，Twitter 推出了 **Fanout Service**（推送服务），核心思想是：**当用户发推时，不是查询时拉取，而是写入时推送**。
+
+```java
+// Fanout 推送服务：写入时将推文推送到粉丝的时间线
+public class FanoutService {
+
+    @Autowired private RedisTemplate redisTemplate;
+
+    // 用户发推时触发 Fanout
+    public void fanoutTweet(Long authorId, Long tweetId) {
+        // 1. 获取作者的粉丝列表
+        List<Long> followerIds = followService.getFollowers(authorId);
+
+        // 2. 将推文 ID 写入每个粉丝的时间线缓存
+        // 时间线只存推文 ID，不存内容，节省内存
+        for (Long followerId : followerIds) {
+            String timelineKey = "timeline:" + followerId;
+
+            // LPUSH：头部插入，最新的在最前面
+            // LTRIM：只保留最近 800 条，防止内存溢出
+            redisTemplate.opsForList().leftPush(timelineKey, tweetId.toString());
+            redisTemplate.opsForList().trim(timelineKey, 0, 799);
+        }
+
+        // 3. 明星账号特殊处理（避免 Fanout 耗时过长）
+        if (followerIds.size() > 100000) {
+            // 异步 Fanout：后台慢慢推送，不阻塞发推响应
+            asyncFanoutQueue.submit(() -> fanoutTweetAsync(authorId, tweetId, followerIds));
+        }
+    }
+
+    // 读取时间线
+    public List<Tweet> getTimeline(Long userId, int count) {
+        // 1. 从 Redis 获取推文 ID 列表
+        String timelineKey = "timeline:" + userId;
+        List<String> tweetIds = redisTemplate.opsForList()
+            .range(timelineKey, 0, count - 1);
+
+        if (tweetIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 2. 批量查询推文详情（使用 Redis 缓存推文内容）
+        return tweetService.getTweetsByIds(tweetIds);
+    }
+}
+```
+
+Fanout 的问题是：**推文只写入粉丝的时间线，不写入自己的时间线**。这导致用户想看自己发的推文时，需要特殊处理。
+
+### 明星账号的写放大问题
+
+Fanout 策略对普通用户有效，但对粉丝数百万的明星账号来说是灾难——一条推文要写入数百万条缓存。
+
+Twitter 的解决方案是**分桶策略**：将粉丝分成多个批次，每个批次异步处理。明星发推的 Fanout 时间从 30 秒缩短到 3 秒。
+
+## 第三阶段：Manhattan 分布式数据库（2013-2017）
+
+### 为什么 MySQL 不够用了
+
+到 2013 年，Twitter 的 MySQL 集群已经超过了 100 个分片，每个分片管理数亿条推文。运维成本急剧上升，跨分片的 JOIN 查询几乎不可能。
+
+Twitter 工程师开始自研分布式数据库 **Manhattan**——一个类似 HBase 的 KV + 时序数据库，专为 Twitter 的读写模式优化。
+
+Manhattan 的核心设计：
+
+```java
+// Manhattan 数据模型
+
+// 推文表（时间序）
+// Key: userId + timestamp，Value: tweet JSON
+ManhattanTable tweets = manhattan.open("tweets");
+
+// 写入推文
+tweets.set(userId, tweetId, tweet.toJson());
+
+// 按时间范围查询某用户的所有推文
+Iterable<Entry> userTweets = tweets.range(
+    userId + ":" + startTimestamp,
+    userId + ":" + endTimestamp
+);
+
+// 关注关系表（关系序）
+ManhattanTable follows = manhattan.open("follows");
+
+// 查出所有关注某用户的人（反向索引）
+Iterable<Entry> followers = follows.reverseIndex("followee", userId);
+```
+
+### Timeline Service：时间线的独立服务
+
+2015 年，Twitter 将时间线服务独立出来，成为一个专门的 **Timeline Service**。这个服务的职责单一而清晰：**存储和提供用户的时间线**。
+
+Timeline Service 的关键设计：
+
+```java
+// Timeline Service 的核心数据结构
+// 每个用户的时间线是一个 Redis Sorted Set
+// Score = 时间戳（用于排序），Member = 推文 ID
+
+public class TimelineService {
+
+    private static final int MAX_TIMELINE_SIZE = 800;
+
+    // Push 时间线：写入时推送（适合普通用户）
+    public void pushTimeline(Long userId, Long tweetId, long timestamp) {
+        String key = "timeline:" + userId;
+
+        redisTemplate.opsForZSet().add(key, tweetId.toString(), timestamp);
+        // 只保留最近的 800 条
+        if (redisTemplate.opsForZSet().zCard(key) > MAX_TIMELINE_SIZE) {
+            redisTemplate.opsForZSet().removeRange(key, 0,
+                MAX_TIMELINE_SIZE - 1);
+        }
+    }
+
+    // Pull 时间线：读取时聚合（适合明星账号）
+    // 明星账号不 Fanout，用户读取时动态聚合
+    public List<Tweet> pullTimeline(Long userId, int count) {
+        // 1. 获取用户关注的账号列表
+        List<Long> following = followService.getFollowing(userId);
+
+        // 2. 并行从 Manhattan 获取每个账号的最新推文
+        List<List<Tweet>> tweetsPerUser = following.parallelStream()
+            .map(user -> tweetService.getRecentTweets(user, 10))
+            .collect(Collectors.toList());
+
+        // 3. 合并排序（按时间倒序）
+        List<Tweet> merged = tweetsPerUser.stream()
+            .flatMap(List::stream)
+            .sorted(Comparator.comparing(Tweet::getCreatedAt).reversed())
+            .limit(count)
+            .collect(Collectors.toList());
+
+        return merged;
+    }
+
+    // 混合策略：小账号 Push，大账号 Pull
+    // 阈值：粉丝数 < 10000 用 Push，> 10000 用 Pull
+    public void fanout(Tweet tweet) {
+        long followerCount = followService.getFollowerCount(tweet.getAuthorId());
+
+        if (followerCount < 10000) {
+            pushTimelineForAllFollowers(tweet);
+        } else {
+            // 明星账号：只写自己的时间线，读者 Pull 时聚合
+            pushTimelineForSelf(tweet.getAuthorId(), tweet.getId());
+        }
+    }
+}
+```
+
+**Push vs Pull 策略的选择**：Push 适合粉丝数少的用户，写入成本低，读取极快；Pull 适合粉丝数多的用户，写入成本高（要写数百万条），但避免了写放大。Twitter 的混合策略是两者结合，动态选择。
+
+## 第四阶段：实时化改造（2017-2020）
+
+### Heron：流处理引擎
+
+Twitter 在 2017 年开源了 **Heron**，一个专为 Twitter 内部场景优化的流处理引擎，目标是替代 Storm。
+
+Heron 的核心改进是**资源隔离和回压机制**——当某个处理环节变慢时，自动降低上游的发送速率，防止数据积压。
+
+```java
+// Heron 拓扑：实时处理用户行为事件
+public class UserActivityTopology {
+
+    public static void main(String[] args) {
+        TopologyBuilder builder = new TopologyBuilder();
+
+        // Spout：从 Kafka 消费用户行为事件
+        builder.setSpout("kafka-spout",
+            new KafkaSpout<>(kafkaConfig), 4);
+
+        // Bolt 1：解析事件
+        builder.setBolt("parser-bolt",
+            new EventParserBolt(), 8)
+            .shuffleGrouping("kafka-spout");
+
+        // Bolt 2：更新用户特征（写入 Redis）
+        builder.setBolt("feature-bolt",
+            new FeatureUpdateBolt(), 16)
+            .shuffleGrouping("parser-bolt");
+
+        // Bolt 3：触发推荐重新计算
+        builder.setBolt("recommend-bolt",
+            new RecommendationBolt(), 8)
+            .shuffleGrouping("feature-bolt");
+
+        // 配置回压机制：当消费延迟 > 1 分钟时触发
+        Config config = new Config();
+        config.setMaxSpoutPending(10000);
+        config.setTopologyBackpressure.enable(true);
+
+        StormSubmitter.submitTopology("user-activity-topology", config,
+            builder.createTopology());
+    }
+}
+```
+
+### 搜索与发现
+
+Twitter 的搜索不同于传统搜索引擎——它搜索的是**实时发生的事件**，而不是网页。
+
+Twitter 搜索的核心挑战是**倒排索引的实时更新**：一条推文发出后，几秒钟内就必须能被搜索到。
+
+Twitter 使用 **Earlybird**（自研的倒排索引引擎）来支持实时搜索：
+
+```java
+// Earlybird 实时索引：推文发出后几秒内可被搜索
+public class EarlybirdIndexer {
+
+    // 1. 接收新推文
+    public void onNewTweet(Tweet tweet) {
+        // 2. 文本分析：分词、提取实体（@提及、#话题、URL）
+        ParsedTweet parsed = analyzer.parse(tweet);
+
+        // 3. 构建倒排索引条目
+        IndexDocument doc = new IndexDocument(tweet.getId());
+        doc.addField("text", parsed.getTokens());      // 文本内容
+        doc.addField("author", tweet.getAuthorId());  // 作者
+        doc.addField("hashtag", parsed.getHashtags()); // 话题
+        doc.addField("created_at", tweet.getTimestamp()); // 时间
+
+        // 4. 写入索引（增量更新，不影响读请求）
+        earlybirdWriter.addDocument(doc);
+    }
+
+    // 搜索：几毫秒内返回结果
+    public SearchResult search(String query, int count) {
+        Query parsedQuery = queryParser.parse(query);
+
+        // 过滤：只看最近 7 天的推文
+        parsedQuery.setTimeRange(now() - 7 * 24 * 3600, now());
+
+        // 排序：时间相关性 + 互动量
+        return earlybirdSearcher.search(parsedQuery, count);
+    }
+}
+```
+
+## 架构启示
+
+### 启示一：读写不对称决定了系统设计
+
+Twitter 的读写模式跟大多数系统不同——**写少读多**，而且读的延迟要求极高。
+
+传统方案（Pull 模型）：读取时聚合所有关注者的推文 → 读取延迟高，用户体验差
+Twitter 方案（Push 模型）：写入时将推文推送到每个粉丝 → 写入成本高，但读取极快
+
+**选择依据**：根据读写比例和延迟要求，选择 Push、Pull 或混合策略。
+
+| 策略 | 写入成本 | 读取成本 | 适合场景 |
+| --- | --- | --- | --- |
+| Push | 高（fanout 到所有粉丝） | 低 | 粉丝数少的用户（< 1 万） |
+| Pull | 低（只写自己） | 高（实时聚合） | 粉丝数多的用户（> 10 万） |
+| 混合 | 中 | 低 | 明星账号 |
+
+### 启示二：时间线只存 ID，详情按需加载
+
+Twitter 时间线只存储推文 ID，不存储推文内容。这个设计的理由：
+
+- **内存效率**：每条推文 ID 只有 8 字节，内容可能有 280 字节
+- **数据一致性**：推文内容更新（如修改、删除）时，不需要更新所有粉丝的时间线
+- **缓存友好**：推文内容统一缓存在 Redis，避免重复存储
+
+**代价**：读取时间线时，需要额外的查询获取推文详情。Twitter 通过批量查询和预热缓存来优化。
+
+### 启示三：突发事件需要特殊的容量规划
+
+Twitter 的信息洪峰往往不可预测——谁也无法提前知道某条新闻会在下一秒引爆全网。
+
+Twitter 的应对策略：
+
+- **弹性扩容**：云原生架构，支持分钟级扩容
+- **降级策略**：当系统压力过大时，关闭某些非核心功能（如趋势话题、搜索建议）
+- **限流保护**：对 API 调用限流，保护核心写路径
+
+**建议**：对于可能面临流量洪峰的系统，提前设计好降级和限流策略，不要等崩溃了再救火。
+
+### 启示四：搜索的实时性要求不同于普通搜索
+
+传统搜索引擎可以接受几分钟的索引延迟，但 Twitter 搜索必须支持秒级。
+
+Twitter 的 Earlybird 索引通过**增量更新**（而不是批量重建）来实现秒级索引更新。
+
+**对普通项目的建议**：如果你的业务需要实时搜索（如商品秒杀、即时通讯、新闻聚合），可以考虑 Elasticsearch 或自研增量索引，而不是全量批量更新。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| Jack Dorsey | 人名 | Twitter 联合创始人兼首任 CEO，Square（后改名 Block）创始人，2006 年发出第一条 Twitter |
+| Evan Williams | 人名 | Twitter 联合创始人，曾任 CEO，Blogger 和 Medium 创始人 |
+| Fanout | 技术名词 | 推送模型，发推时将推文写入所有粉丝的时间线缓存，适合粉丝数少的用户 |
+| Pull Model | 技术名词 | 拉取模型，发推时不写粉丝时间线，读取时动态聚合所有关注者的推文，适合粉丝数多的用户 |
+| Manhattan | 技术名词 | Twitter 自研的分布式数据库，类似 HBase，支持 KV 和时序数据 |
+| Earlybird | 技术名词 | Twitter 自研的实时搜索索引引擎，支持推文的秒级可搜索 |
+| Heron | 技术名词 | Twitter 2017 年开源的流处理引擎，Storm 的继承者，提供更好的资源隔离和回压机制 |
+| Snowflake | 技术名词 | Twitter 2010 年开源的分布式 ID 生成算法，使用时间戳 + 机器 ID + 序号，不需要数据库自增 ID |
+| Rope | 技术名词 | Twitter 2022 年公开的新一代时间线架构，统一了主页时间线和搜索时间线 |
+| Write Amplification | 技术名词 | 写放大，Push 模型下明星账号发一条推文需要写数百万条缓存的问题 |
+
+## 总结
+
+Twitter 的技术演进，始终围绕一个核心命题：**如何在保证实时性的前提下，支撑数亿用户的信息分发**。
+
+**演进脉络**：
+
+- **2006-2009**：Ruby 单体，快速验证产品模型
+- **2009-2013**：MySQL 分片 + Fanout，Push 模型支撑早期增长
+- **2013-2017**：Manhattan + Timeline Service，混合 Push/Pull 策略
+- **2017-2020**：Heron + Earlybird 实时搜索，秒级索引更新
+- **2020-至今**：Rope 统一架构，GraphQL API 化
+
+**核心技术亮点**：
+
+- **Fanout 推送**：写入时将推文推送到粉丝时间线，读取极快
+- **混合 Push/Pull**：根据粉丝数量动态选择策略，平衡读写成本
+- **Manhattan 分布式数据库**：支撑 PB 级推文数据的高并发读写
+- **Earlybird 实时索引**：秒级索引更新，支持实时搜索
+
+**对普通项目的启发**：
+
+- 读写比例决定系统设计，选 Push 还是 Pull 要看具体场景
+- 时间线只存 ID 是内存优化技巧，但要处理好详情加载延迟
+- 突发事件要有降级预案，不要等崩溃了再救火
+- 实时搜索需要增量索引，不要用批量重建

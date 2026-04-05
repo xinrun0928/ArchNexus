@@ -1,0 +1,449 @@
+---
+title: 腾讯即时通讯架构
+description: 全球最大即时通讯平台的亿级长连接架构深度解析
+---
+
+# 腾讯即时通讯架构
+
+1999 年 2 月 10 日，腾讯推出了 QQ 的第一个测试版。那时候，全中国能用上互联网的人不超过 1000 万，网络条件极差（拨号上网，56K 猫），大多数人的沟通方式还是固定电话和 BP 机。
+
+QQ 的第一个版本只有 200KB，安装后占用 1MB 硬盘。功能只有一个：即时聊天。但就是这个「即时聊天」，彻底改变了中国人沟通的方式。
+
+二十多年后的今天，微信月活用户超过 **13 亿**，QQ 月活超过 **5 亿**。腾讯的即时通讯（IM）系统，是全球最复杂的实时消息系统之一——每天处理 **1000 亿条**以上的消息，在线用户峰值超过 **5 亿**。
+
+## 公司画像
+
+腾讯是中国最大的互联网科技公司之一，核心业务包括社交网络（微信、QQ）、游戏（王者荣耀、英雄联盟）、金融科技（微信支付）、企业服务（腾讯云）。
+
+理解腾讯 IM 技术挑战的关键，在于它的**实时性要求**：
+
+- **消息必达**：用户发出一条消息，接收方必须收到。网络不稳定时需要重试，客户端崩溃需要同步。
+- **亿级长连接**：每个在线用户都保持一个到服务器的长连接，服务器需要维护这个连接池。
+- **消息有序**：同一会话的消息必须按发送顺序显示，不能乱序。
+- **跨端同步**：同一条消息，用户在手机、电脑、平板上看到的应该完全一致。
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **1999-2005** | QQ 起步期 | P2P + 中转服务器 | 互联网初期，NAT 穿透困难 |
+| **2005-2010** | 亿级扩展期 | 接入层分离 + 分级存储 + C++ 后端 | 单机瓶颈，百万用户并发 |
+| **2010-2015** | 微信时代 | Long Pull / WebSocket + 多端同步 | 移动互联网，弱网环境 |
+| **2015-至今** | 全球化期 | 多机房部署 + 端到端加密 + 小程序 | 全球化运营，安全合规 |
+
+## 第一阶段：QQ 的 P2P 与中转架构（1999-2005）
+
+### 早期的技术挑战：NAT 穿透
+
+1999 年，大多数用户通过家庭路由器上网，路由器使用 NAT（网络地址转换）。这意味着用户的公网 IP 是共享的，服务器无法直接向客户端推送消息。
+
+腾讯的第一版 QQ 采用了一个折中方案：**中转模式**。即使用户都在 NAT 后面，消息通过腾讯的服务器中转。
+
+```java
+// QQ 中转消息：最早期版本
+public class QQMessageRelay {
+
+    // 伪代码：服务器端消息中转逻辑
+    public void relayMessage(Long senderUin, Long receiverUin, String content) {
+        // 1. 检查接收方是否在线
+        SessionInfo receiver = sessionManager.getSession(receiverUin);
+
+        if (receiver != null && receiver.isOnline()) {
+            // 接收方在线：直接推送
+            PushService.push(receiver, content);
+        } else {
+            // 接收方不在线：存储到离线消息队列
+            OfflineMessageStore.store(receiverUin, new Message(
+                senderUin, content, System.currentTimeMillis()));
+        }
+    }
+}
+```
+
+中转模式的缺点是：**服务器压力大，消息延迟高**。每个消息都要经过服务器中转，当用户量上来后，服务器带宽成为瓶颈。
+
+### P2P 直连：UDP 打洞
+
+2003 年左右，腾讯开始引入 P2P 直连技术。当两个用户都在 NAT 后面时，通过 **UDP 打洞**技术，可以实现客户端之间的直接通信：
+
+```
+用户 A（内网 192.168.1.100:1234）<---> 腾讯打洞服务器 <---> 用户 B（内网 192.168.2.200:5678）
+
+打洞过程：
+1. A 和 B 都向打洞服务器发送 UDP 包，服务器记录双方公网 IP:Port
+2. 服务器告诉 A：「B 的公网地址是 1.2.3.4:5678」
+3. 服务器告诉 B：「A 的公网地址是 5.6.7.8:1234」
+4. A 向 5.6.7.8:1234 发 UDP 包，触发 NAT A 的映射
+5. B 向 1.2.3.4:5678 发 UDP 包，触发 NAT B 的映射
+6. 如果双方 NAT 都对称/全锥型，A 和 B 就能直接通信了
+```
+
+对于无法直连的场景（如企业防火墙、严格 NAT），仍然使用服务器中转。
+
+## 第二阶段：亿级扩展（2005-2010）
+
+### 接入层分离
+
+2010 年前后，QQ 同时在线用户突破 1 亿。这个规模下，单机服务器已经无法承载所有连接。
+
+腾讯的架构改造思路是**分层分离**：
+
+```
+客户端 → 接入层（接入服务器） → 路由层（逻辑路由） → 存储层（消息存储）
+```
+
+**接入层**：负责维护所有长连接，每个接入服务器管理数万到数十万个 TCP 连接。
+
+**路由层**：根据用户 ID 计算路由规则，将消息路由到正确的存储节点。
+
+**存储层**：分布式消息存储，每个节点存储一部分用户的消息。
+
+### 消息可靠送达：ACK 机制
+
+IM 系统最核心的设计是**消息 ACK（确认）机制**——发送方必须确认接收方收到了消息，否则要重试。
+
+```java
+// 消息可靠送达：ACK 机制
+public class MessageService {
+
+    // 发送消息
+    public SendResult sendMessage(Long senderUin, Long receiverUin, String content) {
+        // 1. 生成全局唯一消息 ID
+        String msgId = UUIDGenerator.next();
+
+        // 2. 构造消息
+        IMMessage message = new IMMessage();
+        message.setMsgId(msgId);
+        message.setSenderUin(senderUin);
+        message.setReceiverUin(receiverUin);
+        message.setContent(content);
+        message.setTimestamp(System.currentTimeMillis());
+        message.setStatus(MessageStatus.SENDING);
+
+        // 3. 持久化消息（消息必须落盘才能算发送成功）
+        messageStore.save(message);
+
+        // 4. 尝试推送
+        boolean pushed = pushService.push(receiverUin, message);
+
+        if (!pushed) {
+            // 接收方不在线：标记为待送达
+            message.setStatus(MessageStatus.PENDING_DELIVERY);
+            messageStore.update(message);
+        }
+
+        return new SendResult(msgId, pushed ? DeliveryStatus.DELIVERED : DeliveryStatus.PENDING);
+    }
+
+    // 接收方 ACK
+    public void onMessageAck(Long msgId, Long receiverUin) {
+        IMMessage message = messageStore.findByMsgId(msgId);
+        message.setStatus(MessageStatus.DELIVERED);
+        messageStore.update(message);
+
+        // 通知发送方：消息已送达
+        PushService.pushToClient(message.getSenderUin(),
+            new DeliveryReceipt(msgId, receiverUin));
+    }
+}
+```
+
+### 消息存储：如何存 1000 亿条消息
+
+QQ 的消息存储是业界难题——每天产生数十亿条消息，历史消息要永久保存。
+
+腾讯的消息存储采用**分布式表（Wide-Column）存储**，按用户 ID 分片：
+
+```java
+// 消息存储：按接收者分片
+public class MessageStore {
+
+    // 分片策略：receiverUin % 分片数
+    private int getShard(Long receiverUin) {
+        return (int) (receiverUin % shardCount);
+    }
+
+    // 存储消息
+    public void saveMessage(Long senderUin, Long receiverUin,
+                           String content, long timestamp) {
+        int shard = getShard(receiverUin);
+
+        // Wide-Column 存储：
+        // Row Key: receiverUin + "_" + timestamp
+        // Column: senderUin -> content
+        String rowKey = receiverUin + "_" + timestamp;
+
+        wideColumnStore.put(shard, rowKey, senderUin.toString(), content);
+
+        // 同时更新索引：按 sender 维度查询
+        String indexRowKey = senderUin + "_" + receiverUin + "_" + timestamp;
+        wideColumnStore.put(shard, indexRowKey, "msg", rowKey);
+    }
+
+    // 查询某会话的消息（分页）
+    public List<IMMessage> getConversation(Long userA, Long userB,
+                                         long beforeTimestamp, int limit) {
+        // 1. 查询 A->B 的消息
+        String startKeyA = userA + "_" + userB + "_" + beforeTimestamp;
+        List<MessageEntry> messagesA = wideColumnStore.scan(
+            getShard(userB), startKeyA, limit / 2);
+
+        // 2. 查询 B->A 的消息
+        String startKeyB = userB + "_" + userA + "_" + beforeTimestamp;
+        List<MessageEntry> messagesB = wideColumnStore.scan(
+            getShard(userA), startKeyB, limit / 2);
+
+        // 3. 合并排序
+        return mergeAndSort(messagesA, messagesB, limit);
+    }
+}
+```
+
+## 第三阶段：微信时代（2010-2015）
+
+### 长连接与心跳
+
+微信的早期版本，使用 **HTTP Long Pulling**（长轮询）实现消息推送——客户端发起一个 HTTP 请求，服务器如果没有新消息就 hold 住请求，等有新消息或有超时才返回。
+
+长轮询的问题是**效率低**：每个请求都要建立 HTTP 连接，消耗服务器连接资源。
+
+后来微信切换到 **WebSocket** 双向长连接，配合**心跳机制**维持连接活跃：
+
+```java
+// WebSocket 心跳机制
+public class HeartbeatService {
+
+    private static final int HEARTBEAT_INTERVAL_SECONDS = 30;
+    private static final int HEARTBEAT_TIMEOUT_SECONDS = 60;
+
+    // 客户端：定时发送心跳
+    @Scheduled(fixedRate = HEARTBEAT_INTERVAL_SECONDS * 1000)
+    public void sendHeartbeat() {
+        WebSocketSession session = getCurrentSession();
+        if (session.isOpen()) {
+            session.sendMessage(new HeartbeatMessage(
+                getCurrentUserId(), System.currentTimeMillis()));
+        }
+    }
+
+    // 服务器：检测心跳超时
+    public void onHeartbeat(Long userId, long clientTimestamp) {
+        connectionManager.updateHeartbeat(userId, clientTimestamp);
+    }
+
+    @Scheduled(fixedRate = HEARTBEAT_TIMEOUT_SECONDS * 1000)
+    public void checkTimeout() {
+        long threshold = System.currentTimeMillis()
+            - HEARTBEAT_TIMEOUT_SECONDS * 1000L;
+
+        // 找出心跳超时的连接
+        for (Long userId : connectionManager.getOnlineUsers()) {
+            if (connectionManager.getLastHeartbeat(userId) < threshold) {
+                // 标记为离线，清理连接
+                connectionManager.markOffline(userId);
+                // 通知业务系统
+                eventBus.publish(new UserOfflineEvent(userId));
+            }
+        }
+    }
+}
+```
+
+### 多端同步：消息漫游
+
+微信用户可以在多个设备上登录（手机、电脑、平板），每条消息需要在所有设备上同步。
+
+```java
+// 多端同步：消息漫游
+public class MultiDeviceSyncService {
+
+    // 用户设备列表
+    // deviceType: MOBILE / PC / PAD / WEB
+    public List<DeviceSession> getUserDevices(Long userId) {
+        return deviceRepository.findByUserId(userId);
+    }
+
+    // 发送消息时，同步到所有在线设备
+    public void syncMessageToDevices(Long userId, IMMessage message) {
+        List<DeviceSession> devices = getUserDevices(userId);
+
+        for (DeviceSession device : devices) {
+            if (device.isOnline()) {
+                // 推送到在线设备
+                pushService.pushToDevice(device, message);
+            } else {
+                // 离线设备：消息漫游到服务器
+                // 用户下次登录该设备时，拉取漫游消息
+                offlineMessageStore.storeForDevice(
+                    userId, device.getDeviceId(), message);
+            }
+        }
+    }
+
+    // 设备登录：拉取漫游消息
+    public List<IMMessage> pullRoamingMessages(Long userId,
+                                               String deviceId,
+                                               long sinceTimestamp) {
+        // 从离线消息存储中拉取该设备未同步的消息
+        return offlineMessageStore.getForDevice(
+            userId, deviceId, sinceTimestamp);
+    }
+}
+```
+
+## 第四阶段：全球化与安全（2015-至今）
+
+### 多机房部署：就近接入
+
+微信的全球用户分布极广，跨地域访问延迟问题严重。腾讯在全球部署了多个接入机房，用户就近接入。
+
+```java
+// 就近接入：DNS 解析 + Anycast
+public class AccessRouter {
+
+    // 用户发起请求时，DNS 返回最近的接入机房 IP
+    public InetSocketAddress resolveAccessPoint(Long userId) {
+        // 1. 获取用户地理位置（通过 IP 库或 GPS）
+        GeoLocation location = geoService.locateUser(userId);
+
+        // 2. 根据地理位置选择最近的接入机房
+        // 优先同机房 > 同城 > 同区域 > 跨区域
+        AccessPoint ap = accessPointSelector.select(
+            location, LoadMetric.RESPONSE_TIME);
+
+        return new InetSocketAddress(ap.getPublicIP(), ap.getPort());
+    }
+
+    // 跨机房消息路由
+    public void routeMessage(IMMessage message) {
+        Long receiverId = message.getReceiverUin();
+
+        if (isLocalUser(receiverId)) {
+            // 本机房用户：直接投递
+            deliverLocally(message);
+        } else {
+            // 跨机房用户：通过专线投递
+            String targetDc = getUserDataCenter(receiverId);
+            dcRouter.sendToDataCenter(targetDc, message);
+        }
+    }
+}
+```
+
+### 端到端加密：Signal 协议
+
+2016 年左右，微信逐步引入 **端到端加密**，使用类似于 Signal 协议的加密方案：
+
+- **密钥交换**：双方首次通信时，通过 Diffie-Hellman 密钥交换建立会话密钥
+- **前向保密**：即使长期密钥泄露，历史消息仍然安全（每次会话密钥不同）
+- **消息认证**：每条消息都有 MAC，无法被篡改
+
+## 架构启示
+
+### 启示一：长连接是 IM 的基础设施
+
+IM 系统的核心是**长连接**——客户端和服务器保持一个持久的 TCP 连接，服务器可以随时向客户端推送消息。
+
+长连接的实现细节：
+
+- **心跳机制**：维持连接活跃，防止中间设备（如 NAT、超时）关闭空闲连接
+- **断线重连**：网络波动时，客户端要自动重连，服务端要处理重复连接
+- **连接容量**：单台服务器能维护的长连接数量是有限的（Linux 默认 fd 限制 1024，可调优到数十万）
+
+### 启示二：消息必达是最基本的要求
+
+IM 系统的消息送达是**端到端保证**的：
+
+1. 发送方发消息，服务器必须持久化（不能丢）
+2. 服务器推送，接收方必须 ACK（不能漏）
+3. 接收方不在线，消息要存入离线队列，下次上线再投递
+
+这三个环节缺一不可。任何一个环节有问题，就会出现「消息丢了」的用户反馈。
+
+### 启示三：消息 ID 是全局唯一的
+
+在分布式系统中，多个服务器同时处理消息，消息 ID 必须**全局唯一且趋势递增**（用于消息排序）。
+
+腾讯使用 **Snowflake** 或类似算法生成消息 ID：
+
+```java
+// Snowflake 消息 ID 生成
+public class SnowflakeIdGenerator {
+
+    private static final long EPOCH = 1609459200000L; // 2021-01-01
+    private static final long WORKER_ID_BITS = 10L;
+    private static final long SEQUENCE_BITS = 12L;
+
+    private final long workerId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+
+    public long nextId() {
+        long timestamp = System.currentTimeMillis() - EPOCH;
+
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & ((1 << SEQUENCE_BITS) - 1);
+            if (sequence == 0) timestamp = waitForNextMillis();
+        } else {
+            sequence = 0;
+        }
+
+        lastTimestamp = timestamp;
+
+        return (timestamp << (WORKER_ID_BITS + SEQUENCE_BITS))
+             | (workerId << SEQUENCE_BITS)
+             | sequence;
+    }
+}
+```
+
+### 启示四：消息存储要同时满足高吞吐和低延迟
+
+QQ 的消息存储有两个极端场景：
+
+- **写**：每天 1000 亿条消息写入，写入吞吐量要极高
+- **读**：用户翻阅历史消息，读取延迟要极低
+
+腾讯使用 **LSM-Tree** 或 **Wide-Column** 存储引擎，牺牲读取性能换写入性能（IM 系统写入 >> 读取），再通过**冷热分离**（近期消息 SSD，历史消息 HDD）进一步优化成本。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| 马化腾（Pony Ma） | 人名 | 腾讯创始人兼 CEO，1971 年生于广东汕头，深圳大学计算机系毕业 |
+| 张志东（Tony Zhang） | 人名 | 腾讯前 CTO，QQ 早期核心架构师，2014 年卸任 CTO |
+| NAT（Network Address Translation） | 技术名词 | 网络地址转换，将内网 IP 映射为公网 IP，使内网设备能访问互联网 |
+| UDP 打洞 | 技术名词 | P2P 穿透 NAT 的技术，通过中转服务器帮助两个 NAT 后用户建立直连 |
+| WebSocket | 技术名词 | 浏览器和服务器之间的全双工通信协议，支持服务端主动推送消息 |
+| Long Pulling | 技术名词 | 长轮询，客户端发起请求后，服务器在没有新消息时 hold 住连接直到超时 |
+| 心跳机制 | 技术名词 | 客户端定时向服务器发送小包，证明连接仍然活跃，防止空闲连接被关闭 |
+| ACK（Acknowledgement） | 技术名词 | 确认机制，接收方收到消息后回复 ACK，发送方才确认消息送达 |
+| 消息漫游 | 技术名词 | 同一账号在多个设备上登录，消息在所有设备上同步 |
+| Signal 协议 | 技术名词 | 端到端加密通信协议，提供前向保密和消息认证，WhatsApp 等使用此协议 |
+| Snowflake | 技术名词 | Twitter 开源的分布式 ID 生成算法，使用时间戳 + 机器 ID + 序号生成全局唯一 ID |
+| 前向保密 | 技术名词 | 即使长期密钥泄露，历史加密消息仍然安全的加密属性 |
+
+## 总结
+
+腾讯 IM 系统的技术演进，始终围绕一个核心命题：**如何在 亿级用户规模下，保证每条消息都能可靠、实时、低延迟地送达**。
+
+**演进脉络**：
+
+- **1999-2005**：P2P + 中转模式，解决 NAT 穿透问题
+- **2005-2010**：分层架构、ACK 机制、Wide-Column 存储，支撑亿级用户
+- **2010-2015**：WebSocket 长连接、多端同步、消息漫游，移动互联网时代
+- **2015-至今**：多机房部署、端到端加密、全球化就近接入
+
+**核心技术亮点**：
+
+- **长连接与心跳**：维持亿级长连接，及时发现断线
+- **ACK 机制**：端到端消息必达保证，持久化 + 重试 + 确认
+- **多端同步**：消息漫游，同一账号在任意设备都能看到完整历史
+- **Wide-Column 存储**：高吞吐写入，冷热分离降低成本
+
+**对普通项目的启发**：
+
+- IM 系统的消息送达是最高优先级，不要在消息持久化上妥协
+- 长连接是 IM 的基础设施，要提前做好容量规划
+- 消息 ID 全局唯一且趋势递增，是多端同步和排序的基础
+- 端到端加密要提前规划，不要等产品做大后再加

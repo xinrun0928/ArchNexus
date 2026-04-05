@@ -1,0 +1,421 @@
+---
+title: Stripe 支付架构
+description: 全球领先在线支付平台的高可用金融系统架构
+---
+
+# Stripe 支付架构
+
+2010 年，Patrick Collison 和 John Collison 两兄弟在爱尔兰的一个小镇上，创办了 Stripe。他们当时的判断是：「在线支付太难了，大多数中小网站根本不应该自己造轮子。我们来做一个 API，让任何网站 5 分钟内就能接入支付功能。」
+
+Stripe 的第一个客户是自己的公司——Astro Twitch（后来的 Twitch）需要在线收款，但找不到合适的方案。Patrick 和 John 发现，与其自己用传统方案接支付网关，不如自己做一个好用的 API。于是 Stripe 就这样诞生了。
+
+这个故事的背景是：支付是整个互联网上最复杂的领域之一。它涉及资金安全、合规监管、网络稳定性、系统可靠性。任何一个环节出错，都可能导致用户资金损失或公司被监管处罚。
+
+## 公司画像
+
+Stripe 是全球最大的在线支付基础设施提供商，截至 2024 年估值超过 **650 亿美元**，服务超过 **150 个国家**和地区，处理的支付金额占美国电商 GMV 的重要比例。
+
+理解 Stripe 技术挑战的关键，在于它的**金融系统特性**：
+
+- **资金安全是第一优先级**：Stripe 的使命是「让支付成为互联网的水和电」，这意味着支付必须 100% 可靠，一分钱都不能出错。
+- **合规监管无处不在**：每个国家都有自己的支付法规，Stripe 需要在全球范围内满足 PCI DSS、KYC、AML 等合规要求。
+- **99.999% 的可用性**：Stripe 承诺 99.999% 的可用性，即每年最多允许 5 分钟的停机时间。这对于金融系统来说是底线。
+- **超低延迟**：支付请求的平均响应时间要求在 100ms 以内，用户等待超过 1 秒就会焦虑。
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **2010-2012** | API 起步期 | Ruby on Rails + PostgreSQL | 快速验证支付 API 模型 |
+| **2012-2014** | 规模化改造 | Kafka + 微服务拆分 + 异步处理 | 支付量增长，Rails 单体成为瓶颈 |
+| **2014-2017** | 全球化扩展 | 多区域部署 + 事件驱动 + Ledger | 满足各国合规和数据本地化要求 |
+| **2017-至今** | 智能与平台化 | AI 欺诈检测 + Stripe Atlas + Connect | 平台化生态，全链路支付服务 |
+
+## 第一阶段：支付 API 的起步（2010-2012）
+
+### 核心理念：让复杂变简单
+
+Stripe 的第一个产品，是一套用 Ruby 编写的支付 API。开发者只需要几行代码，就能完成信用卡支付：
+
+```ruby
+# Stripe 经典支付示例：几行代码完成支付
+charge = Stripe::Charge.create(
+  amount: 2000,      # 金额：20.00 美元（以分为单位）
+  currency: "usd",  # 货币：美元
+  source: params[:stripe_token],  # 客户端生成的卡 token
+  description: "Example charge"
+)
+
+if charge.paid
+  # 支付成功，更新订单状态
+  order.mark_as_paid!
+end
+```
+
+这行代码背后，是一整套复杂的金融系统：卡组织网络（Visa/Mastercard）、收单行、发卡行、结算网络、PCI 合规、风控引擎、资金流水。
+
+Stripe 把这些复杂性全部封装在 API 后面，让开发者只需要关心「收多少钱」这个简单问题。
+
+### 支付的核心流程
+
+一笔支付从用户点击「付款」到资金到达商家账户，需要经过多个环节：
+
+```
+用户输入卡信息
+    ↓
+Stripe.js 收集卡信息，生成一次性 token（卡号不上传到商家服务器）
+    ↓
+商家后端用 token 创建 Charge
+    ↓
+Stripe 向卡组织网络发起授权请求
+    ↓
+发卡行验证卡号、余额、信用额度
+    ↓
+授权成功，资金暂时被「冻结」
+    ↓
+商家发货/���供服务
+    ↓
+商家请求 Capture，资金正式从用户账户扣款
+    ↓
+T+N 日，资金结算到商家账户
+```
+
+这个流程中，Stripe 扮演的角色是**收单机构**，连接商家和卡组织网络，处理授权、清算、结算等环节。
+
+## 第二阶段：规模化改造（2012-2014）
+
+### 为什么 Rails 单体撑不住了
+
+2012 年，Stripe 的支付量从每天几百笔增长到每天几万笔，Rails 单体开始出现瓶颈：
+
+- **部署耦合**：支付系统的任何变更都需要全量测试，发布周期被拖长
+- **扩展困难**：Rails 是单进程模型，无法充分利用多核 CPU
+- **数据库连接池耗尽**：高并发下数据库连接不够用
+- **内存泄漏**：长时间运行后 Ruby 进程内存膨胀
+
+### 异步处理：支付与对账分离
+
+Stripe 在这个阶段做了最重要的架构决策：**把「支付请求」和「对账」完全分离**。
+
+「支付」是实时操作，用户必须立即知道结果；「对账」是异步操作，可以延迟几秒到几分钟。两个操作放在同一个服务里，会导致实时操作被离线操作拖累。
+
+```java
+// 支付服务：同步响应，延迟要求 < 100ms
+@Service
+public class PaymentService {
+    @Autowired private PaymentRepository paymentRepository;
+    @Autowired private KafkaTemplate kafkaTemplate;
+
+    public PaymentResult charge(String chargeId, Money amount) {
+        // 1. 幂等检查：防止重复扣款
+        Optional<Payment> existing = paymentRepository.findByChargeId(chargeId);
+        if (existing.isPresent()) {
+            return PaymentResult.fromPayment(existing.get());
+        }
+
+        // 2. 调用支付网关（实时，同步等待响应）
+        PaymentGatewayResult result = paymentGateway.authorize(
+            chargeId, amount, cardToken);
+
+        if (result.isSuccess()) {
+            // 3. 支付成功：保存记录
+            Payment payment = new Payment();
+            payment.setChargeId(chargeId);
+            payment.setAmount(amount);
+            payment.setStatus(PaymentStatus.AUTHORIZED);
+            payment.setGatewayTransactionId(result.getTransactionId());
+            paymentRepository.save(payment);
+
+            // 4. 发送异步事件：触发对账、通知等下游处理
+            kafkaTemplate.send("payment-events",
+                chargeId,
+                new PaymentAuthorizedEvent(chargeId, result.getTransactionId()));
+
+            return PaymentResult.success(payment);
+        } else {
+            return PaymentResult.failed(result.getErrorMessage());
+        }
+    }
+}
+
+// 对账服务：异步处理，不影响支付响应时间
+@Service
+public class ReconciliationService {
+
+    @KafkaListener(topics = "payment-events", groupId = "reconciliation")
+    public void onPaymentEvent(PaymentEvent event) {
+        switch (event.getType()) {
+            case "AUTHORIZED":
+                // 核验授权结果：确保 Stripe 和网关的记录一致
+                reconcileAuthorization(event.getChargeId());
+                break;
+            case "CAPTURED":
+                // 核对实际扣款金额
+                reconcileCapture(event.getChargeId());
+                break;
+            case "REFUNDED":
+                // 核对退款金额
+                reconcileRefund(event.getChargeId());
+                break;
+        }
+    }
+}
+```
+
+### 幂等性：支付的命门
+
+Stripe 支付系统的核心设计原则之一是**幂等性**——同一笔支付请求重复执行，结果必须相同。
+
+为什么幂等性如此重要？因为支付请求可能因为网络超时而失败，客户端会重试。如果支付系统不支持幂等，重试就会导致重复扣款。
+
+Stripe 的幂等性设计：
+
+```java
+// 幂等键：Stripe API 的核心参数
+// 客户端生成唯一 ID，同一 ID 的请求只执行一次
+public PaymentResult createCharge(CreateChargeRequest request) {
+    String idempotencyKey = request.getIdempotencyKey();
+
+    // 1. 检查幂等缓存（Redis）
+    Optional<PaymentResult> cached = idempotencyCache.get(idempotencyKey);
+    if (cached.isPresent()) {
+        return cached.get();  // 直接返回缓存结果
+    }
+
+    // 2. 检查数据库
+    Optional<Payment> existing = paymentRepository
+        .findByIdempotencyKey(idempotencyKey);
+    if (existing.isPresent()) {
+        return PaymentResult.fromPayment(existing.get());
+    }
+
+    // 3. 执行业务逻辑
+    try {
+        PaymentResult result = doCharge(request);
+
+        // 4. 保存幂等记录（原子操作）
+        idempotencyCache.set(idempotencyKey, result, Duration.ofHours(24));
+
+        return result;
+    } catch (PaymentGatewayException e) {
+        // 网关超时：返回错误，但不保存幂等记录
+        // 客户端重试时，幂等键相同，会重新尝试
+        throw e;
+    }
+}
+```
+
+## 第三阶段：全球化与 Ledger（2014-2017）
+
+### 为什么要自研 Ledger
+
+Stripe 的商业模式是**抽佣**：每笔支付收取 2.9% + 30¢ 的手续费。这意味着 Stripe 需要精确记录每笔资金的流向——用户付了多少钱、Stripe 扣了多少佣金、商家实收多少。
+
+这看起来是一个简单的减法题，但实际上非常复杂：
+
+- **多货币**：Stripe 支持 135 种货币，每笔支付涉及汇率换算
+- **退款**：用户退款后，Stripe 需要从商家账户扣回相应金额，同时退还佣金
+- **争议**：当用户发起信用卡争议（chargeback）时，Stripe 需要在商家账户扣回金额，同时扣除手续费
+- **提现**：商家提现时，Stripe 需要从银行账户转账，同时记录手续费
+
+这些操作如果用普通的关系数据库，需要大量的 JOIN 和事务，而且很难保证所有账户的余额之和为零。
+
+Stripe 的解决方案是**自研 Ledger 系统**——一个专门用于记录资金流向的系统，每次资金变动都会产生一条不可变的记账记录。
+
+### Ledger 的核心设计
+
+```java
+// Ledger 条目：不可变的资金变动记录
+public class LedgerEntry {
+    private final String id;                    // 唯一 ID
+    private final String transactionId;          // 关联的交易 ID
+    private final String accountId;             // 账户 ID
+    private final LedgerEntryType type;          // CREDIT/DEBIT
+    private final Money amount;                  // 金额
+    private final String currency;               // 货币
+    private final String currencyRate;           // 汇率（如果是换算）
+    private final String description;             // 描述
+    private final long timestamp;                // 时间戳
+    private final Map<String, String> metadata;  // 元数据
+}
+
+// 账户余额：所有 CREDIT 减去所有 DEBIT
+public class Account {
+    private final String id;
+    private final AccountType type;             // USER/MERCHANT/STRIPE_FEE/PLATFORM
+    private final String currency;
+
+    // 余额 = SUM(所有 CREDIT) - SUM(所有 DEBIT)
+    public Money getBalance() {
+        List<LedgerEntry> entries = ledger.getEntriesByAccount(id);
+        Money total = Money.zero(currency);
+        for (LedgerEntry entry : entries) {
+            if (entry.getType() == CREDIT) {
+                total = total.add(entry.getAmount());
+            } else {
+                total = total.subtract(entry.getAmount());
+            }
+        }
+        return total;
+    }
+}
+
+// 转账示例：用户支付 100 美元，商家实收 97.1 美元，Stripe 收 2.9 美元
+public void recordPayment(String chargeId, Money amount) {
+    // 1. 用户账户：+100 美元（CREDIT）
+    ledger.post(LedgerEntry.builder()
+        .transactionId(chargeId)
+        .accountId(userAccountId)
+        .type(CREDIT)
+        .amount(amount)
+        .description("User payment")
+        .build());
+
+    // 2. 商家账户：+97.1 美元（CREDIT）
+    ledger.post(LedgerEntry.builder()
+        .transactionId(chargeId)
+        .accountId(merchantAccountId)
+        .type(CREDIT)
+        .amount(amount.subtract(platformFee))
+        .description("Merchant payout")
+        .build());
+
+    // 3. Stripe 佣金账户：+2.9 美元（CREDIT）
+    ledger.post(LedgerEntry.builder()
+        .transactionId(chargeId)
+        .accountId(stripeFeeAccountId)
+        .type(CREDIT)
+        .amount(platformFee)
+        .description("Platform fee")
+        .build());
+
+    // 验证：余额之和为零（100 = 97.1 + 2.9）
+    assert ledger.getBalanceSum().equals(Money.zero("USD"));
+}
+```
+
+Ledger 的核心价值是**不可变性**——每条记录一旦写入就不可修改，只能追加新记录。这意味着任何资金变动都有完整的审计轨迹，出问题时可以精确还原。
+
+### 事件驱动架构
+
+Stripe 的系统通过事件驱动架构连接各个模块：
+
+```java
+// Stripe 的事件流：所有业务动作都会产生事件
+// 下游系统订阅自己需要的事件，独立处理
+
+// 用户订阅示例：监听支付成功事件
+@WebhookHandler(eventType = "payment_intent.succeeded")
+public void onPaymentSucceeded(PaymentIntentEvent event) {
+    // 发送收据
+    emailService.sendReceipt(event.getCustomerId(), event.getAmount());
+    // 更新 CRM
+    crmService.updateCustomerLifetimeValue(event.getCustomerId(), event.getAmount());
+    // 触发忠诚度计划
+    loyaltyService.awardPoints(event.getCustomerId(), event.getAmount());
+    // 更新分析数据
+    analyticsService.trackPayment(event.getCustomerId(), event.getAmount());
+}
+
+// 商家订阅示例：监听结算事件
+@WebhookHandler(eventType = "balance.available")
+public void onBalanceAvailable(BalanceEvent event) {
+    // 触发商家通知
+    notificationService.notifyMerchant(event.getMerchantId(),
+        "You have " + event.getAvailableAmount() + " available for payout");
+    // 触发自动提现（如果开启了）
+    if (autoPayoutEnabled) {
+        payoutService.initiatePayout(event.getMerchantId());
+    }
+}
+```
+
+## 架构启示
+
+### 启示一：金融系统的金额必须精确
+
+Stripe 的 Ledger 设计揭示了一个重要原则：**金融系统的金额计算必须精确到分，不能有任何浮点误差**。
+
+```java
+// 错误：使用 double 进行金额计算
+double amount = 19.99;
+double fee = amount * 0.029 + 0.30;  // 结果可能是 0.87971... 而不是 0.88
+double finalAmount = amount - fee;     // 累积误差极大
+
+// 正确：使用整数（以分为单位）或 BigDecimal
+// Stripe 的金额单位是「分」，不是「元」
+int amountCents = 1999;
+int feeCents = amountCents * 29 / 1000 + 30;  // 88 美分
+int finalAmountCents = amountCents - feeCents; // 1911 美分 = 19.11 美元
+```
+
+**对普通项目的建议**：任何涉及金钱的计算、存储、传输，都必须用整数（以分为单位）或 `BigDecimal`。绝对不要用 `double` 或 `float`。
+
+### 启示二：幂等性是支付系统的生命线
+
+Stripe 的幂等性设计是支付系统的标配。实现方式：
+
+1. **客户端生成幂等键**：UUID，保证同一操作不会重复生成
+2. **服务端检查幂等键**：已处理的请求直接返回缓存结果
+3. **幂等键过期时间**：24 小时足够覆盖所有可能的重试场景
+4. **网关超时的特殊处理**：网关返回超时时，不保存幂等记录，允许重试
+
+**建议**：幂等性设计要从 API 设计阶段就考虑，而不是出了问题再打补丁。
+
+### 启示三：Ledger 是金融系统的必备组件
+
+如果你在开发任何涉及资金流转的系统（如电商平台、虚拟货币、积分系统），Ledger 设计都是值得借鉴的。
+
+Ledger 的核心原则：
+
+- **不可变性**：每条记录只能追加，不能修改或删除
+- **双录**：每笔金额变动同��记录 CREDIT 和 DEBIT，余额之和始终为零
+- **审计性**：任何资金问题都可以通过重放 Ledger 记录来还原
+
+### 启示四：合规是进入金融行业的门票
+
+Stripe 在全球 150+ 个国家运营，每个国家都有自己的支付法规和合规要求。Stripe 投入了大量资源在合规团队和技术系统上。
+
+**建议**：如果你的业务涉及跨境支付或多货币结算，合规要从系统设计阶段就考虑，而不是等产品上线后再补。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| Patrick / John Collison | 人名 | Stripe 联合创始人，爱尔兰裔，19 岁和 21 岁时共同创办 Stripe |
+| PCI DSS | 技术名词 | Payment Card Industry Data Security Standard，支付卡行业数据安全标准，规定如何存储、传输、处理信用卡信息 |
+| KYC（Know Your Customer） | 技术名词 | 了解你的客户，金融机构必须验证用户身份的流程 |
+| AML（Anti-Money Laundering） | 技术名词 | 反洗钱，防止金融系统被用于洗钱的合规要求 |
+| Charge | 业务名词 | Stripe 的核心概念，代表一次支付请求，包含金额、货币、卡信息等 |
+| Capture | 业务名词 | 资金捕获，授权后正式从用户账户扣款 |
+| Chargeback | 业务名词 | 信用卡争议，用户向发卡行申诉未授权交易，发卡行从商家扣回资金 |
+| Authorization / Auth | 业务名词 | 授权，支付的第一阶段，冻结用户信用卡额度但不扣款 |
+| Clearing | 业务名词 | 清分，支付授权后，将交易信息发送给卡组织进行清分结算 |
+| Settlement | 业务名词 | 结算，资金从发卡行到达收单行，完成最终的资金转移 |
+| Ledger | 技术名词 | 账本系统，记录所有资金变动的不可变日志，保证资金流向可追溯 |
+| Idempotency Key | 技术名词 | 幂等键，客户端生成的唯一标识，保证同一请求重复执行只生效一次 |
+
+## 总结
+
+Stripe 是金融系统设计的标杆。它的技术演进始终围绕一个核心命题：**如何在保证资金安全的前提下，让支付变得像水和电一样简单**。
+
+**演进脉络**：
+
+- **2010-2012**：Ruby on Rails 单体，快速验证支付 API
+- **2012-2014**：异步化改造，支付与对账分离，引入 Kafka
+- **2014-2017**：自研 Ledger，全球化合规，多区域部署
+- **2017-至今**：AI 欺诈检测，平台化 Connect，高可用基础设施
+
+**核心技术亮点**：
+
+- **幂等性设计**：Idempotency Key 保证支付请求可安全重试
+- **Ledger 系统**：不可变账本，每次资金变动有完整审计轨迹
+- **事件驱动架构**：Webhooks 连接 Stripe 与商家系统，解耦业务逻辑
+- **异步处理**：支付与对账分离，保证支付响应延迟 < 100ms
+
+**对普通项目的启发**：
+
+- 金钱计算必须用整数（分）或 `BigDecimal`，不能用浮点数
+- 幂等性要从 API 设计阶段就考虑
+- 任何涉及资金流转的系统，都值得借鉴 Ledger 设计
+- 合规是进入金融行业的门票，要从系统设计阶段就考虑

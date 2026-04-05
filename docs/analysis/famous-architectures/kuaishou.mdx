@@ -1,0 +1,353 @@
+---
+title: 快手短视频架构
+description: 全球领先短视频平台的技术架构深度解析
+---
+
+# 快手短视频架构
+
+2011 年，快手创始人宿华和程一笑推出了快手 GIF——一个把视频转换成 GIF 动图的工具。那时候，智能手机刚刚普及，短视频还是一个小众市场。
+
+2013 年，快手转型为短视频社区，用户可以拍摄并分享 7 秒短视频。2016 年，快手开放了 57 秒短视频，DAU 突破 4000 万。2020 年，快手在美国纽交所上市，日活用户超过 **3 亿**。
+
+快手的故事，是一个典型的**技术驱动产品增长**的故事——它没有抖音那样激进的市场投放，而是靠着推荐算法和用户体验，在下沉市场积累了巨大的用户基础。
+
+理解快手技术挑战的关键，在于它的**短视频内容分发特性**：
+
+- **内容供给极丰富**：每天有超过 **1500 万条**新视频上传。
+- **用户消费极碎片化**：平均每个用户每天刷 **100+ 条**短视频。
+- **推荐精准度要求高**：用户对推荐不满意的容错窗口极小（刷几条不感兴趣就可能流失）。
+- **成本压力大**：视频存储和 CDN 带宽是最大的成本中心。
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **2011-2015** | GIF 转型期 | FFmpeg + Nginx + 简单推荐 | 短视频形态验证 |
+| **2015-2017** | 快手 57 秒期 | 视频处理流水线 + CDN + 粗排精排 | 内容爆发，推荐效率不足 |
+| **2017-2019** | 爆发增长期 | 实时特征工程 + 多目标推荐 + Kafka | 日活快速增长，特征工程瓶颈 |
+| **2019-2022** | 直播融合期 | 直播弹幕 + 实时互动 + CDN 分发 | 短视频 + 直播双增长 |
+| **2022-至今** | 大模型期 | 多模态推荐 + AIGC + 云原生 | 内容理解和生成的智能化 |
+
+## 第一阶段：从 GIF 到短视频（2011-2015）
+
+### 视频处理流水线
+
+快手的第一个技术挑战是**视频处理**——用户上传视频后，需要转码、截图、生成缩略图，才能在各个终端播放。
+
+```java
+// 视频处理流水线
+public class VideoProcessingPipeline {
+
+    // 用户上传完成后，触发处理流水线
+    public void onVideoUploaded(VideoUploadEvent event) {
+        String videoId = event.getVideoId();
+        String rawPath = event.getRawFilePath();
+
+        // 1. 异步转码：生成多种分辨率和码率
+        CompletableFuture.runAsync(() -> {
+            transcode(videoId, rawPath, "1080p", 5000);
+            transcode(videoId, rawPath, "720p", 2500);
+            transcode(videoId, rawPath, "480p", 1000);
+            transcode(videoId, rawPath, "360p", 500);
+        });
+
+        // 2. 截图：生成封面帧
+        CompletableFuture.runAsync(() -> {
+            String coverPath = ffmpeg.extractCover(rawPath, "00:01");
+            videoStore.setCover(videoId, coverPath);
+        });
+
+        // 3. 生成视频指纹（去重）
+        CompletableFuture.runAsync(() -> {
+            String fingerprint = videoFingerprint.compute(rawPath);
+            // 如果发现相似视频，标记为疑似搬运
+            checkDuplicate(videoId, fingerprint);
+        });
+
+        // 4. 审核（异步，不阻塞发布）
+        auditQueue.submit(videoId);
+    }
+
+    // 转码：使用 FFmpeg
+    private void transcode(String videoId, String input, String quality,
+                          int bitrate) {
+        String output = String.format("/storage/transcode/%s_%s.mp4",
+            videoId, quality);
+
+        // FFmpeg 命令行封装
+        String cmd = String.format(
+            "ffmpeg -i %s -b:v %dk -vf scale=-2:540 %s",
+            input, bitrate, output);
+
+        ProcessExecutor.execute(cmd);
+
+        // 5. 上传到 CDN
+        cdnUploader.upload(output, "videos/" + videoId + "_" + quality + ".mp4");
+    }
+}
+```
+
+### 早期推荐：内容为王
+
+快手早期的推荐策略相对简单——**内容质量为王**。
+
+视频质量由多个维度评估：播放量、点赞数、评论数、分享数、完播率。基于这些数据计算一个综合分数，再结合用户的兴趣标签进行推荐。
+
+## 第二阶段：推荐系统的工程化（2015-2017）
+
+### 召回与排序：两阶段推荐
+
+随着视频量和用户量爆发，单阶段排序无法满足需求。快手引入了**两阶段推荐架构**：
+
+```java
+// 两阶段推荐：召回 + 排序
+public class RecommendService {
+
+    @Autowired private CandidateGenerator candidateGenerator;
+    @Autowired private Ranker ranker;
+
+    public List<Video> recommend(Long userId, int count) {
+        // 1. 召回阶段：从千万级视频库中召回 1000 条候选
+        long start = System.nanoTime();
+        List<Long> candidateIds = candidateGenerator.generate(userId, 1000);
+
+        // 2. 排序阶段：对 1000 条候选打分，取 Top N
+        List<Video> ranked = ranker.rank(userId, candidateIds);
+
+        long latency = (System.nanoTime() - start) / 1_000_000;
+        metrics.record("recommend.latency_ms", latency);
+
+        return ranked.subList(0, Math.min(count, ranked.size()));
+    }
+}
+
+// 召回阶段：多种召回策略并行
+@Service
+public class CandidateGenerator {
+
+    public List<Long> generate(Long userId, int targetCount) {
+        List<Long> candidates = new ArrayList<>();
+
+        // 策略 1：关注人最新视频
+        candidates.addAll(followingRecall(userId, targetCount / 5));
+
+        // 策略 2：同类目热门视频
+        candidates.addAll(categoryHotRecall(userId, targetCount / 5));
+
+        // 策略 3：协同过滤召回
+        candidates.addAll(cfRecall(userId, targetCount / 5));
+
+        // 策略 4：热门视频（全局热度）
+        candidates.addAll(globalHotRecall(targetCount / 5));
+
+        // 策略 5：相似内容召回
+        candidates.addAll(contentBasedRecall(userId, targetCount / 5));
+
+        // 去重 + 截断
+        return candidates.stream()
+            .distinct()
+            .limit(targetCount)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### CDN 分发：就近观看
+
+短视频的观看体验高度依赖 CDN。快手的 CDN 架构覆盖全国，有数千个 CDN 节点，用户观看时自动调度到最近节点。
+
+```java
+// CDN 调度：就近分配
+public class CdnSelector {
+
+    // 根据用户位置，分配最优 CDN 节点
+    public CdnNode selectCdnNode(Long userId, String videoId) {
+        // 1. 获取用户地理位置
+        GeoLocation location = geoService.locateUser(userId);
+
+        // 2. 获取视频源站位置（通常在 CDN 源站附近）
+        String origin = videoStore.getSource(videoId);
+
+        // 3. 选择最优 CDN 节点
+        // 优先：同省份 CDN > 同区域 CDN > 全国 CDN
+        List<CdnNode> candidates = cdnRegistry.getNodes();
+
+        return candidates.stream()
+            .filter(n -> n.isHealthy() && n.hasVideo(videoId))
+            .min(Comparator.comparingDouble(n ->
+                distance(n.getLocation(), location)))
+            .orElseGet(() -> fallbackToOrigin(origin));
+    }
+}
+```
+
+## 第三阶段：多目标推荐（2017-2019）
+
+### 为什么需要多目标优化
+
+单一的点击率（CTR）优化，会导致推荐结果趋向于「标题党」——有吸引力的封面和标题会获得更多点击，但实际内容质量并不高。
+
+快手的多目标推荐，同时优化以下目标：
+
+- **点击率（CTR）**：用户是否点击视频
+- **播放率（VTR）**：点击后是否开始播放
+- **完播率**：是否完整观看
+- **互动率**：是否点赞、评论、分享
+- **关注率**：是否关注作者
+
+```java
+// 多目标推荐：帕累托最优
+@Service
+public class MultiObjectiveRanker {
+
+    // MMOE：Multi-gate Mixture-of-Experts
+    // 多个任务共享底层特征，每个任务有独立的门控网络
+
+    public List<VideoScore> rank(Long userId, List<Long> videoIds) {
+        // 1. 获取用户特征和视频特征
+        UserFeatures userFeatures = featureStore.getUserFeatures(userId);
+        List<VideoFeatures> videoFeatures = featureStore.getVideoFeatures(videoIds);
+
+        // 2. 共享底层表达
+        List<DenseTensor> sharedEmbeddings = sharedTower.forward(
+            userFeatures, videoFeatures);
+
+        // 3. 每个目标独立预测
+        double ctrScore = ctrTower.forward(sharedEmbeddings);
+        double vtrScore = vtrTower.forward(sharedEmbeddings);
+        double likeScore = likeTower.forward(sharedEmbeddings);
+        double commentScore = commentTower.forward(sharedEmbeddings);
+        double shareScore = shareTower.forward(sharedEmbeddings);
+        double followScore = followTower.forward(sharedEmbeddings);
+
+        // 4. 加权融合（权重由线上实验决定）
+        double finalScore =
+            ctrScore * 0.15 +
+            vtrScore * 0.25 +
+            likeScore * 0.15 +
+            commentScore * 0.10 +
+            shareScore * 0.15 +
+            followScore * 0.20;
+
+        return IntStream.range(0, videoIds.size())
+            .mapToObj(i -> new VideoScore(videoIds.get(i), finalScore))
+            .sorted(Comparator.comparingDouble(VideoScore::getScore).reversed())
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 第四阶段：直播融合（2019-2022）
+
+### 直播弹幕的实时处理
+
+快手的直播业务与短视频并行增长。直播的最大技术挑战是**弹幕实时性**——用户发的弹幕必须在秒级内显示在屏幕上。
+
+```java
+// 直播弹幕服务：Kafka + Flink 实时处理
+@Service
+public class LiveDanmuService {
+
+    // 生产者：用户发送弹幕
+    public void sendDanmu(Long userId, Long roomId, String content) {
+        Danmu danmu = new Danmu();
+        danmu.setUserId(userId);
+        danmu.setRoomId(roomId);
+        danmu.setContent(content);
+        danmu.setTimestamp(System.currentTimeMillis());
+
+        // 发送到 Kafka
+        kafkaTemplate.send("live-danmu", roomId.toString(), danmu);
+    }
+
+    // 消费者：实时处理弹幕
+    @Service
+    public class DanmuProcessor {
+
+        @KafkaListener(topics = "live-danmu", groupId = "danmu-processor")
+        public void process(Danmu danmu) {
+            // 1. 内容安全审核
+            if (!contentModerator.isSafe(danmu.getContent())) {
+                return;  // 不安全弹幕直接丢弃
+            }
+
+            // 2. 过滤违禁词
+            String filtered = wordFilter.filter(danmu.getContent());
+
+            // 3. 限流：每个房间每分钟最多显示 N 条弹幕
+            if (!rateLimiter.tryAcquire(danmu.getRoomId())) {
+                return;  // 超过频率限制，丢弃
+            }
+
+            // 4. 广播到在线用户（通过 WebSocket）
+            broadcastService.broadcast(danmu.getRoomId(), filtered);
+        }
+    }
+}
+```
+
+## 架构启示
+
+### 启示一：推荐系统是短视频平台的核心
+
+快手和抖音的核心差异，不是产品形态，而是**推荐策略**。快手的推荐更偏向「普惠」——让更多普通创作者的作品被看到，而不只是推荐头部大 V。
+
+这背后的技术实现是**流量分配的公平性算法**——不只是优化用户体验，还要考虑创作者的发作品积极性。
+
+### 启示二：CDN 是视频平台的生命线
+
+视频播放的卡顿率是用户体验的核心指标。CDN 的覆盖密度和调度准确性，直接影响卡顿率。
+
+CDN 选型建议：
+
+- **全国覆盖**：确保每个省份都有 CDN 节点
+- **智能调度**：根据用户位置、网络状况、CDN 负载综合选择节点
+- **回源优化**：CDN 缓存未命中时，回源速度要快
+
+### 启示三：多目标优化要找准核心指标
+
+多目标优化的问题是**目标之间的权衡**。点击率高的内容，不一定是完播率高的内容。
+
+快手的经验是**核心指标要明确**。快手的核心指标是「有效观看时长」——不是播放就计数，而是看完超过一定时长才算有效观看。这个指标过滤掉了标题党，引导推荐系统推荐真正有价值的内容。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| 宿华 | 人名 | 快手创始人兼 CEO，1982 年生于湖南，2011 年与程一笑共同创办快手 |
+| 程一笑 | 人名 | 快手联合创始人，曾在人人网工作，2011 年创办快手 GIF |
+| CDN（Content Delivery Network） | 技术名词 | 内容分发网络，通过在全球部署缓存节点，让用户就近获取视频内容 |
+| FFmpeg | 技术名词 | 开源多媒体处理工具，用于视频转码、截图、裁剪等处理 |
+| 召回（Recall） | 技术名词 | 从海量候选集中快速筛选出潜在感兴趣内容的阶段 |
+| 排序（Rank） | 技术名词 | 对召回的候选集进行精细化评分和排序的阶段 |
+| CTR（Click-Through Rate） | 技术名词 | 点击率，衡量推荐内容被点击的比例 |
+| VTR（View-Through Rate） | 技术名词 | 播放率，点击后实际开始播放的比例 |
+| MMOE | 技术名词 | Multi-gate Mixture-of-Experts，多门混合专家网络，用于多目标学习 |
+| 弹幕 | 技术名词 | 叠加在视频上的实时评论，直播和视频的互动形式 |
+| 视频指纹 | 技术名词 | 对视频内容提取的唯一标识，用于去重和相似度检测 |
+
+## 总结
+
+快手的技术演进，始终围绕一个核心命题：**如何在海量内容中，让每个用户都看到自己最想看的那条视频**。
+
+**演进脉络**：
+
+- **2011-2015**：GIF 转型视频，FFmpeg 处理流水线
+- **2015-2017**：两阶段推荐，召回 + 排序，CDN 分发
+- **2017-2019**：多目标推荐，MMOE，同时优化 CTR/VTR/互动率
+- **2019-2022**：直播融合，Kafka + Flink 实时弹幕
+- **2022-至今**：多模态大模型，AIGC 内容理解与生成
+
+**核心技术亮点**：
+
+- **两阶段推荐**：召回（1000 候选）+ 排序（精细评分）
+- **多目标优化**：MMOE 网络，同时优化点击/播放/互动/关注
+- **FFmpeg 视频处理**：异步流水线，多分辨率转码
+- **CDN 智能调度**：就近分配，降低卡顿率
+
+**对普通项目的启发**：
+
+- 推荐策略优化比技术架构升级的 ROI 更高
+- CDN 是视频平台的生命线，要优先建设
+- 多目标优化要找准核心指标，避免目标之间的冲突
+- 内容安全审核要前置，不能让劣质内容影响用户体验

@@ -1,0 +1,380 @@
+---
+title: 滴滴出行架构
+description: 中国最大出行平台的实时调度与供需匹配架构深度解析
+---
+
+# 滴滴出行架构
+
+2012 年 6 月，程维在北京中关村的一间软件园办公室里，创办了滴滴出行。那时候，快的打车已经在杭州上线，滴滴和快的在接下来两年里展开了一场史诗级的补贴大战——烧掉了数十亿人民币，教育了整个中国市场什么是「网约车」。
+
+补贴大战结束后，滴滴和快的在 2015 年合并，又在 2016 年合并了 Uber 中国，成为中国出行市场的绝对霸主。
+
+但技术上的挑战远没有补贴大战那么简单：每天处理数千万订单，高峰期每秒处理数万次叫车请求，同时为百万司机和数亿用户提供匹配服务——这背后是一套极其复杂的实时调度系统。
+
+## 公司画像
+
+滴滴出行是全球最大的出行平台之一，覆盖中国 **400 多个城市**，拥有超过 **5000 万注册司机**，日均订单超过 **3000 万**。业务涵盖快车、专车、出租车、顺风车、代驾、货运等多个品类。
+
+理解滴滴技术挑战的关键，在于它的**实时调度特性**：
+
+- **秒级匹配**：用户叫车后，等待时间超过 30 秒就会焦虑，调度系统必须在几秒内完成匹配。
+- **供需动态波动**：早晚高峰、雨雪天气、大型活动，供需关系在分钟级别内剧烈变化。
+- **多目标优化**：不只是让用户打到车，还要考虑司机收入、平台抽成、用户体验多个目标。
+- **全局最优 vs 局部最优**：每次匹配不仅考虑当前订单，还要考虑对后续订单的影响。
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **2012-2014** | 补贴大战期 | PHP + MySQL + 简单派单 | 快速上线，抢占市场 |
+| **2014-2016** | 合并扩张期 | Java 微服务 + HBase + Redis | 规模化后系统重构 |
+| **2016-2019** | 智能化期 | 机器学习派单 + 需求预测 + 拼车 | 补贴退潮，效率优先 |
+| **2019-至今** | 自动驾驶期 | 自动驾驶融合调度 + 云原生 | 自动驾驶时代的多车调度 |
+
+## 第一阶段：补贴大战的粗放期（2012-2014）
+
+### 起步：简单派单
+
+滴滴最初的功能只有一个：出租车叫车。用户发单，系统推送给附近司机，司机接单。
+
+早期的派单逻辑极其简单——**按距离排序**，把订单推送给最近的司机：
+
+```java
+// 早期派单：最近司机优先
+public class SimpleDispatchService {
+
+    public DispatchResult dispatch(Order order) {
+        Location userLocation = order.getUserLocation();
+
+        // 1. 查询附近 5km 内的司机
+        List<Driver> nearbyDrivers = driverService.findNearby(
+            userLocation.getLat(),
+            userLocation.getLng(),
+            5000  // 5km
+        );
+
+        // 2. 按距离排序
+        nearbyDrivers.sort(Comparator.comparingDouble(
+            d -> distance(d.getLocation(), userLocation)));
+
+        // 3. 推送给最近的司机
+        for (Driver driver : nearbyDrivers) {
+            boolean accepted = pushToDriver(driver, order);
+            if (accepted) {
+                return DispatchResult.success(driver.getId());
+            }
+            // 司机拒单，继续推下一个
+        }
+
+        return DispatchResult.noDriverAvailable();
+    }
+}
+```
+
+这个策略的问题很快暴露：**只考虑距离，不考虑其他因素**。司机的接单意愿、当前状态（是否在送客中）、是否顺路，都没有被考虑。
+
+## 第二阶段：规模化与重构（2014-2016）
+
+### 合并后的技术整合
+
+2015 年滴滴快的合并，2016 年合并 Uber 中国，每次合并都带来巨大的技术整合压力：
+
+- 两家公司的技术栈完全不同（滴滴用 Java，快的用 Python）
+- 两家公司的用户和司机数据需要合并
+- 系统需要支撑更大的并发量
+
+这个阶段，滴滴做了全面的**微服务化改造**，统一技术栈到 Java。
+
+### 订单状态机
+
+出行订单是一个典型的**状态机**——每个订单从创建到完成，要经历一系列明确的状态转换。
+
+```java
+// 订单状态机
+public class OrderStateMachine {
+
+    public static enum OrderStatus {
+        CREATED,        // 用户下单
+        DISPATCHING,    // 系统派单中
+        DRIVER_ACCEPTED, // 司机接单
+        DRIVER_ARRIVED,  // 司机到达
+        TRIP_STARTED,    // 行程开始
+        TRIP_COMPLETED,  // 行程结束
+        CANCELLED,      // 取消
+        CLOSED          // 订单关闭（已付款）
+    }
+
+    // 状态转换规则
+    public boolean canTransition(OrderStatus from, OrderStatus to) {
+        Map<OrderStatus, Set<OrderStatus>> transitions = Map.of(
+            CREATED, Set.of(DISPATCHING, CANCELLED),
+            DISPATCHING, Set.of(DRIVER_ACCEPTED, CANCELLED),
+            DRIVER_ACCEPTED, Set.of(DRIVER_ARRIVED, CANCELLED),
+            DRIVER_ARRIVED, Set.of(TRIP_STARTED, CANCELLED),
+            TRIP_STARTED, Set.of(TRIP_COMPLETED),
+            TRIP_COMPLETED, Set.of(CLOSED),
+            CANCELLED, Set.of(),
+            CLOSED, Set.of()
+        );
+        return transitions.get(from).contains(to);
+    }
+
+    // 执行状态转换
+    public void transition(Order order, OrderStatus to) {
+        if (!canTransition(order.getStatus(), to)) {
+            throw new IllegalStateException(
+                "Cannot transition from " + order.getStatus() + " to " + to);
+        }
+
+        OrderStatus from = order.getStatus();
+        order.setStatus(to);
+        order.setUpdatedAt(System.currentTimeMillis());
+
+        // 持久化
+        orderRepository.save(order);
+
+        // 发布领域事件
+        eventBus.publish(new OrderStatusChangedEvent(order.getId(), from, to));
+    }
+}
+```
+
+### Redis 缓存热点数据
+
+叫车场景的读操作远多于写操作——用户每次刷新界面，都在查询附近司机。滴滴大量使用 Redis 缓存热点数据：
+
+```java
+// 司机位置缓存：Redis GEO
+@Service
+public class DriverLocationService {
+
+    private static final String GEO_KEY = "driver:locations";
+    private static final String AVAIL_KEY = "driver:available:";
+
+    // 司机位置上报（每 5 秒一次）
+    public void updateLocation(Long driverId, double lng, double lat) {
+        // GEOADD：更新司机地理位置
+        redisTemplate.opsForGeo().add(GEO_KEY, new Point(lng, lat), driverId.toString());
+
+        // 标记可用：带 2 分钟过期时间
+        String availKey = AVAIL_KEY + driverId;
+        redisTemplate.opsForValue().set(availKey, "1", Duration.ofMinutes(2));
+    }
+
+    // 查询附近可用司机
+    public List<Driver> findNearbyAvailable(double lng, double lat, double radiusMeters) {
+        // 1. 查询附近所有司机
+        Circle circle = new Circle(new Point(lng, lat),
+            new Distance(radiusMeters, MetricsUnit.METERS));
+        GeoResults<GeoLocation<String>> results =
+            redisTemplate.opsForGeo().radius(GEO_KEY, circle);
+
+        if (results == null) return Collections.emptyList();
+
+        // 2. 过滤出可用司机
+        return results.getContent().stream()
+            .filter(r -> {
+                String key = AVAIL_KEY + r.getContent().getName();
+                return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+            })
+            .map(r -> {
+                Long driverId = Long.parseLong(r.getContent().getName());
+                return driverService.findById(driverId);
+            })
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 第三阶段：智能化调度（2016-2019）
+
+### 机器学习派单：综合评分
+
+2016 年，滴滴上线了**机器学习派单**系统，不再只按距离排序，而是综合考虑多个因素计算每个司机的派单分数。
+
+```java
+// 机器学习派单：综合评分
+@Service
+public class MLDispatchService {
+
+    @Autowired private MLModel rankModel;
+    @Autowired private DriverService driverService;
+    @Autowired private DemandService demandService;
+
+    public DispatchDecision dispatch(Order order) {
+        Location pickup = order.getPickupLocation();
+
+        // 1. 获取候选司机（附近 5km 内）
+        List<Driver> candidates = driverService.findNearby(
+            pickup.getLat(), pickup.getLng(), 5000);
+
+        // 2. 构造特征
+        List<CandidateFeature> features = candidates.stream()
+            .map(driver -> buildFeature(driver, order))
+            .collect(Collectors.toList());
+
+        // 3. 模型打分（批量预测，节省 RPC 调用）
+        List<Double> scores = rankModel.predict(features);
+
+        // 4. 选择分数最高的司机
+        int bestIdx = 0;
+        double bestScore = scores.get(0);
+        for (int i = 1; i < scores.size(); i++) {
+            if (scores.get(i) > bestScore) {
+                bestScore = scores.get(i);
+                bestIdx = i;
+            }
+        }
+
+        // 5. 推送并确认
+        return dispatchToDriver(order, candidates.get(bestIdx));
+    }
+
+    private CandidateFeature buildFeature(Driver driver, Order order) {
+        return CandidateFeature.builder()
+            // 距离特征
+            .distanceToPickup(distance(driver.getLocation(), order.getPickupLocation()))
+            .distanceToDestination(distance(driver.getLocation(), order.getDestination()))
+            // 供需特征
+            .supplyDemandRatio(demandService.getSupplyDemandRatio(order.getPickupLocation()))
+            .currentDriverDensity(driverService.countNearby(order.getPickupLocation(), 3000))
+            // 司机特征
+            .driverAcceptRate(driver.getAcceptRate())
+            .driverRating(driver.getRating())
+            .driverCancellationRate(driver.getCancellationRate())
+            .driverActiveHours(driver.getActiveHoursToday())
+            // 顺路特征
+            .detourDistance(calculateDetour(driver, order))
+            .directionMatch(calculateDirectionMatch(driver, order))
+            .build();
+    }
+}
+```
+
+### 需求预测与动态调度
+
+滴滴的需求预测系统，会预测接下来 30 分钟内各区域的出行需求，提前引导司机前往热点区域，减少用户的等待时间。
+
+```java
+// 需求预测：提前引导司机
+@Service
+public class DemandForecastService {
+
+    // 预测未来 30 分钟的出行需求（按网格）
+    public Map<GridCell, Double> forecastDemand30min() {
+        Map<GridCell, Double> forecast = new HashMap<>();
+
+        for (GridCell cell : allCells) {
+            // 历史数据：上周同期、同昨天同期
+            double historyAvg = getHistoryAverage(cell);
+
+            // 实时修正：当前需求相对历史的倍数
+            double realTimeFactor = getRealTimeFactor(cell);
+
+            // 外部因素：天气、节假日、大型活动
+            double externalFactor = externalFactorService.getFactor(cell);
+
+            // 综合预测
+            double forecastValue = historyAvg * realTimeFactor * externalFactor;
+            forecast.put(cell, forecastValue);
+        }
+
+        return forecast;
+    }
+
+    // 发送引导：告诉司机哪些区域需求高
+    public void sendGuidance(Long driverId) {
+        Map<GridCell, Double> forecast = forecastDemand30min();
+
+        // 找出预测需求最高的前 3 个区域
+        List<GridCell> hotSpots = forecast.entrySet().stream()
+            .sorted(Map.Entry.<GridCell, Double>comparingByValue().reversed())
+            .limit(3)
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toList());
+
+        if (!hotSpots.isEmpty()) {
+            notificationService.pushGuidance(driverId, hotSpots);
+        }
+    }
+}
+```
+
+## 第四阶段：自动驾驶融合调度（2019-至今）
+
+### 自动驾驶与有人驾驶的混合调度
+
+2019 年后，滴滴开始布局自动驾驶（Robotaxi）。这带来了全新的技术挑战：**如何让自动驾驶车辆和有人驾驶车辆共存于同一个调度平台**。
+
+两者的调度逻辑差异很大：
+
+- **有人驾驶**：需要考虑司机体验、收入公平、拒单意愿
+- **自动驾驶**：不考虑体验，但有电量限制、区域限制、速度限制
+
+滴滴的解决方案是**统一的调度引擎**，根据不同的车辆类型和当前状态，选择最优的派单策略。
+
+## 架构启示
+
+### 启示一：派单策略比技术选型更重要
+
+滴滴早期用的是 PHP + MySQL，后来才换成 Java + HBase。但真正提升用户体验的，不是技术栈升级，而是**派单策略的智能化**。
+
+机器学习派单上线后，用户的平均等待时间缩短了 15%，司机的接单率提升了 10%。这些改进不需要换数据库，只需要换一个算法。
+
+**建议**：在投入资源做技术架构升级之前，先审视业务策略是否有优化空间。很多时候，策略优化比技术优化的 ROI 更高。
+
+### 启示二：供需匹配是出行平台的核心
+
+出行平台的核心矛盾是**供需错配**——用户叫车的时候往往没车，有车的时候往往没用户。
+
+滴滴的解决方案是**动态调节**：
+
+- **价格调节**：高峰期涨价，吸引更多司机出车
+- **引导调节**：提前预测热点，引导司机前往
+- **拼车调节**：一个司机同时接多个乘客，提升利用率
+
+**建议**：供需错配是平台型业务的本质问题，没有一劳永逸的解决方案，需要持续优化。
+
+### 启示三：状态机是复杂业务的核心
+
+出行订单的状态转换非常复杂，涉及用户、司机、平台三个参与方。清晰的**状态机设计**，是防止状态错乱的关键。
+
+**建议**：对于涉及多个参与方、有复杂状态转换的业务（如订单、支付、工单），从第一天就设计好状态机，不要用 if-else 硬编码状态逻辑。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| 程维 | 人名 | 滴滴出行创始人兼 CEO，1983 年生于江西上饶，曾在阿里任职，2012 年创办滴滴 |
+| 柳青 | 人名 | 滴滴出行总裁，柳传志之女，2014 年加入滴滴，主导了滴滴快的合并和 Uber 中国合并 |
+| 派单策略 | 技术名词 | 根据订单和司机特征，决定将订单分配给哪个司机的算法 |
+| 供需匹配 | 技术名词 | 在特定时空条件下，匹配服务供给（司机）和需求（乘客） |
+| 动态定价 | 技术名词 | 根据实时供需关系，自动调整服务价格的机制 |
+| 拼车 | 技术名词 | 多个乘客共享同一辆车，分别支付各自费用的出行方式 |
+| Robotaxi | 技术名词 | 自动驾驶出租车，无人驾驶的网约车 |
+| 司乘体验 | 技术名词 | 司机和乘客使用平台的整体感受，包括等待时间、接驾体验等 |
+
+## 总结
+
+滴滴的技术演进，始终围绕一个核心命题：**如何在秒级时间内，把最合适的司机匹配给最需要的乘客**。
+
+**演进脉络**：
+
+- **2012-2014**：简单派单，最近司机优先
+- **2014-2016**：微服务化，Redis GEO，订单状态机
+- **2016-2019**：机器学习派单，需求预测，拼车优化
+- **2019-至今**：自动驾驶融合调度，多车型混合派单
+
+**核心技术亮点**：
+
+- **机器学习派单**：综合距离、供需、司机特征多维度评分
+- **需求预测**：基于历史 + 实时 + 外部因素，提前引导司机
+- **Redis GEO**：高并发查询附近司机，每秒处理数十万次
+- **订单状态机**：清晰的状态转换规则，防止状态错乱
+
+**对普通项目的启发**：
+
+- 派单策略优化往往比技术升级的 ROI 更高
+- 供需错配是平台型业务的本质问题，需要持续优化
+- 复杂业务要用状态机管理，不要用 if-else 硬编码
+- 实时性要求高的系统，要做好 Redis 等缓存层的容量规划

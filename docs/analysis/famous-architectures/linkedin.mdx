@@ -1,0 +1,318 @@
+---
+title: LinkedIn 架构
+description: 全球最大职业社交网络的技术架构深度解析
+---
+
+# LinkedIn 架构
+
+2002 年底， Reid Hoffman 在 Peter Thiel 的公寓里，和几个斯坦福校友一起创办了 LinkedIn。那时候 MySpace 已经如日中天，Facebook 刚刚起步，社交网络赛道看起来已经被占满了。
+
+Reid 的判断是：「职场社交和娱乐社交是不同的。人们在娱乐社交上愿意暴露自己的私人生活，但在职场社交上，他们需要一个更专业、更可控的形象。这意味着，Facebook 做不了 LinkedIn 的事。」
+
+这个判断在二十年后来看是对的。但很少有人知道，LinkedIn 对整个分布式系统领域的贡献，远不止一个职业社交平台——**LinkedIn 是 Kafka 的诞生地，也是众多大数据基础设施的思想源头**。
+
+## 公司画像
+
+LinkedIn 是全球最大的职业社交网络，截至 2024 年拥有超过 **10 亿注册用户**，覆盖 200 多个国家和地区。LinkedIn 的商业模式以招聘解决方案（Recruiter、Job Ads）为主，是微软旗下最重要的 SaaS 产品之一。
+
+理解 LinkedIn 技术挑战的关键，在于它的**社交图谱特性**：
+
+- **六度人脉**：LinkedIn 最核心的价值是「二度人脉」——你认识的人能帮你连接到你想认识的人。这个价值来源于完整的社交图谱，数据一旦丢失，整个产品价值就归零。
+- **关系动态变化**：用户的职位、公司、行业会不断变化，旧数据不能删除（历史记录有价值），新数据需要实时更新。
+- **多角色用户**：求职者、招聘方、内容创作者、广告主，不同角色的数据模型和访问模式差异极大。
+- **B2B 业务的 SLA**：LinkedIn 的招聘产品是企业付费的，SLA 要求极高，任何停机都会触发大额赔偿。
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **2002-2006** | LAMP 单体起步 | PHP + MySQL | 快速验证职业社交模型 |
+| **2006-2010** | 数据爆发期 | Kafka + Voldemort + Espresso | 关系数据增长，关系数据库无法支撑 |
+| **2010-2015** | 实时化改造 | Samza + Apache Storm + Graph computin | 人脉推荐、Feed 流实时性需求 |
+| **2015-至今** | 平台化与 AI | AI 推荐 + REST.li + Proxygen | 智能化运营，全球化扩展 |
+
+## 第一阶段：LAMP 单体（2002-2006）
+
+### 起步：最小化验证
+
+LinkedIn 创立之初，团队只有 7 个人，技术栈选择了最保守的方案：PHP + MySQL，跑在几台 Dell 服务器上。这个选择没有错——早期最重要的是验证「职场社交」这个需求是否真实存在，而不是用什么数据库。
+
+2003 年初，LinkedIn 开放注册，到年底注册用户突破 10 万。那时候 MySQL 还撑得住，但工程师已经开始担心：如果用户增长到 100 万、1000 万，现有架构怎么办？
+
+### 第一个技术负债：关系数据的存储
+
+LinkedIn 最早的数据模型，是一个标准的「用户-连接」表：
+
+```sql
+CREATE TABLE connections (
+    user_id BIGINT NOT NULL,
+    connected_user_id BIGINT NOT NULL,
+    connected_at DATETIME NOT NULL,
+    PRIMARY KEY (user_id, connected_user_id),
+    INDEX idx_connected_user (connected_user_id)
+);
+```
+
+这个模型的问题很快暴露出来：
+
+- **查询一度人脉**：简单，索引能覆盖
+- **查询二度人脉**：需要 JOIN 两次，10 万用户时已经非常慢
+- **查询三度人脉**：JOIN 三次，MySQL 直接超时
+
+而 LinkedIn 最核心的功能——「你可能认识的人」，本质上是三度人脉查询。如果每次点开「你可能认识的人」，都要等 10 秒才能出结果，用户早就跑了。
+
+## 第二阶段：数据爆发期（2006-2010）
+
+### Kafka 的诞生
+
+2007 年，LinkedIn 的工程师 Jay Kreps（后创办 Confluent）在内部开发了一个消息队列系统，最初叫「Kafka」，目标是解决 LinkedIn 内部各个系统之间的异步通信问题。
+
+那时候 LinkedIn 的数据流已经非常复杂：
+
+- 用户行为数据（页面浏览、点击、搜索）需要流向多个下游系统
+- 搜索索引需要实时更新
+- 推荐系统需要实时计算用户特征
+- 数据仓库需要离线分析
+
+每个下游系统都直接连到主数据库拉数据，主数据库不堪重负。
+
+Jay Kreps 的设计灵感来自一个简单的观察：**数据库是用来存储数据的，而不是用来传输数据的。把数据流当作一等公民，单独处理**。
+
+```java
+// Kafka 生产者：用户行为事件发布
+public class UserActivityProducer {
+
+    private final KafkaProducer<String, UserActivityEvent> producer;
+
+    public void onPageView(Long userId, String pageUrl, long timestamp) {
+        UserActivityEvent event = new UserActivityEvent();
+        event.setEventType("PAGE_VIEW");
+        event.setUserId(userId);
+        event.setPageUrl(pageUrl);
+        event.setTimestamp(timestamp);
+        event.setSessionId(getCurrentSessionId());
+
+        // 发送到 Kafka Topic
+        // 同一个用户的事件发送到同一个 Partition（保证顺序）
+        producer.send(new ProducerRecord<>(
+            "user-activity",
+            userId.toString(),  // key：用于 Partition 路由
+            event
+        ));
+    }
+
+    public void onConnectionMade(Long userId, Long connectedUserId) {
+        UserActivityEvent event = new UserActivityEvent();
+        event.setEventType("CONNECTION_MADE");
+        event.setUserId(userId);
+        event.setTargetUserId(connectedUserId);
+        event.setTimestamp(System.currentTimeMillis());
+
+        producer.send(new ProducerRecord<>(
+            "user-activity",
+            userId.toString(),
+            event
+        ));
+    }
+}
+
+// Kafka 消费者：搜索索引更新
+public class SearchIndexConsumer {
+
+    @KafkaListener(topics = "user-activity", groupId = "search-indexer")
+    public void onUserActivity(UserActivityEvent event) {
+        switch (event.getEventType()) {
+            case "PAGE_VIEW":
+                // 更新用户搜索偏好索引
+                searchIndexService.updateUserPreferences(
+                    event.getUserId(), event.getPageUrl());
+                break;
+            case "CONNECTION_MADE":
+                // 重建用户的社交图谱索引
+                searchIndexService.rebuildSocialIndex(event.getUserId());
+                break;
+            case "PROFILE_UPDATE":
+                // 重新索引用户简历
+                searchIndexService.reindexProfile(event.getUserId());
+                break;
+        }
+    }
+}
+```
+
+2011 年，LinkedIn 将 Kafka 开源，2012 年成为 Apache 顶级项目。如今，Kafka 已经是全球使用最广泛的分布式流处理平台，日处理消息量超过 7 万亿条。
+
+### Espresso：LinkedIn 自研的分布式数据库
+
+LinkedIn 存储用户简历、公司信息等结构化数据，使用的是自研的 NoSQL 数据库 **Espresso**。
+
+Espresso 的核心设计：
+
+- **Multi-Version Concurrency Control（MVCC）**：支持读写并发，读操作不会阻塞写操作
+- **自动分片**：按主键哈希分片，支持在线扩容
+- **二级索引**：支持在任意字段上建索引，不用每次都全表扫描
+- **跨机房复制**：数据在多个机房间同步，保证高可用
+
+```java
+// Espresso 数据模型：用户简历
+public class ProfileStore {
+
+    private final EspressoClient client;
+
+    // 读取用户简历
+    public Profile getProfile(Long userId) {
+        ReadResult result = client.get(
+            "profiles",           // 表名
+            userId.toString(),    // 主键
+            "id, headline, summary, skills, experiences"
+        );
+
+        return deserialize(result.getColumns());
+    }
+
+    // 更新用户简历（MVCC 支持幂等更新）
+    public void updateHeadline(Long userId, String newHeadline) {
+        // 乐观锁：基于 version 字段防止并发写冲突
+        client.update("profiles",
+            userId.toString(),
+            new ColumnUpdate("headline", newHeadline),
+            new ColumnUpdate("version", currentVersion + 1)
+        );
+    }
+
+    // 搜索：按技能关键词查询用户
+    public List<Long> searchBySkill(String skill, int limit) {
+        // 二级索引查询
+        ScanResult result = client.scan(
+            "profiles",
+            new IndexRangeQuery("skills_index", skill),
+            limit
+        );
+
+        return result.getKeys().stream()
+            .map(Long::parseLong)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 第三阶段：实时化改造（2010-2015）
+
+### Samza：流处理框架
+
+Kafka 解决了数据传输问题，但数据计算仍然需要另外的工具。LinkedIn 在 2013 年开源了 **Samza**，一个与 Kafka 深度集成的流处理框架。
+
+Samza 的核心模型：**每个 Kafka Topic 是一组有序的消息流，Samza 作业消费这些消息流，输出新的消息流**。
+
+```java
+// Samza 作业：实时计算用户「你可能认识的人」
+public class PeopleYouMayKnowJob implements StreamTask {
+
+    // 维护用户一度人脉的缓存
+    private StateStore<Long, Set<Long>> firstDegreeCache;
+
+    @Override
+    public void process(IncomingMessageEnvelope envelope,
+                       MessageCollector collector,
+                       TaskCoordinator coordinator) {
+
+        ConnectionEvent event = (ConnectionEvent) envelope.getMessage();
+
+        Long userId = event.getUserId();
+        Long connectedUserId = event.getConnectedUserId();
+
+        // 1. 获取用户的一度人脉
+        Set<Long> userConnections = getFirstDegree(userId);
+        Set<Long> connectedUserConnections = getFirstDegree(connectedUserId);
+
+        // 2. 找出「共同好友」
+        Set<Long> mutualConnections = new HashSet<>(userConnections);
+        mutualConnections.retainAll(connectedUserConnections);
+
+        // 3. 生成推荐：共同好友越多，推荐优先级越高
+        for (Long mutual : mutualConnections) {
+            int score = scoreConnection(userId, mutual);
+            Recommendation rec = new Recommendation(mutual, score);
+            collector.send(new ProducerRecordEnvelope<>(
+                "recommendations",
+                userId.toString(),
+                rec
+            ));
+        }
+
+        // 4. 更新缓存
+        updateFirstDegreeCache(userId, connectedUserId);
+    }
+}
+```
+
+### 图计算：LPU（LinkedIn Processing Unit）
+
+LinkedIn 的核心价值是社交图谱，而图计算的规模是惊人的：10 亿用户，每人平均 50 个连接，总边数超过 500 亿条。
+
+LinkedIn 内部开发了 **LPU（图处理单元）**，专门用于大规模图数据的实时计算。LPU 的核心场景是「你可能认识的人」推荐——通过图遍历找出两个用户之间的最短路径，然后给共同好友多的用户更高的推荐分数。
+
+## 架构启示
+
+### 启示一：消息队列是架构的分层边界
+
+LinkedIn 发明 Kafka 的核心价值，不是技术突破，而是**架构分层**——把「数据传输」从数据库中抽离出来，让数据库只做存储，让消息队列负责传输。
+
+这个分层的意义是：**解耦**。下游系统可以独立演进，不需要跟主数据库直接耦合。搜索系统重构不影响推荐系统，推荐系统升级不影响分析平台。
+
+**对普通项目的建议**：如果你的系统有多个下游消费者需要消费同一份数据，首���考虑消息队列，而不是让每个消费者直接连数据库。
+
+### 启示二：数据是资产，也是负债
+
+LinkedIn 的工程师花了大量精力在数据质量上——脏数据会导致推荐系统给出荒谬的建议，重复数据会导致用户收到重复通知。
+
+数据治理的成本往往被低估。很多人觉得「存起来总比丢了好」，但数据会过期、会重复、会出错。维护这些数据的成本，有时候比丢失它更大。
+
+**建议**：每个数据字段都要有「数据所有者和有效期」。谁负责更新？谁负责删除？过期了怎么办？这些问题在系统设计阶段就要回答。
+
+### 启示三：实时和离线的选择
+
+LinkedIn 的系统同时支持 Samza（实时）和 Hadoop（离线）两种计算模式，关键在于判断哪些场景需要实时，哪些场景可以接受延迟。
+
+**需要实时**：推荐排序、搜索索引更新、通知推送、异常监控
+**可以离线**：用户数据分析、推荐模型训练、广告报表生成、审计日志归档
+
+**建议**：不要把所有东西都做成实时的。实时系统的开发和运维成本远高于离线系统。先用离线跑通，等业务真正需要实时再升级。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| Reid Hoffman | 人名 | LinkedIn 联合创始人兼执行董事长，PayPal 早期高管，著名的天使投资人 |
+| Peter Thiel | 人名 | PayPal 联合创始人，Founders Fund 创始人，曾在斯坦福教授创业课程 |
+| Jay Kreps | 人名 | LinkedIn 工程师，Kafka 设计者，2014 年创办 Confluent（Kafka 商业公司） |
+| Kafka | 技术名词 | Apache 顶级项目，分布式流处理平台，每日处理消息超过 7 万亿条，LinkedIn 发明并于 2011 年开源 |
+| Espresso | 技术名词 | LinkedIn 自研的 NoSQL 数据库，基于 MVCC，支持自动分片和跨机房复制 |
+| Samza | 技术名词 | Apache 顶级项目，分布式流处理框架，与 Kafka 深度集成，适合有状态的流处理任务 |
+| MVCC（Multi-Version Concurrency Control） | ��术名词 | 多版本并发控制，读操作不会阻塞写操作，适合读多写少的场景 |
+| 六度人脉理论 | 技术名词 | 世界上任何两个人之间，平均最多通过 6 个中间人就能建立联系 |
+| REST.li | 技术名词 | LinkedIn 开源的 REST 框架，基于 REST + JSON，提供强类型客户端和服务端代码生成 |
+| Proxygen | 技术名词 | LinkedIn 开源的 C++ HTTP 框架，支持 HTTP/2，用于高性能 API 网关 |
+
+## 总结
+
+LinkedIn 对整个行业的贡献，远不止一个职业社交平台。**Kafka 重新定义了数据流的处理方式，Espresso 证明了自研数据库在特定场景下的价值，Samza 填补了有状态流处理的空白**。
+
+**演进脉络**：
+
+- **2002-2006**：LAMP 单体，验证职业社交模型
+- **2006-2010**：Kafka + Voldemort + Espresso，支撑数据爆发
+- **2010-2015**：Samza + 图计算，实现实时人脉推荐
+- **2015-至今**：平台化 + AI 驱动，全球化扩展
+
+**核心技术亮点**：
+
+- **Kafka**：消息队列作为架构分层边界，解耦数据生产和消费
+- **Espresso**：MVCC + 自动分片，支撑 10 亿级用户数据存储
+- **Samza**：有状态流处理，实现实时图计算
+
+**对普通项目的启发**：
+
+- 消息队列是架构分层的核心工具，不是备选方案
+- ���据治理需要提前规划，不要等到数据乱了才想起来清理
+- 实时和离线要分开考虑，不要把所有东西都做成实时
