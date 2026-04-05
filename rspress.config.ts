@@ -82,7 +82,7 @@ export default defineConfig({
      * true：在顶部导航栏显示文档搜索框（支持全文搜索）
      * false：隐藏搜索功能
      */
-    // search: true,
+    search: false,
 
     /**
      * 社交链接配置
@@ -158,6 +158,13 @@ export default defineConfig({
      */
     cleanUrls: true,
   },
+
+  /**
+   * 搜索框开关
+   * true：在顶部导航栏显示文档搜索框（支持全文搜索）
+   * false：隐藏搜索功能
+   */
+  search: false,
 
   // ==============================================
   // 页面头部标签配置（SEO、meta 标签、自定义 head）
