@@ -1,51 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
-
-interface TechStack {
-  name: string;
-  description: string;
-  link: string;
-  icon: string;
-}
-
-const techStacks: TechStack[] = [
-  {
-    name: 'Java',
-    description: '主要开发语言',
-    link: 'https://guide.docs.zxinrun.cn/',
-    icon: '☕',
-  },
-  {
-    name: 'Spring Boot',
-    description: '企业级应用框架',
-    link: '/spring',
-    icon: '🌱',
-  },
-  {
-    name: 'MySQL',
-    description: '关系型数据库',
-    link: '/database/mysql',
-    icon: '🐬',
-  },
-  {
-    name: 'Redis',
-    description: '缓存与分布式锁',
-    link: '/cache/redis',
-    icon: '🔴',
-  },
-  {
-    name: 'Kafka',
-    description: '消息队列',
-    link: '/middleware/kafka',
-    icon: '📨',
-  },
-  {
-    name: 'Docker',
-    description: '容器化部署',
-    link: '/devops/docker',
-    icon: '🐳',
-  },
-];
+import { techStacks } from '../../../theme_config/techStacks';
 
 export const TechStackButton = () => {
   const [isOpen, setIsOpen] = useState(false);

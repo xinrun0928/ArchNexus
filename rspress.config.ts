@@ -2,6 +2,7 @@
 import * as path from 'node:path';
 // 导入 Rspress 核心配置定义函数，提供类型提示和配置校验
 import { defineConfig } from '@rspress/core';
+import { pluginSass } from '@rsbuild/plugin-sass';
 
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
@@ -67,6 +68,10 @@ export default defineConfig({
     dark: '/icon.png',
   },
 
+  builderConfig: {
+    plugins: [pluginSass()]
+  },
+
   // ==============================================
   // 主题外观配置（导航、侧边栏、搜索、页脚等）
   // ==============================================
@@ -76,6 +81,12 @@ export default defineConfig({
 
     // // 侧边栏配置
     // sidebar: sidebar,
+
+    /**
+     * 技术栈配置
+     * 详见 theme_config/techStacks.ts
+     */
+    // techStacks: [], // 默认读取 theme_config/techStacks.ts，无需在此重复配置
 
     /**
      * 搜索框开关
