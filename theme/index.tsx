@@ -1,10 +1,10 @@
 import { Layout as BasicLayout } from '@rspress/core/theme-original';
-import { TechStackButton } from './components/TechStackButton';
+import { EcosystemButton } from './components/EcosystemButton';
 
 const Layout = () => (
   <BasicLayout
     /* 导航栏 Logo 左侧区域 */
-    beforeNavTitle={<TechStackButton />}
+    beforeNavTitle={<EcosystemButton />}
   />
 );
 
