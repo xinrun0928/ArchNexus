@@ -3,8 +3,8 @@ import * as path from 'node:path';
 // 导入 Rspress 核心配置定义函数，提供类型提示和配置校验
 import { defineConfig } from '@rspress/core';
 
-import { nav } from './theme_config/nav'
-import { sidebar } from './theme_config/sidebar'
+import { nav } from './theme_config/nav';
+import { sidebar } from './theme_config/sidebar';
 
 // Rspress 文档站点核心配置导出
 export default defineConfig({
@@ -38,7 +38,8 @@ export default defineConfig({
    * 用于 SEO 搜索引擎优化，提升站点被搜索概率
    * 简洁概括站点内容，便于搜索引擎收录
    */
-  description: '系统梳理 Java 后端核心知识与架构设计能力，从基础到进阶，一步一步成为真正的架构师',
+  description:
+    '系统梳理 Java 后端核心知识与架构设计能力，从基础到进阶，一步一步成为真正的架构师',
 
   /**
    * 网站 favicon 图标（浏览器标签小图标）
@@ -70,19 +71,18 @@ export default defineConfig({
   // 主题外观配置（导航、侧边栏、搜索、页脚等）
   // ==============================================
   themeConfig: {
+    // // 顶部导航栏配置
+    // nav: nav,
 
-    // 顶部导航栏配置
-    nav: nav,
- 
-    // 侧边栏配置
-    sidebar: sidebar,
+    // // 侧边栏配置
+    // sidebar: sidebar,
 
     /**
      * 搜索框开关
      * true：在顶部导航栏显示文档搜索框（支持全文搜索）
      * false：隐藏搜索功能
      */
-    search: true,
+    // search: true,
 
     /**
      * 社交链接配置
@@ -104,7 +104,7 @@ export default defineConfig({
      * 「下一篇」按钮文字
      * 文档底部翻页区域的「下一篇」按钮显示文本
      */
-    nextPageText: "下一篇",
+    nextPageText: '下一篇',
 
     /**
      * 滚动到顶部按钮开关
@@ -129,8 +129,9 @@ export default defineConfig({
      * 支持 HTML 标签，可插入链接、样式等
      */
     footer: {
-      message: 'Copyright © 2025-2026 <a href="https://github.com/xinrun0928/ArchNexus">ArchNexus</a>',
-    }
+      message:
+        'Copyright © 2025-2026 <a href="https://github.com/xinrun0928/ArchNexus">ArchNexus</a>',
+    },
   },
 
   // ==============================================
