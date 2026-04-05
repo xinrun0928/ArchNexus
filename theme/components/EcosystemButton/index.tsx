@@ -1,3 +1,15 @@
+/**
+ * 生态导航按钮组件
+ *
+ * 功能：在导航栏提供下拉入口，快速访问作者的其他文档项目。
+ * 点击按钮展开下拉列表，显示所有配置的生态项目链接。
+ *
+ * 特性：
+ * - 点击外部自动关闭
+ * - 支持外部链接新窗口打开
+ * - 单项时自动切换为单列布局
+ */
+
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
 import { ecosystemButton } from '../../../theme_config/ecosystemButton';
@@ -23,23 +35,24 @@ export const EcosystemButton = () => {
   return (
     <div className="ecosystem-button-container" ref={dropdownRef}>
       <button
-        className="ecosystem-button-button"
+        className="ecosystem-button"
         onClick={() => setIsOpen(!isOpen)}
-        onMouseEnter={() => setIsOpen(true)}
         aria-label="生态导航"
         aria-expanded={isOpen}
       >
         <svg
           className="ecosystem-button-icon"
-          width="20"
-          height="20"
           viewBox="0 0 24 24"
           fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
         >
-          <path
-            d="M2.5 5H5V2.5H2.5V5zM5 11.25H2.5v-2.5H5v2.5zm12.5 0H15v-2.5h2.5v2.5zm-8.75 0h2.5v-2.5h-2.5v2.5zM5 17.5H2.5V15H5v2.5zm10 0h2.5V15H15v2.5zm-3.75 0h-2.5V15h2.5v2.5zM17.5 5H15V2.5h2.5V5zM8.75 5h2.5V2.5h-2.5V5z"
-            fill="currentColor"
-          />
+          <rect x="3" y="3" width="7" height="7" />
+          <rect x="14" y="3" width="7" height="7" />
+          <rect x="14" y="14" width="7" height="7" />
+          <rect x="3" y="14" width="7" height="7" />
         </svg>
       </button>
 
@@ -47,7 +60,7 @@ export const EcosystemButton = () => {
         <div className="ecosystem-button-header">
           <span className="ecosystem-button-title">我的生态</span>
         </div>
-        <div className="ecosystem-button-list">
+        <div className={`ecosystem-button-list ${ecosystemButton.length === 1 ? 'single' : ''}`}>
           {ecosystemButton.map((item) => {
             const isExternal = item.link.startsWith('http://') || item.link.startsWith('https://');
             return (
