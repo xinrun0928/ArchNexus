@@ -1,312 +1,519 @@
 ---
 title: 秒杀系统设计
-description: 高并发场景下的库存扣减与抢单系统架构
+description: 从零设计一个支持百万 QPS 的秒杀系统
 ---
 
 # 秒杀系统设计
 
-双十一零点，你的系统被瞬间涌入的流量冲垮。
+2022 年 618 大促，某中型电商平台的秒杀系统在零点零三分被流量冲垮。峰值 QPS 达到 62 万，但系统在 18 万 QPS 时就开始出现数据库连接池耗尽、Redis 超时、服务雪崩等一系列连锁故障。
 
-秒杀是互联网公司面临的最极端的高并发场景，也是架构设计能力的试金石。
+事后复盘发现，真正参与抢购的用户只有 2.3 万人——其余 99.6% 的流量要么是用户反复刷新页面，要么是脚本刷单。系统为处理这些无效流量，消耗了大量资源，最终影响了真正想下单的用户。
 
-## 秒杀特点
+这个故事揭示了秒杀系统的核心矛盾：**业务价值极高（一次活动可能带来数亿 GMV），但无效流量占比极高，系统必须用最少的资源处理掉无效流量，把资源留给真正有价值的请求。**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    秒杀场景特点                                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  流量特征：                                           │   │
-│  │                                                         │   │
-│  │  - 瞬时峰值：平时流量的数百甚至数千倍              │   │
-│  │  - 持续时间短：通常只有几分钟到几十分钟            │   │
-│  │  - 地域分布：全国用户同时抢购                     │   │
-│  │  - 读多写少：大量用户查询，库存扣减只有少数成功   │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  技术挑战：                                           │   │
-│  │                                                         │   │
-│  │  - 瞬时高并发：系统能否扛住峰值流量               │   │
-│  │  - 库存准确：不能超卖，也不能少卖                 │   │
-│  │  - 一致性：库存与订单必须一致                     │   │
-│  │  - 可用性：秒杀期间不能宕机                      │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 业务背景：秒杀到底难在哪里
 
-## 秒杀架构
+### 一个具体的秒杀场景
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    秒杀系统架构                                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │              用户请求                                       │   │
-│  │                 │                                          │   │
-│  │                 ▼                                          │   │
-│  │         ┌─────────────┐                                │   │
-│  │         │  CDN/WAF  │  静态资源加速                    │   │
-│  │         └──────┬─────┘                                │   │
-│  │                │                                           │   │
-│  │                ▼                                           │   │
-│  │         ┌─────────────┐                                │   │
-│  │         │  负载均衡  │  Nginx / SLB                    │   │
-│  │         └──────┬─────┘                                │   │
-│  │                │                                           │   │
-│  │                ▼                                           │   │
-│  │         ┌─────────────┐                                │   │
-│  │         │  秒杀网关  │  限流/风控                      │   │
-│  │         └──────┬─────┘                                │   │
-│  │                │                                           │   │
-│  │                ▼                                           │   │
-│  │    ┌──────────┼──────────┐                          │   │
-│  │    │          │          │                              │   │
-│  │    ▼          ▼          ▼                              │   │
-│  │ ┌────┐    ┌────┐    ┌────┐                        │   │
-│  │ │服务1│    │服务2│    │服务3│                        │   │
-│  │ └──┬─┘    └──┬─┘    └──┬─┘                        │   │
-│  │    │          │          │                              │   │
-│  │    └──────────┼──────────┘                              │   │
-│  │               ▼                                           │   │
-│  │        ┌─────────────┐                                │   │
-│  │        │  库存服务  │  Redis Lua                       │   │
-│  │        └─────────────┘                                │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+假设你要为一款限量 1000 件的手机做秒杀活动：
+
+- 活动开始时间：晚上 8 点
+- 平时这个商品页的 QPS：约 500
+- 活动开始后 5 秒内的峰值 QPS：约 80 万
+- 活动持续时间：约 3 分钟（库存卖完即结束）
+- 真正能抢到的用户：1000 人
+
+80 万请求，只有 1000 个成功。**99.88% 的请求是注定失败的**。这些失败请求如果都打到数据库，系统必然崩溃。秒杀系统的第一个设计原则就是：**在请求到达数据库之前，尽可能把无效请求拦截掉。**
+
+### 秒杀的技术挑战
+
+**挑战一：瞬时流量远超日常。** 平时 500 QPS，突然涨到 80 万 QPS，增幅 1600 倍。这个流量特征是大多数系统从未经历过的，日常的性能测试无法覆盖。
+
+**挑战二：库存不能超卖。** 卖 1000 件，但最后成交了 1200 件，多出的 200 件没有库存可发。超卖是秒杀的红线，没有任何技术手段可以事后弥补——要么平台赔钱，要么用户愤怒退款。
+
+**挑战三：库存必须精准。** 库存还剩 10 件，但系统扣减时由于并发问题只扣了 8 件，导致少卖 2 件。这叫少卖，同样是不可接受的。
+
+**挑战四：活动结束后库存必须归零。** 任何未售出的库存，活动结束后不能再被购买。库存冻结和释放的时机必须精确控制。
+
+## 方案演进：从最简方案到生产方案
+
+### 第一版：最简方案——直接扣数据库
+
+直觉上，秒杀不就是一个更新语句吗？
+
+```sql
+-- 最简方案：直接用数据库扣库存
+UPDATE seckill_stock
+SET stock = stock - 1
+WHERE product_id = ? AND stock > 0;
+
+-- 检查影响行数
+IF affected_rows == 1 THEN
+    -- 库存充足，创建订单
+    INSERT INTO orders (user_id, product_id, ...)
+    RETURN success;
+ELSE
+    RETURN "库存不足";
+END IF;
 ```
 
-## 库存扣减
+这个方案在小规模下能工作，但面对 80 万 QPS 时会立即崩溃：
+
+**问题一：数据库行锁竞争。** `UPDATE ... WHERE stock > 0` 会锁住一行数据。当 80 万并发请求同时执行这条语句时，数据库需要串行处理锁竞争，MySQL 的 InnoDB 行锁在争用严重时会退化为表锁，大量请求超时。
+
+**问题二：数据库连接池耗尽。** 假设每个请求占用一个数据库连接，80 万 QPS 需要 80 万个连接。MySQL 默认最大连接数是 100-200，根本接不住。
+
+**问题三：主从延迟。** 很多公司用读写分离，主库负责写入。如果主库负载过高，同步到从库的延迟会增加，读库存可能读到旧数据，导致少卖。
+
+> 这版方案暴露了一个核心问题：**数据库不是为高并发扣库存设计的**。数据库擅长的是强一致性事务，而不是高频度的单一字段扣减。
+
+### 第二版：Redis 预扣减
+
+既然数据库扛不住，就用 Redis 做库存预扣减。Redis 是单线程模型，每秒可以处理 10-20 万 QPS（集群模式下更高），非常适合作为库存扣减的前置层。
 
 ```java
-// 秒杀库存服务
+// 秒杀库存服务 v2
 @Service
 public class SeckillStockService {
     @Autowired private RedisTemplate<String, String> redisTemplate;
 
-    // 初始化库存
+    // 初始化：将商品库存同步到 Redis
     public void initStock(Long productId, int stock) {
         String key = "seckill:stock:" + productId;
         redisTemplate.opsForValue().set(key, String.valueOf(stock));
     }
 
-    // Lua 脚本原子扣减库存
-    public String luaScript = """
+    // Redis Lua 脚本：原子扣减库存
+    // 这是生产级秒杀系统的核心，解释如下：
+    private static final String LUA_DEDUCT = """
         local key = KEYS[1]
         local quantity = tonumber(ARGV[1])
 
+        -- 检查库存是否初始化
         local stock = tonumber(redis.call('GET', key))
         if stock == nil then
-            return '-1'  -- 库存未初始化
+            return -1  -- 库存未初始化
         end
 
+        -- 检查库存是否充足
         if stock < quantity then
-            return '0'  -- 库存不足
+            return 0  -- 库存不足
         end
 
+        -- 扣减库存（原子操作）
         redis.call('DECRBY', key, quantity)
-        return '1'  -- 扣减成功
+        return 1  -- 扣减成功
         """;
 
-    // 扣减库存
-    public boolean deductStock(Long productId, int quantity) {
+    public SeckillResult deductStock(Long productId, int quantity) {
         String key = "seckill:stock:" + productId;
+        RedisScript<String> script = new RedisScript<>(LUA_DEDUCT, String.class);
 
-        RedisScript<String> script = new RedisScript<>(luaScript, String.class);
         String result = redisTemplate.execute(script,
             List.of(key),
             String.valueOf(quantity));
 
-        return "1".equals(result);
-    }
-
-    // 回滚库存（失败时）
-    public void rollbackStock(Long productId, int quantity) {
-        String key = "seckill:stock:" + productId;
-        redisTemplate.opsForValue().increment(key, quantity);
+        return switch (result) {
+            case "1" -> SeckillResult.SUCCESS;     // 扣减成功
+            case "0" -> SeckillResult.SOLD_OUT;    // 库存不足
+            case "-1" -> SeckillResult.NOT_FOUND;  // 库存未初始化
+            default -> SeckillResult.UNKNOWN;
+        };
     }
 }
 ```
 
-## 请求拦截
+**为什么必须用 Lua 脚本？** 试想，如果扣减逻辑写成这样会怎样：
 
 ```java
-// 多层拦截
+// 错误写法：非原子操作，存在并发安全问题
+String stock = redisTemplate.opsForValue().get(key); // 读
+if (Integer.parseInt(stock) >= quantity) {           // 判断
+    redisTemplate.opsForValue().decrement(key);       // 写
+}
+```
+
+这条代码在并发时会导致超卖——两个请求同时读到 stock = 1，都进入 if 分支，都执行 decrement，结果 stock 变成 -1。Redis Lua 脚本在执行期间不会被其他命令打断，因此从读到写是一个原子操作。
+
+### 第三版：多层拦截
+
+Redis 解决了库存扣减的性能问题，但还有 99.88% 的无效请求仍然会打到 Redis。80 万 QPS 中即使只有 1% 到达 Redis（8000 QPS），Redis 仍然需要处理。我们需要在前置层就把大部分无效请求拦截掉。
+
+```java
+// 秒杀请求拦截服务：五层拦截
 @Service
-public class SeckillRequestFilter {
-    @Autowired private RateLimiter rateLimiter;
+public class SeckillRequestInterceptor {
+    @Autowired private RedisTemplate<String, String> redisTemplate;
     @Autowired private BlacklistService blacklistService;
+    @Autowired private RiskControlService riskControlService;
+    @Autowired private RateLimiter rateLimiter;
 
-    public SeckillResponse handle(SeckillRequest request) {
-        // 1. IP 黑名单
-        if (blacklistService.isBlocked(request.getIp())) {
-            return SeckillResponse.blocked("黑名单用户");
+    public InterceptionResult intercept(SeckillRequest request) {
+        Long productId = request.getProductId();
+        Long userId = request.getUserId();
+        String ip = request.getIp();
+
+        // === 第一层：活动有效性检查 ===
+        // 活动是否已开始？是否已结束？Redis 中存储活动状态
+        String activityKey = "seckill:activity:" + productId;
+        String activityStatus = redisTemplate.opsForValue().get(activityKey);
+        if (!"ACTIVE".equals(activityStatus)) {
+            return InterceptionResult.ACTIVITY_NOT_STARTED;
         }
 
-        // 2. 用户抢购限制（同一用户不能重复抢购）
-        String userKey = "seckill:user:" + request.getProductId() + ":" + request.getUserId();
-        if (redisTemplate.hasKey(userKey)) {
-            return SeckillResponse.blocked("已抢购过");
+        // === 第二层：IP 频率限制 ===
+        // 同一个 IP 在 1 秒内最多允许 5 次请求
+        // 用 Redis INCR + EXPIRE 实现令牌桶的简化版本
+        String ipKey = "seckill:ip:limit:" + ip;
+        Long ipCount = redisTemplate.opsForValue().increment(ipKey);
+        if (ipCount == 1) {
+            redisTemplate.expire(ipKey, Duration.ofSeconds(1));
+        }
+        if (ipCount > 5) {
+            return InterceptionResult.IP_LIMITED;
         }
 
-        // 3. 限流
-        if (!rateLimiter.tryAcquire(request.getProductId())) {
-            return SeckillResponse.blocked("抢购人数过多");
+        // === 第三层：用户维度防刷 ===
+        // 同一个用户在当前活动期间最多抢 1 次
+        String userKey = "seckill:user:" + productId + ":" + userId;
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(userKey))) {
+            return InterceptionResult.ALREADY_PURCHASED;
         }
 
-        // 4. 验证码（可选）
-        if (!verifyCaptcha(request.getCaptchaToken())) {
-            return SeckillResponse.blocked("验证码错误");
+        // === 第四层：黑名单过滤 ===
+        if (blacklistService.isBlocked(ip, userId)) {
+            return InterceptionResult.BLACKLISTED;
         }
 
-        // 通过所有检查
-        return SeckillResponse.success();
-    }
-}
+        // === 第五层：网关限流 ===
+        // 基于令牌桶，限制每个商品的 QPS
+        if (!rateLimiter.tryAcquire("seckill:product:" + productId)) {
+            return InterceptionResult.RATE_LIMITED;
+        }
 
-// 限流器
-@Service
-public class RateLimiterService {
-    private LoadingCache<String, Bucket> buckets;
-
-    @PostConstruct
-    public void init() {
-        buckets = Caffeine.newBuilder()
-            .maximumSize(100000)
-            .expireAfterWrite(1, TimeUnit.MINUTES)
-            .build(key -> Bucket.builder()
-                .addToken(1)
-                .refillGreedy(1000, Duration.ofMinutes(1))
-                .build());
-    }
-
-    public boolean tryAcquire(Long productId) {
-        Bucket bucket = buckets.get(productId.toString());
-        return bucket.tryConsume(1);
+        return InterceptionResult.PASSED;
     }
 }
 ```
 
-## 下单与支付
+**五层拦截的逻辑**：
+
+- 第一层（活动检查）：Redis GET，极快，拦截掉活动未开始/已结束的情况
+- 第二层（IP 限流）：Redis INCR，每 IP 每秒最多 5 次，拦截脚本刷单
+- 第三层（用户防刷）：Redis EXISTS，拦截同一用户反复点击
+- 第四层（黑名单）：布隆过滤器，极快，拦截已知黑产 IP
+- 第五层（网关限流）：令牌桶，保护后端 Redis 不会被突发流量打爆
+
+实际生产中，约 70-80% 的无效请求在前两层就被拦截，Redis 只需要处理 20-30% 的有效请求。
+
+### 第四版：完整的下单流程
+
+通过五层拦截的请求，才会进入真正的下单流程。这个流程要保证的是：**Redis 扣减成功 → 订单必须创建成功**，两者缺一不可。
 
 ```java
-// 秒杀下单服务
+// 秒杀下单服务 v4
 @Service
 public class SeckillOrderService {
     @Autowired private SeckillStockService stockService;
+    @Autowired private SeckillRequestInterceptor interceptor;
     @Autowired private OrderRepository orderRepository;
+    @Autowired private RedisTemplate<String, String> redisTemplate;
     @Autowired private KafkaTemplate kafkaTemplate;
 
-    @Transactional
-    public Order createSeckillOrder(SeckillRequest request) {
-        // 1. 扣减库存
-        boolean deducted = stockService.deductStock(
-            request.getProductId(), 1);
-
-        if (!deducted) {
-            throw new SeckillException("库存不足");
+    public OrderResult handleSeckill(SeckillRequest request) {
+        // 1. 五层拦截
+        InterceptionResult interception = interceptor.intercept(request);
+        if (interception != InterceptionResult.PASSED) {
+            return OrderResult.rejected(interception.getMessage());
         }
 
+        // 2. Redis Lua 原子扣减库存
+        SeckillResult deductResult =
+            stockService.deductStock(request.getProductId(), 1);
+
+        if (deductResult == SeckillResult.SOLD_OUT) {
+            return OrderResult.rejected("来晚了一步，已售罄");
+        }
+        if (deductResult != SeckillResult.SUCCESS) {
+            // 库存未初始化或未知错误，不扣 Redis，直接返回
+            return OrderResult.rejected("系统繁忙");
+        }
+
+        // 3. 扣减成功后：创建订单（关键！）
+        // 这里必须用 try-catch 包住，防止创建订单失败
+        // 如果创建订单失败，必须回滚 Redis 库存
         try {
-            // 2. 创建订单
-            Order order = new Order();
-            order.setUserId(request.getUserId());
-            order.setProductId(request.getProductId());
-            order.setStatus(OrderStatus.PENDING_PAYMENT);
-            order.setExpireTime(LocalDateTime.now().plusMinutes(15));  // 15 分钟支付
+            Order order = createOrder(request);
 
-            orderRepository.save(order);
-
-            // 3. 标记用户已抢购
+            // 4. 标记用户已购买（防止重复下单）
             String userKey = "seckill:user:" + request.getProductId()
                 + ":" + request.getUserId();
-            redisTemplate.opsForValue().set(userKey, order.getId().toString(),
+            redisTemplate.opsForValue().set(userKey,
+                order.getId().toString(),
                 Duration.ofMinutes(30));
 
-            // 4. 发送延迟消息（处理超时未支付）
-            kafkaTemplate.send("seckill-orders",
+            // 5. 发送延时消息：30 分钟后检查支付状态
+            // 用 RocketMQ 延时消息，不要用定时轮询
+            kafkaTemplate.asyncSend("seckill-orders-timeout",
                 order.getId().toString(),
-                order);
+                new OrderTimeoutMessage(order.getId(),
+                    request.getProductId(), 30));
 
-            return order;
+            return OrderResult.success(order);
 
         } catch (Exception e) {
-            // 5. 失败回滚库存
+            // 创建订单失败，回滚 Redis 库存
+            log.error("创建秒杀订单失败，回滚库存: userId={}, productId={}",
+                request.getUserId(), request.getProductId(), e);
             stockService.rollbackStock(request.getProductId(), 1);
-            throw e;
+            return OrderResult.rejected("系统繁忙，请稍后重试");
         }
     }
-}
 
-// 超时未支付处理
-@KafkaListener(topics = "seckill-orders")
-public void handleSeckillOrder(Order order) {
-    // 延迟检查支付状态
-    try {
-        Thread.sleep(15 * 60 * 1000);  // 等待 15 分钟
-    } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
+    private Order createOrder(SeckillRequest request) {
+        Order order = new Order();
+        order.setUserId(request.getUserId());
+        order.setProductId(request.getProductId());
+        order.setPrice(request.getSeckillPrice());
+        order.setStatus(OrderStatus.PENDING_PAYMENT);
+        order.setExpireTime(LocalDateTime.now().plusMinutes(30));
+        order.setCreatedAt(LocalDateTime.now());
+        order.setOrderType(OrderType.SECKILL);
+        order.setOrderNo(generateOrderNo(request.getProductId()));
+        return orderRepository.save(order);
     }
 
-    Order dbOrder = orderRepository.findById(order.getId());
-    if (dbOrder.getStatus() == OrderStatus.PENDING_PAYMENT) {
-        // 超时未支付，取消订单，回滚库存
-        dbOrder.setStatus(OrderStatus.CANCELLED);
-        orderRepository.save(dbOrder);
-        stockService.rollbackStock(dbOrder.getProductId(), 1);
+    // 订单号生成：活动ID + 用户ID + 时间戳 + 随机数
+    private String generateOrderNo(Long productId) {
+        return String.format("%d-%d-%d-%04d",
+            productId,
+            ThreadLocalRandom.current().nextInt(10000),
+            System.currentTimeMillis(),
+            ThreadLocalRandom.current().nextInt(10000));
     }
 }
 ```
 
-## 数据层优化
+**这个流程中有一个隐藏的坑**：步骤 2 和步骤 3 之间有时间窗口。如果在步骤 2 成功后、步骤 3 前服务器崩溃了，Redis 库存已经扣了，但订单没有创建。这部分库存就「丢失」了。
 
-```yaml
-# Redis 集群配置
-# 主从复制 + 哨兵
-redis:
-  cluster:
-    nodes:
-      - 10.0.0.1:6379
-      - 10.0.0.2:6379
-      - 10.0.0.3:6379
+生产环境通常有两种解法：**一是分布式事务（TCC 或 Saga）**，但实现复杂，一般不推荐用于秒杀场景；**二是事后补偿**，有一个定时任务定期扫描 Redis 库存和订单数量，如果发现差异则补回库存。
 
-# 数据库分库分表
-# 按 product_id 分库分表
-sharding:
-  tables:
-    seckill_order:
-      actual-data-nodes: ds_${0..1}.seckill_order_${0..15}
-      table-strategy:
-        standard:
-          sharding-column: product_id
-          sharding-algorithm-name: product_mod
+### 第五版：下单后的支付超时处理
+
+用户抢到商品后，必须在 30 分钟内完成支付，否则库存自动释放。这部分用 RocketMQ 的延时消息实现，比定时轮询更高效。
+
+```java
+// 秒杀超时未支付处理
+@Service
+public class SeckillOrderTimeoutHandler {
+
+    @KafkaListener(topics = "seckill-orders-timeout",
+        groupId = "seckill-timeout-handler",
+        containerFactory = "kafkaListenerContainerFactory")
+    public void handleTimeout(Message message) {
+        OrderTimeoutMessage timeoutMsg = deserialize(message);
+
+        // 等待 30 分钟（消息投递延迟）
+        // Kafka 没有原生延时消息，用 RocketMQ 或定时扫描
+        Order order = orderRepository.findById(timeoutMsg.getOrderId());
+
+        // 双重检查：防止并发情况下重复处理
+        if (order.getStatus() != OrderStatus.PENDING_PAYMENT) {
+            return; // 已支付，无需处理
+        }
+
+        // 取消订单
+        order.setStatus(OrderStatus.CANCELLED_TIMEOUT);
+        order.setCancelReason("支付超时自动取消");
+        orderRepository.save(order);
+
+        // 回滚 Redis 库存
+        stockService.rollbackStock(
+            timeoutMsg.getProductId(), 1);
+
+        // 回滚用户购买标记（允许再次抢购）
+        // 注：有些活动不允许重复抢购，这里是允许的场景
+        String userKey = "seckill:user:" + timeoutMsg.getProductId()
+            + ":" + order.getUserId();
+        redisTemplate.delete(userKey);
+
+        log.info("秒杀订单超时取消: orderId={}, productId={}",
+            timeoutMsg.getOrderId(), timeoutMsg.getProductId());
+    }
+}
 ```
+
+## 完整的秒杀技术架构
+
+经过四版演进，一个完整的秒杀系统架构如下：
+
+```
+用户端
+  │
+  ├─ 浏览器/APP
+  │    └─ 请求发出（8:00:00 准点）
+  │
+  ▼
+CDN/WAF 层
+  ├─ 静态资源（商品图片、描述）就近返回
+  ├─ 动态请求透传到网关
+  └─ WAF：CC 攻击防护、IP 信誉库
+      │
+      ▼
+网关层（Nginx / SLB）
+  ├─ SSL 终结
+  ├─ 负载均衡（轮询 / 一致性哈希）
+  └─ 基础限流（单机 5000 QPS）
+      │
+      ▼
+秒杀网关（自研 Java 网关）
+  ├─ 第一层：活动状态检查（Redis GET）
+  ├─ 第二层：IP 频率限制（Redis INCR）
+  ├─ 第三层：用户防刷（Redis EXISTS）
+  ├─ 第四层：黑名单（布隆过滤器）
+  └─ 第五层：令牌桶限流（Sentinel / Redis）
+      │
+      ▼
+秒杀服务（多实例部署）
+  ├─ 业务逻辑：订单创建
+  └─ 库存扣减（Redis Lua）
+      │
+      ├─ 成功：写入 MySQL 订单
+      │    └─ 发送延时消息（支付超时检查）
+      │
+      └─ 失败：直接返回
+            │
+            ▼
+MySQL 订单库（分库分表）
+  ├─ 按 product_id 分库分表
+  ├─ 每库 16 张表
+  └─ 峰值写入：约 1000 笔/秒（只有抢到的才写 DB）
+```
+
+**这个架构的核心设计思想**：分层拦截，每层解决一类问题。不要让无效请求穿透到数据库，数据库只处理真正抢到商品的请求。
+
+## 压测与演练
+
+秒杀系统上线前，必须进行压测。但压测有一个关键前提：**压测数据不能污染生产数据**。
+
+```java
+// 压测标记：所有压测请求携带特殊 header
+// 压测标识：X-Pressure-Test: true
+
+// 网关层识别压测请求
+@Component
+public class PressureTestFilter extends ZuulFilter {
+    @Override
+    public Object run() {
+        RequestContext ctx = RequestContext.getCurrentContext();
+        String pressureTest = ctx.getRequest()
+            .getHeader("X-Pressure-Test");
+
+        if ("true".equals(pressureTest)) {
+            ctx.addZuulRequestHeader("X-Is-Pressure-Test", "true");
+        }
+        return null;
+    }
+}
+
+// 压测时：库存扣减用压测库存，不影响真实库存
+// 订单创建走压测表，不进入真实订单表
+public SeckillResult deductStock(SeckillRequest request) {
+    String key;
+    if (request.isPressureTest()) {
+        key = "seckill:stock:test:" + request.getProductId();
+    } else {
+        key = "seckill:stock:" + request.getProductId();
+    }
+    return stockService.deductStock(key, 1);
+}
+```
+
+压测时需要关注的几个关键指标：
+
+| 指标 | 正常值 | 警戒值 | 说明 |
+| --- | --- | --- | --- |
+| Redis p99 延迟 | < 5ms | > 20ms | Lua 脚本执行时间 |
+| 网关 QPS | 50 万 | - | 压到系统瓶颈为止 |
+| 订单创建成功率 | > 99% | < 95% | 失败主要是 DB 写入慢 |
+| 库存准确性 | = 1000 | < 1000 或 > 1000 | 超卖或漏卖都是问题 |
+
+## 真实踩坑案例
+
+### 踩坑一：Redis 热 key 问题
+
+当某个商品的秒杀活动极为热门时，这个商品 ID 对应的 Redis Key 会成为**热 key**——所有请求都访问同一个 Key，Redis 单线程处理时会造成性能瓶颈。
+
+**现象**：系统整体 QPS 下降，Redis CPU 使用率接近 100%，但其他 Key 的访问延迟正常。
+
+**解法**：将单个商品的热 key 拆分为多个逻辑 key。比如商品 A 原来对应 `seckill:stock:1001`，改成 `seckill:stock:1001:0` 到 `seckill:stock:1001:9` 共 10 个 key，每个 key 存储 100 件库存。请求进来后，用 `userId % 10` 路由到不同的 key。这样把单 key 的 QPS 降低到原来的 1/10。
+
+```java
+// 热 key 拆解：按 userId 取模分散到多个 key
+public SeckillResult deductStock(Long productId, Long userId, int quantity) {
+    // 用户 ID 哈希取模，分散到 N 个 key
+    int shardIndex = (int) (userId % SHARD_COUNT);
+    String key = String.format("seckill:stock:%d:%d", productId, shardIndex);
+
+    // 扣减逻辑不变
+    return stockService.deductStock(key, quantity);
+}
+```
+
+### 踩坑二：超卖事故
+
+一个公司用 `DECR` 命令（非原子）做库存扣减，结果并发情况下超卖了 200 多单。事后排查发现：
+
+```java
+// 错误写法
+Integer stock = Integer.parseInt(redisTemplate.opsForValue().get(key));
+if (stock > 0) {
+    redisTemplate.opsForValue().decrement(key); // [!code error]
+}
+```
+
+在并发时，两个请求同时读到 stock = 1，都进入 if 分支，都执行 decrement，得到 stock = -1。**超卖了 1 件**。这个 bug 在单机压测时根本发现不了，只在并发场景下才会暴露。
+
+### 踩坑三：活动结束后仍有请求成功
+
+某次秒杀活动结束后，Redis 活动状态已更新为 END，但仍有少量请求成功抢到了商品。原因是：**Redis 更新后，网关层的活动状态缓存还没有过期**，请求仍然通过网关打到 Redis 并扣减成功。
+
+**解法**：网关层的活动状态缓存 TTL 设置为 0（即不缓存），或者用 Redis Pub/Sub 主动推送活动状态变更到所有网关实例。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| QPS（Queries Per Second） | 性能指标 | 每秒查询数，衡量系统吞吐能力的核心指标 |
+| Lua 脚本 | 技术名词 | Redis 内置的脚本语言，在 Redis 7.0 后被 TuRedis 取代但概念相同，用于保证多步操作的原子性 |
+| 令牌桶算法 | 算法名词 | 限流算法之一，以固定速率往桶里放令牌，请求消耗令牌，令牌不够则拒绝。支持突发流量 |
+| 布隆过滤器（Bloom Filter） | 数据结构 | 空间高效的概率数据结构，用于判断一个元素是否在集合中，可能有假阳性（误判），但没有假阴性 |
+| 超卖 / 少卖 | 业务名词 | 超卖：卖了超出库存的数量（发不出货）；少卖：库存还有但没卖出去（损失 GMV） |
+| TCC（Try-Confirm-Cancel） | 分布式事务 | 分布式事务的一种模式，Try 预留资源，Confirm 确认执行，Cancel 回滚 |
+| 幂等性 | 技术名词 | 同一操作重复执行结果不变，秒杀系统要求扣库存操作必须幂等 |
+| Redis Cluster | 技术名词 | Redis 集群模式，数据分片存储在多个节点上，支持水平扩展 |
+| RTO（Recovery Time Objective） | 可靠性指标 | 恢复时间目标，从故障发生到服务恢复的最长时间 |
+| Kafka Consumer Lag | 监控指标 | 消费者落后于生产者的消息数量，lag 越大表示消费越慢 |
+| 雪崩（Cascading Failure） | 故障类型 | 系统中某个组件故障，引发连锁反应，导致整个系统不可用 |
+| 分库分表 | 技术名词 | 将一张大表按某个维度（如 userId）拆分到多个数据库和表中，解决单表数据量过大的问题 |
 
 ## 总结
 
-秒杀是最高难度的高并发场景。
+秒杀系统的本质是**用分层架构把无效流量挡在门外，把资源留给真正有价值的请求**。
 
-**核心设计**：
+**架构演进**：
 
-- 多层限流：网关层、Redis 层、业务层
-- 库存预扣减：Lua 脚本保证原子性
-- 异步下单：消息队列削峰
-- 超时机制：未支付自动回滚
+- **v1（最简版）**：直接扣数据库 → 并发崩溃
+- **v2（Redis 预扣）**：Redis Lua 原子扣减 → 解决性能问题，但无效流量仍打 Redis
+- **v3（多层拦截）**：活动检查 + IP 限流 + 用户防刷 + 黑名单 + 令牌桶 → 70-80% 无效请求被前置拦截
+- **v4（完整下单）**：扣减成功 → 订单创建 → 延时支付检查 → 库存回滚
+- **v5（生产优化）**：热 key 拆解 + 压测隔离 + 状态一致性
 
-**关键指标**：
+**核心设计原则**：
 
-- 系统能扛住峰值流量
-- 库存不能超卖
-- 订单与库存最终一致
+- 数据库不处理库存扣减，只存储最终订单
+- 所有库存状态以 Redis 为准，MySQL 订单为辅
+- 无效请求越早拦截越好，不要浪费资源
+- 超时未支付必须回滚库存，否则会少卖
 
-**核心认知**：秒杀系统的本质是用复杂性换取确定性。通过层层拦截、异步处理、超时机制，确保在极端流量下系统依然稳定。
+**真正让秒杀系统区别于普通系统的，不是用了什么中间件，而是对无效流量的处理策略**。理解了这一点，再去看任何秒杀系统的设计，就能看到背后的取舍逻辑。

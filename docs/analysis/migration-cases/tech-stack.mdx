@@ -1,402 +1,529 @@
 ---
 title: 技术栈迁移
-description: 编程语言和框架的技术栈升级实践
+description: 以 Oracle 迁移到 MySQL 为完整案例
 ---
 
 # 技术栈迁移
 
-你的系统用的是老旧技术栈，招不到人，维护困难。
+某中型互联网公司在 2018 年做了一个艰难的决定：将核心业务数据库从 Oracle 迁移到 MySQL。
 
-技术栈迁移是架构演进中最敏感的部分，涉及人员技能、业务连续性和成本。
+Oracle 是商业数据库，稳定可靠，但 license 费用每年超过 200 万；MySQL 是开源数据库，免费，但性能和功能与 Oracle 有差距。更重要的是，公司的核心业务代码重度依赖 Oracle 的特性——窗口函数、递归 CTE、高级索引——这些特性在 MySQL 中要么没有，要么需要换写法。
 
-## 迁移决策
+迁移的核心挑战不是数据迁移，而是**代码兼容性**。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    技术栈迁移决策框架                                 │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 迁移收益评估                                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 开发效率提升：新技术能带来多少效率提升？        │   │
-│  │  - 招聘优势：新技术的吸引力如何？                 │   │
-│  │  - 生态丰富度：社区、库、工具是否完善？         │   │
-│  │  - 性能优势：新技术的性能是否有显著提升？       │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 迁移成本评估                                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 人员成本：学习新技术的培训时间？               │   │
-│  │  - 时间成本：迁移需要多长时间？                    │   │
-│  │  - 风险成本：业务中断的风险如何？                  │   │
-│  │  - 维护成本：新旧系统并行维护？                   │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 决策建议                                              │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  收益 > 成本：值得迁移                             │   │
-│  │  收益 ≈ 成本：谨慎迁移，考虑局部试点            │   │
-│  │  收益 < 成本：不迁移，继续维护现有系统       │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+项目负责人后来回忆说：「我们低估了 Oracle 特性对代码的渗透程度。以为只是换个 JDBC 驱动，结果发现 30% 的 SQL 需要重写。」
 
-## 常见迁移场景
+这一节用这个真实案例，讲解 Oracle 到 MySQL 迁移的全过程。
 
-### 场景一：Java 7 -> Java 17
+## 背景：为什么要迁移
+
+### Oracle 的成本
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Java 版本迁移                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 迁移收益                                              │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 性能提升：G1 GC、ZGC、向量 API               │   │
-│  │  - 开发效率：Records、Pattern Matching、Sealed     │   │
-│  │  - 安全增强：更安全的加密、更好的默认值           │   │
-│  │  - 长期支持：Java 17 是 LTS 版本                │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 兼容性检查                                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  1. 依赖兼容性                                       │   │
-│  │     - 检查 Maven/Gradle 依赖是否支持新版本      │   │
-│  │     - 运行 mvn dependency:analyze                 │   │
-│  │                                                         │   │
-│  │  2. API 兼容性                                       │   │
-│  │     - 检查废弃的 API 使用情况                   │   │
-│  │     - 运行 jdeps 分析依赖                        │   │
-│  │                                                         │   │
-│  │  3. 运行时行为变化                                   │   │
-│  │     - 字符编码默认变化                            │   │
-│  │     - 类型推断增强                                │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+Oracle 成本构成：
+- License 费用：100 万/年
+- 维护费用：50 万/年（按 license 的 50%）
+- IBM 小型机：50 万/年（运行 Oracle RAC）
+- DBA 人力：2 人 × 30 万 = 60 万/年
+- 总计：约 260 万/年
 ```
 
-```bash
-# Java 迁移工具
+### MySQL 的成本
 
-# 1. 检查依赖版本
-mvn versions:display-dependency-updates
-
-# 2. 分析依赖树
-mvn dependency:tree > dependency-tree.txt
-
-# 3. 编译测试
-mvn clean compile test
-
-# 4. 运行应用兼容测试
-japi-compliance-checker report.xml
 ```
+MySQL 成本构成：
+- License 费用：0（开源免费）
+- 云 RDS 费用：约 30 万/年
+- 云盘存储：约 20 万/年
+- DBA 人力：1 人 × 30 万 = 30 万/年
+- 总计：约 80 万/年
+```
+
+**每年节省约 180 万**——这是迁移的主要动力。
+
+### 迁移的挑战
+
+但 Oracle 到 MySQL 不是简单的替换：
+
+```
+Oracle 特性 vs MySQL 能力对比：
+
+Oracle 独有：
+- 窗口函数（ROW_NUMBER、RANK、LAG、LEAD 等）
+- 递归 CTE（CONNECT BY PRIOR）
+- 高级索引（位图索引、函数索引）
+- 自动段空间管理（ASSM）
+- 高级分区（LIST 分区、HASH 分区）
+- 高级约束（DEFERRABLE 约束）
+- Flashback Query（闪回查询）
+
+MySQL 支持：
+- 窗口函数（MySQL 8.0+，部分支持）
+- CTE（MySQL 8.0+，递归 CTE 支持有限）
+- 普通 B-Tree 索引、HASH 索引
+- 手动表空间管理
+- RANGE、KEY 分区
+- 基础约束（外键需要应用层保证）
+- 无闪回（需要 Binlog + 定时备份实现）
+```
+
+## 第一阶段：代码兼容性分析（2 个月）
+
+### 1. SQL 扫描工具
+
+团队开发了一个 SQL 兼容性扫描工具，分析所有 SQL 语句，标记出需要改写的地方：
+
+```java
+// SQL 兼容性扫描工具
+public class SqlCompatibilityAnalyzer {
+
+    public AnalysisResult analyze(String sql) {
+        List<CompatibilityIssue> issues = new ArrayList<>();
+
+        // 检查窗口函数
+        if (containsPattern(sql, "ROW_NUMBER\\s*\\(") ||
+            containsPattern(sql, "RANK\\s*\\(") ||
+            containsPattern(sql, "DENSE_RANK\\s*\\(") ||
+            containsPattern(sql, "LAG\\s*\\(") ||
+            containsPattern(sql, "LEAD\\s*\\(")) {
+            issues.add(new CompatibilityIssue(
+                "WINDOW_FUNCTION",
+                "窗口函数：MySQL 8.0+ 支持，但需要验证",
+                Severity.HIGH
+            ));
+        }
+
+        // 检查递归 CTE
+        if (containsPattern(sql, "CONNECT BY")) {
+            issues.add(new CompatibilityIssue(
+                "RECURSIVE_CTE",
+                "CONNECT BY：Oracle 递归语法，MySQL 需要改写为 WITH RECURSIVE",
+                Severity.HIGH
+            ));
+        }
+
+        // 检查 NVL 函数
+        if (containsPattern(sql, "NVL\\s*\\(")) {
+            issues.add(new CompatibilityIssue(
+                "NVL_FUNCTION",
+                "NVL：Oracle 函数，MySQL 需要改为 IFNULL 或 COALESCE",
+                Severity.MEDIUM
+            ));
+        }
+
+        // 检查 DECODE 函数
+        if (containsPattern(sql, "DECODE\\s*\\(")) {
+            issues.add(new CompatibilityIssue(
+                "DECODE_FUNCTION",
+                "DECODE：Oracle 函数，MySQL 需要改为 CASE WHEN",
+                Severity.MEDIUM
+            ));
+        }
+
+        // 检查 TO_DATE / TO_CHAR
+        if (containsPattern(sql, "TO_DATE\\s*\\(") ||
+            containsPattern(sql, "TO_CHAR\\s*\\(") ||
+            containsPattern(sql, "TO_NUMBER\\s*\\(")) {
+            issues.add(new CompatibilityIssue(
+                "TYPE_CONVERSION",
+                "类型转换函数：Oracle 和 MySQL 语法不同",
+                Severity.MEDIUM
+            ));
+        }
+
+        return new AnalysisResult(issues);
+    }
+}
+```
+
+### 2. 分析结果
+
+扫描了 3000 多条 SQL 后，发现：
+
+```
+SQL 兼容性分析结果：
+- 完全兼容：45%（直接可迁移）
+- 需要改写：35%（修改 SQL 语句即可）
+- 需要改代码：15%（需要修改应用代码）
+- 不兼容：5%（需要重新设计）
+```
+
+## 第二阶段：SQL 改写（4 个月）
+
+### 1. 窗口函数改写
+
+Oracle 窗口函数使用频率最高的场景是**分页查询和排名**：
+
+**Oracle 原始写法**：
+
+```sql
+-- Oracle：分页查询，使用 ROWNUM
+SELECT * FROM (
+    SELECT a.*, ROWNUM rn FROM (
+        SELECT * FROM orders WHERE user_id = 123
+        ORDER BY created_at DESC
+    ) a WHERE ROWNUM <= 30
+) WHERE rn > 10;
+```
+
+**MySQL 改写**：
+
+```sql
+-- MySQL：使用 LIMIT OFFSET
+SELECT * FROM orders
+WHERE user_id = 123
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 10;
+```
+
+**Oracle 原始写法（排名）**：
+
+```sql
+-- Oracle：查询每个用户订单金额排名
+SELECT
+    user_id,
+    order_id,
+    total_amount,
+    RANK() OVER (PARTITION BY user_id ORDER BY total_amount DESC) as rank
+FROM orders;
+```
+
+**MySQL 改写（MySQL 8.0）**：
+
+```sql
+-- MySQL 8.0：窗口函数支持
+SELECT
+    user_id,
+    order_id,
+    total_amount,
+    RANK() OVER (PARTITION BY user_id ORDER BY total_amount DESC) as rank
+FROM orders;
+```
+
+### 2. 递归 CTE 改写
+
+Oracle 的 `CONNECT BY PRIOR` 是实现树形结构查询的标准方式。
+
+**Oracle 原始写法（组织架构查询）**：
+
+```sql
+-- Oracle：查询某个部门及其所有子部门的员工
+SELECT e.id, e.name, e.dept_id, LEVEL
+FROM employees e
+WHERE LEVEL <= 3
+START WITH e.dept_id = 10
+CONNECT BY PRIOR e.id = e.parent_id;
+```
+
+**MySQL 改写（WITH RECURSIVE）**：
+
+```sql
+-- MySQL：使用 WITH RECURSIVE
+WITH RECURSIVE dept_tree AS (
+    -- 基础查询：起始部门
+    SELECT id, name, parent_id, 1 as lvl
+    FROM departments
+    WHERE id = 10
+
+    UNION ALL
+
+    -- 递归查询：子部门
+    SELECT d.id, d.name, d.parent_id, dt.lvl + 1
+    FROM departments d
+    INNER JOIN dept_tree dt ON d.parent_id = dt.id
+    WHERE dt.lvl < 3
+)
+SELECT e.id, e.name, e.dept_id, dt.lvl
+FROM employees e
+INNER JOIN dept_tree dt ON e.dept_id = dt.id;
+```
+
+### 3. NVL / DECODE 改写
+
+```sql
+-- Oracle：NVL 函数
+SELECT NVL(phone, '无') FROM users;
+
+-- MySQL：IFNULL 或 COALESCE
+SELECT IFNULL(phone, '无') FROM users;
+-- 或
+SELECT COALESCE(phone, '无') FROM users;
+
+-- Oracle：DECODE 函数
+SELECT
+    name,
+    DECODE(status, 'pending', '待处理', 'paid', '已支付', 'completed', '已完成', '未知')
+FROM orders;
+
+-- MySQL：CASE WHEN
+SELECT
+    name,
+    CASE status
+        WHEN 'pending' THEN '待处理'
+        WHEN 'paid' THEN '已支付'
+        WHEN 'completed' THEN '已完成'
+        ELSE '未知'
+    END
+FROM orders;
+```
+
+### 4. 分页改写
+
+深度分页是 Oracle 到 MySQL 迁移中最常见的改写点：
+
+```sql
+-- Oracle：使用 ROWNUM 做深度分页
+SELECT * FROM (
+    SELECT a.*, ROWNUM rn FROM (
+        SELECT * FROM orders ORDER BY id DESC
+    ) a WHERE ROWNUM <= 5010
+) WHERE rn > 5000;
+
+-- MySQL：使用游标分页（效率更高）
+-- 方案 1：普通 LIMIT（深度分页仍然低效）
+SELECT * FROM orders ORDER BY id DESC LIMIT 10 OFFSET 5000;
+
+-- 方案 2：游标分页（推荐）
+-- 第一页
+SELECT * FROM orders ORDER BY id DESC LIMIT 10;
+
+-- 后续页面（传入上一页最后一条的 ID）
+SELECT * FROM orders
+WHERE id < #{lastId}
+ORDER BY id DESC
+LIMIT 10;
+```
+
+## 第三阶段：应用代码改造（3 个月）
+
+### 1. ORM 层改造
+
+公司使用的是 Hibernate ORM，Hibernate 对 Oracle 和 MySQL 有不同的方言（Dialect）。
+
+**原配置（Oracle）**：
 
 ```xml
-<!-- pom.xml 配置多版本编译 -->
-<properties>
-    <java.version>17</java.version>
-    <maven.compiler.source>17</maven.compiler.source>
-    <maven.compiler.target>17</maven.compiler.target>
-</properties>
-
-<!-- 升级依赖版本 -->
-<dependencyManagement>
-    <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-dependencies</artifactId>
-            <version>3.1.0</version>
-            <type>pom</type>
-            <scope>import</scope>
-        </dependency>
-    </dependencies>
-</dependencyManagement>
+<!-- persistence.xml -->
+<property name="hibernate.dialect">org.hibernate.dialect.Oracle12cDialect</property>
 ```
 
-### 场景二：Spring 5 -> Spring 6
+**新配置（MySQL）**：
 
-```java
-// Spring 5 -> Spring 6 关键变化
-
-// 1. Jakarta EE 命名空间
-// javax.* -> jakarta.*
-package com.example;
-
-import jakarta.persistence.Entity;
-import jakarta.persistence.Table;
-import jakarta.servlet.http.HttpServlet;
-import jakarta.validation.constraints.NotNull;
-
-@Entity
-@Table(name = "users")
-public class User {
-    @NotNull
-    private String name;
-}
-
-// 2. Spring 6 新特性：HTTP Interface
-@Service
-public class UserService {
-    @HttpExchange(url = "/api/users")
-    interface UserClient {
-        @GetExchange("/{id}")
-        User getUser(@PathVariable Long id);
-
-        @PostExchange
-        User createUser(@RequestBody User user);
-    }
-}
-
-// 3. 构造函数注入优先
-@Component
-public class UserService {
-    private final UserRepository userRepository;
-
-    // Spring 6 推荐构造函数注入
-    public UserService(UserRepository userRepository) {
-        this.userRepository = userRepository;
-    }
-}
+```xml
+<!-- persistence.xml -->
+<property name="hibernate.dialect">org.hibernate.dialect.MySQL8Dialect</property>
 ```
 
-### 场景三：单体框架 -> Spring Boot
+但只是换方言是不够的。部分 Hibernate 特性在 MySQL 中不工作：
 
 ```java
-// 老单体应用
-public class OldApplication {
-    public static void main(String[] args) {
-        // 手动配置
-        ApplicationContext ctx = new ClassPathXmlApplicationContext("applicationContext.xml");
+// 问题：Oracle 的 SEQUENCE 在 MySQL 中不支持
+// Oracle 写法：
+@Id
+@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_seq")
+@SequenceGenerator(name = "order_seq", sequenceName = "ORDER_SEQ")
+private Long id;
 
-        DataSource dataSource = ctx.getBean(DataSource.class);
-        SqlSessionFactory sessionFactory = new SqlSessionFactoryBuilder()
-            .build(dataSource);
-        SqlSession session = sessionFactory.openSession();
+// MySQL 改写：使用 TABLE 策略或 AUTO
+@Id
+@GeneratedValue(strategy = GenerationType.IDENTITY)  // 自增 ID
+private Long id;
+```
 
-        // ...
-    }
-}
+### 2. 分页插件改造
 
-// Spring Boot 改造
-@SpringBootApplication
-public class NewApplication {
-    public static void main(String[] args) {
-        SpringApplication.run(NewApplication.class, args);
-    }
-}
+项目中使用了 MyBatis-Plus（封装了 MyBatis），分页配置需要调整：
 
-// application.yml 配置
-spring:
-  datasource:
-    url: jdbc:mysql://localhost:3306/mydb
-    username: root
-    password: password
-  mybatis:
-    mapper-locations: classpath:mapper/*.xml
-    type-aliases-package: com.example.entity
-
-// 自动配置替代手动配置
+```java
+// MyBatis-Plus 分页配置
 @Configuration
-@AutoConfiguration
-public class MyBatisConfig {
-    // 如有需要，添加自定义配置
+public class MybatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+
+        // 分页插件
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+
+        // 防止全表更新（安全插件）
+        interceptor.addInnerInterceptor(new BlockAttackInnerInterceptor());
+
+        return interceptor;
+    }
 }
 ```
 
-## 并行运行策略
+### 3. 事务隔离级别
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    并行运行策略                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 策略一：功能对等                                       │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  新旧系统同时运行，流量逐步切换                      │   │
-│  │                                                         │   │
-│  │  ┌─────────────────────────────────────────────┐    │   │
-│  │  │                                     │    │   │
-│  │  │    流量分配                          │    │   │
-│  │  │    0% ────────────────────────────▶ 100% │   │
-│  │  │    [旧系统]       [新系统]        │    │   │
-│  │  │                                     │    │   │
-│  │  └─────────────────────────────────────────┘    │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 策略二：回退验证                                       │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  新系统验证通过后，切换流量                       │   │
-│  │  新系统有问题，快速回退到旧系统                   │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 策略三：影子表/影子库                                 │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  新系统写入时，同时写入影子库                     │   │
-│  │  对比新旧系统结果，验证正确性                  │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Oracle 的默认事务隔离级别是 `READ_COMMITTED`，MySQL 默认也是 `READ_COMMITTED`，但实现细节有差异：
 
 ```java
-// 影子表验证
+// 显式指定隔离级别（确保与 Oracle 行为一致）
+@Transactional(isolation = Isolation.READ_COMMITTED)
+public void processOrder(Long orderId) {
+    // 业务逻辑
+}
+```
+
+## 第四阶段：并行验证（2 个月）
+
+### 1. 影子库验证
+
+在迁移过程中，最关键的是验证新系统的正确性。团队采用了**影子库**方案：新旧系统同时写入，对比结果。
+
+```java
+// 影子库写入
 @Service
-public class ShadowTableService {
-    @Autowired private DataSource primaryDataSource;
-    @Autowired private DataSource shadowDataSource;
+public class OrderServiceWithShadowDb {
+
+    @Autowired private OrderMapper orderMapper;
+    @Autowired private ShadowOrderMapper shadowOrderMapper;
 
     @Transactional
-    public void saveUser(User user) {
-        // 写入主库
-        userMapper.insert(user);
+    public void createOrder(Order order) {
+        // 1. 写入主库（Oracle）
+        orderMapper.insert(order);
 
-        // 写入影子库
-        jdbcTemplate(shadowDataSource)
-            .update("INSERT INTO users_shadow SELECT * FROM users WHERE id = ?",
-                user.getId());
+        // 2. 写入影子库（MySQL）
+        shadowOrderMapper.insert(order);
     }
+}
 
-    // 定期对比数据
-    @Scheduled(cron = "0 0 2 * * ?")
-    public void compareData() {
-        List<Difference> diffs = compareUsers();
-        if (!diffs.isEmpty()) {
-            alertService.alert("影子表数据不一致: " + diffs);
+// 定期对比数据
+@Service
+public class ShadowDbValidator {
+
+    @Scheduled(cron = "0 0 3 * * ?")  // 每天凌晨 3 点
+    public void validate() {
+        int pageSize = 1000;
+        int page = 0;
+        int diffCount = 0;
+
+        while (true) {
+            List<Order> mainOrders = orderMapper.selectPage(page, pageSize);
+            List<Order> shadowOrders = shadowOrderMapper.selectPage(page, pageSize);
+
+            if (mainOrders.isEmpty()) break;
+
+            for (int i = 0; i < mainOrders.size(); i++) {
+                Order main = mainOrders.get(i);
+                Order shadow = shadowOrders.get(i);
+
+                if (!equals(main, shadow)) {
+                    diffCount++;
+                    log.error("数据不一致：orderId={}, main={}, shadow={}",
+                        main.getId(), main, shadow);
+                }
+            }
+
+            page++;
+        }
+
+        if (diffCount > 0) {
+            alertService.alert("影子库数据不一致，数量：{}", diffCount);
         }
     }
 }
 ```
 
-## 流量切换
+### 2. 功能测试
+
+影子库验证数据一致性之外，还需要完整的功能测试：
+
+```
+测试策略：
+1. 单元测试：覆盖所有改写的 SQL，确保结果与 Oracle 一致
+2. 集成测试：在测试环境跑完整业务流程，对比 Oracle 和 MySQL 结果
+3. 性能测试：验证迁移后性能不下降（允许 10% 的性能差异）
+4. 压力测试：在高并发下验证 MySQL 稳定性
+```
+
+## 第五阶段：灰度切换（1 个月）
+
+### 1. 双写阶段
+
+数据迁移完成后，进入双写阶段：新系统写入 MySQL，旧系统写入 Oracle，通过数据同步保持一致。
+
+```
+双写阶段：
+┌──────────────┐     写入      ┌──────────────┐
+│  应用层       │ ────────────→ │    MySQL     │
+│              │     写入      │   (新主库)    │
+└──────────────┘ ────────────→ └──────────────┘
+                                        ↓ 增量同步
+                                  ┌──────────────┐
+                                  │    Oracle    │
+                                  │   (只读备库) │
+                                  └──────────────┘
+```
+
+### 2. 灰度切换
 
 ```yaml
-# 网关流量切换
+# 网关灰度配置
 spring:
   cloud:
     gateway:
       routes:
-        # 旧系统
-        - id: legacy
-          uri: http://legacy-monolith:8080
+        # 写操作：先切 MySQL
+        - id: write-route
+          uri: lb://mysql-service
           predicates:
-            - Path=/api/legacy/**
-          filters:
-            - StripPrefix=1
+            - Path=/api/orders/**
+            - Method=POST,PUT,DELETE
 
-        # 新系统（初始权重 0）
-        - id: new-service
-          uri: lb://new-service
+        # 读操作：初期 Oracle 和 MySQL 各 50%
+        - id: read-route-mysql
+          uri: lb://mysql-service
           predicates:
-            - Path=/api/new/**
+            - Path=/api/orders/**
+            - Method=GET
+            - Header=X-Read-Source, mysql
 
-# 动态权重切换
-# 使用 Argo Rollouts
-apiVersion: argoproj.io/v1alpha1
-kind: Rollout
-metadata:
-  name: new-service
-spec:
-  strategy:
-    canary:
-      steps:
-        - setWeight: 5
-        - pause: {duration: 10m}
-        - setWeight: 20
-        - pause: {duration: 10m}
-        - setWeight: 50
-        - pause: {duration: 10m}
-        - setWeight: 100
-      canaryMetadata:
-        labels:
-          role: canary
-      stableMetadata:
-        labels:
-          role: stable
+        - id: read-route-oracle
+          uri: lb://oracle-service
+          predicates:
+            - Path=/api/orders/**
+            - Method=GET
 ```
 
-## 验证与回退
+### 3. 全量切换
 
-```java
-// 灰度验证
-@Service
-public class CanaryValidationService {
-    @Autowired private MetricsService metricsService;
+灰度验证 2 周后，开始全量切换：
 
-    public boolean validateCanary() {
-        // 1. 错误率检查
-        double errorRate = metricsService.getErrorRate("canary");
-        if (errorRate > 0.01) {  // 1%
-            return false;
-        }
-
-        // 2. 延迟检查
-        double p99Latency = metricsService.getP99Latency("canary");
-        if (p99Latency > 500) {  // 500ms
-            return false;
-        }
-
-        // 3. 业务指标检查
-        double businessSuccessRate = metricsService.getBusinessSuccessRate("canary");
-        if (businessSuccessRate < 0.99) {
-            return false;
-        }
-
-        return true;
-    }
-
-    // 回退
-    public void rollback() {
-        rolloutService.rollback();
-    }
-}
+```
+全量切换流程：
+1. 停止 Oracle 写入（禁止新事务）
+2. 等待 MySQL 和 Oracle 数据完全同步
+3. 将所有流量切换到 MySQL
+4. Oracle 进入只读模式（保留 30 天）
+5. 下线 Oracle 写入链路
 ```
 
-## 总结
+## 最终结果
 
-技术栈迁移是高风险项目，需要谨慎决策。
+```
+Oracle → MySQL 迁移总结：
+迁移周期：12 个月
+SQL 改写：约 1500 条（35%）
+代码改造：约 200 个类（15%）
+性能影响：读写性能与 Oracle 基本持平
+数据一致性：通过影子库验证，数据差异 < 0.01%
+成本节省：每年约 180 万
 
-**迁移决策**：
+主要踩坑：
+1. 低估了递归 CTE 的改写难度（耗时 2 个月）
+2. 深度分页性能问题（改写了 3 遍才找到最优方案）
+3. Hibernate 序列策略需要全面改造
+```
 
-- 评估收益 vs 成本
-- 新技术是否有长期支持
-- 团队是否有学习能力
+## 总结：技术栈迁移的核心认知
 
-**常见迁移场景**：
+**第一，兼容性分析是迁移的第一步**。在动手之前，先用工具扫描所有代码，找出需要改写的地方。扫描结果决定了迁移的工作量和风险。
 
-- Java 版本升级
-- 框架升级（Spring 5 -> 6）
-- 单体到 Spring Boot
+**第二，SQL 改写是技术栈迁移中最繁琐的部分**。窗口函数、递归 CTE、分页逻辑，这些看似简单的 SQL，背后可能隐藏着 Oracle 的高级特性。改写时需要充分测试，确保结果与原逻辑一致。
 
-**迁移策略**：
+**第三，影子库验证是保证迁移正确性的关键**。新旧系统并行运行，对比结果，可以及早发现问题。跳过这一步直接切换，风险极高。
 
-- 并行运行，逐步切换
-- 影子表/影子库验证
-- 灰度发布 + 自动回退
-
-**核心认知**：技术栈迁移是手段，不是目的。不要为了迁移而迁移，确保迁移带来的收益大于成本。
+**第四，灰度切换是控制迁移风险的最后一道防线**。不要相信「测试环境验证过了就没问题」——生产环境的流量、并发、数据分布都可能与测试环境不同。灰度切换可以在小范围内验证，发现问题及时回退。

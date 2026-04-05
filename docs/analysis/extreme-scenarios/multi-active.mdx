@@ -1,249 +1,585 @@
 ---
 title: 跨机房多活
-description: 多地域部署与容灾架构
+description: 真实机房故障场景下的容灾架构设计
 ---
 
 # 跨机房多活
 
-你的服务只部署在一个机房，机房断电后整个系统不可用。
+2019 年 7 月，某云厂商的北京可用区 A 发生了电力故障，持续约 4 小时。故障期间，该可用区内运行的所有服务全部中断，大量使用该可用区的互联网公司受到严重影响。其中一家公司的 CTO 在复盘会上说：「我们原本以为做了备份就够了，结果发现备份只是给自己看的——真正切换的时候才发现，DNS 解析缓存没有清理，数据库没有切换脚本，联系人都在睡觉，整个切换过程用了 3 个小时。」
 
-跨机房多活是高可用架构的终极形态，但实现成本高、复杂度大。
+这是一个典型的「以为做了容灾，但没做演练」的案例。
+
+跨机房多活是高可用架构的终极形态。它的目标是：**无论哪个机房发生故障，用户的请求都能在最短时间内被正常处理，用户甚至感知不到故障的发生。** 这个目标背后，是巨大的技术投入和运维复杂度。
+
+本篇文章从真实的机房故障场景出发，讲解多活架构的设计思路和落地细节。
+
+## 从一个真实的故障场景开始
+
+### 故障背景
+
+某中型互联网公司（DAU 约 300 万）的系统部署在两个机房：
+
+- **主机房 A**（北京可用区 A）：运行 80% 的服务
+- **备机房 B**（北京可用区 B）：运行 20% 的服务（平时不接流量）
+
+### 故障发生
+
+凌晨 3:17，机房 A 的主交换机出现硬件故障，导致约 60% 的服务器网络中断。剩余 40% 的服务器虽然网络正常，但由于共享存储（NAS）不可用，部分服务仍然无法正常工作。
+
+### 真实的切换过程
+
+```
+3:17  故障发生。监控系统报警，值班 SRE 被叫醒。
+3:20  确认为机房级故障，启动应急预案。
+3:25  手动执行 DNS 切换：将域名解析从机房 A 的 SLB 切换到机房 B。
+3:35  大量请求涌入机房 B，机房 B 容量不足，开始出现超时。
+3:42  紧急扩容机房 B 的服务实例（从 20% 扩到 100%），但数据库连接池配置
+      不足以支撑双倍连接，数据库开始告警。
+3:50  修改数据库连接池配置，重启数据库服务。
+3:58  数据库稳定，但部分订单数据因主机房网络中断而丢失（未同步到备机房）。
+4:05  故障恢复，总影响时间：48 分钟。
+4:10  开始排查数据丢失原因。
+```
+
+事后统计：故障期间，约 **12% 的用户订单数据丢失**（未能及时同步），直接损失约 **85 万元**，间接损失（用户信任度下降）无法量化。
+
+这个案例揭示了多活架构的几个核心问题：
+
+- **DNS 切换不是自动的**，需要人工操作 + DNS 缓存刷新
+- **容量规划不足**，备用机房必须能承接全量流量
+- **数据同步是最大的坑**，跨机房的数据一致性比想象中难得多
 
 ## 多活架构等级
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    多活架构等级                                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Level 1：冷备                                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 主机房故障后手动切换                         │   │
-│  │  - RTO（恢复时间目标）: 小时级                  │   │
-│  │  - 成本：低                                        │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Level 2：热备                                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 数据实时同步，备机房处于待机状态                 │   │
-│  │  - 主机房故障后自动/手动切换                       │   │
-│  │  - RTO：分钟级                                       │   │
-│  │  - 成本：中                                         │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Level 3：同城双活                                      │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 同城两机房同时对外服务                         │   │
-│  │  - 流量自动分配                                    │   │
-│  │  - RTO：秒级                                        │   │
-│  │  - 成本：高                                         │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Level 4：异地多活                                      │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 多地域同时对外服务                             │   │
-│  │  - 就近访问                                        │   │
-│  │  - 任意机房故障，其他机房接管                       │   │
-│  │  - RTO：秒级                                        │   │
-│  │  - 成本：极高                                       │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+多活不是一个「做了/没做」的二元问题，而是一个有多个等级的连续谱。从最低的冷备到最高的异地多活，每个等级对应不同的投入和保障能力。
 
-## 同城双活架构
+### 等级一：冷备
+
+冷备是最简单、成本最低的容灾方案。**备机房平时不运行任何服务**，只有在主机房故障后，才手动启动服务、恢复数据。
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    同城双活架构                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │              用户请求                                       │   │
-│  │                 │                                          │   │
-│  │                 ▼                                          │   │
-│  │         ┌─────────────┐                                │   │
-│  │         │  全局负载  │  DNS / Anycast                   │   │
-│  │         └──────┬─────┘                                │   │
-│  │                │                                           │   │
-│  │       ┌───────┴───────┐                               │   │
-│  │       ▼               ▼                               │   │
-│  │   ┌───────┐       ┌───────┐                       │   │
-│  │   │ 机房 A │       │ 机房 B │                       │   │
-│  │   │ (主)  │       │ (备)   │                       │   │
-│  │   └───┬───┘       └───┬───┘                       │   │
-│  │       │               │                               │   │
-│  │       └───────┬───────┘                               │   │
-│  │               │                                       │   │
-│  │               ▼                                       │   │
-│  │         ┌─────────────┐                            │   │
-│  │         │  同步复制  │  主从同步                     │   │
-│  │         └─────────────┘                            │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+日常状态：
+主机房 A：100% 服务运行，承载全部流量
+备机房 B：关机状态，无服务运行，无数据同步
+
+故障后：
+1. 启动备机房 B 的服务器（约 30 分钟）
+2. 从备份恢复数据（取决于数据量，约 30 分钟 - 数小时）
+3. 修改 DNS 指向（约 10 分钟）
+4. 切流
+
+RTO：小时级
+RPO：取决于备份频率，最差可能丢失几小时的数据
 ```
 
-## 异地多活架构
+**适用场景**：非核心系统、内部工具、对停机时间容忍度高的业务。
+
+**不适用场景**：核心交易系统、用户直接使用的线上服务。
+
+### 等级二：热备（主备同步）
+
+热备比冷备更进一步：**备机房平时保持运行状态，实时同步主机房的数据**。故障时不需要启动服务器，但仍然需要手动切换流量。
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    异地多活架构                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  单元化架构：                                           │   │
-│  │                                                         │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │                                         │   │   │
-│  │  │  用户请求 →就近接入 → 本地处理         │   │   │
-│  │  │                                         │   │   │
-│  │  └─────────────────────────────────────────┘   │   │
-│  │                                                         │   │
-│  │  数据分类：                                               │   │
-│  │  - 本地数据：用户维表、配置等（可多写）         │   │
-│  │  - 全局数据：订单、账户等（单写 + 同步）        │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+日常状态：
+主机房 A：100% 服务运行，承载全部流量
+备机房 B：服务运行，数据库实时同步，但不接收请求
+
+故障后：
+1. 提升备机房 B 为主机（自动或手动，约 5 分钟）
+2. 修改 DNS 指向（约 10 分钟）
+3. 切流
+
+RTO：15-30 分钟
+RPO：接近零（实时同步）
 ```
 
-## 数据同步
+热备的问题是**备机房平时不承载流量**，资源利用率低，而且**切换时 DNS 刷新需要时间**（用户端 DNS 缓存最长可达 24 小时，部分用户会持续访问故障机房）。
+
+### 等级三：同城双活
+
+同城双活是大多数中型互联网公司的目标：**两个机房同时承载流量，故障时自动切换，不需要人工干预**。
+
+```
+日常状态：
+主机房 A：50-60% 流量
+备机房 B：40-50% 流量（按机房容量比例分配）
+两个机房都有完整的服务和数据副本
+
+故障后：
+1. 负载均衡器自动将故障机房流量切到健康机房（秒级）
+2. 故障机房的服务自动下线（健康检查触发）
+
+RTO：秒级到分钟级
+RPO：接近零（同城网络延迟通常 < 5ms，数据同步几乎无感知）
+```
+
+同城双活的关键技术挑战是**数据库双向同步**——两个机房同时写入时，如何保证数据不冲突？
+
+**解决方案：按用户 ID 路由到固定机房**。每个用户固定属于某个机房（按 userId % N 路由），该用户的所有读写都在同一个机房内完成，避免跨机房的事务。
 
 ```java
-// 异地数据同步
+// 同城双活路由：按 userId 固定到某个机房
 @Service
-public class CrossRegionSyncService {
+public class UserRoutingService {
+    @Autowired private DataSource dataSourceA;
+    @Autowired private DataSource dataSourceB;
+
+    // 路由规则：userId % 2 == 0 → 机房 A，userId % 2 == 1 → 机房 B
+    public DataSource routeDataSource(Long userId) {
+        return (userId % 2 == 0) ? dataSourceA : dataSourceB;
+    }
+
+    // 获取用户所属机房
+    public String getUserHomeRegion(Long userId) {
+        return (userId % 2 == 0) ? "region-A" : "region-B";
+    }
+}
+
+// 订单服务：按用户 ID 路由
+@Service
+public class OrderService {
+    @Autowired private UserRoutingService routingService;
+
+    @Transactional
+    public Order createOrder(Long userId, OrderRequest request) {
+        // 1. 按 userId 获取对应的数据源
+        DataSource ds = routingService.routeDataSource(userId);
+
+        // 2. 所有操作都在同一个数据源内完成（无跨机房事务）
+        try (Connection conn = ds.getConnection()) {
+            // 扣减库存（在当前机房内完成）
+            stockMapper.decreaseStock(conn, request.getProductId(), 1);
+
+            // 创建订单（在当前机房内完成）
+            Order order = new Order();
+            order.setUserId(userId);
+            order.setProductId(request.getProductId());
+            orderMapper.insert(conn, order);
+
+            return order;
+        }
+    }
+}
+```
+
+### 等级四：异地多活（单元化）
+
+异地多活是阿里、字节等大厂采用的方案，**在地理上相隔足够远的多个位置同时提供服务**。它能应对的不只是机房故障，还包括城市级灾难（地震、洪水、大规模停电）。
+
+单元化（Cell-based Architecture）是异地多活的核心设计思想：**把整个业务拆成多个相互独立的「单元」，每个单元包含完整的应用层和本地数据，单元之间不跨单元调用**。
+
+```
+全国划分为多个 Cell：
+
+Cell 北京：
+  负责：北京 + 天津 + 河北 的用户
+  数据：本地用户数据为主，全局数据（订单、账户）通过同步中间件同步
+
+Cell 上海：
+  负责：上海 + 江苏 + 浙江 的用户
+  数据：同上
+
+Cell 广州：
+  负责：广东 + 广西 + 海南 的用户
+  数据：同上
+
+用户就近接入自己所属的 Cell，故障时：
+1. 健康检查发现 Cell 北京不可用
+2. 路由层将北京用户流量切到最近的可用 Cell（如 Cell 上海）
+3. 北京用户在上海 Cell 临时运行，数据在上海本地处理
+4. 故障恢复后，北京 Cell 重新上线，北京用户切回
+```
+
+## 数据同步：多活架构的核心难题
+
+### 三类数据，三种同步策略
+
+多活架构中最复杂的问题不是流量切换，而是**数据同步**。不同类型的数据，需要不同的同步策略：
+
+| 数据类型 | 特点 | 同步策略 | 同步延迟 | 一致性级别 |
+| --- | --- | --- | --- | --- |
+| **用户维表**（个人信息、账户余额） | 强一致性要求 | 数据库主从同步（Paxos/Raft） | < 1s | 强一致性 |
+| **业务数据**（订单、库存） | 最终一致性可接受 | 消息队列异步同步 | 秒级 | 最终一致性 |
+| **缓存数据**（Session、热点数据） | 可以丢失 | 不同步，故障时重建 | N/A | 无一致性保证 |
+
+### 数据库同步：MySQL 半同步复制 vs Binlog 订阅
+
+```java
+// 方案一：MySQL 半同步复制（ASM）
+// MySQL 5.7+ 支持半同步复制，主库写入后，等待至少一个从库确认收到日志才返回成功
+// 优点：配置简单，MySQL 原生支持
+// 缺点：主库在从库响应慢时会阻塞，跨机房延迟高时性能下降明显
+
+// 配置半同步复制（主库）
+SET GLOBAL rpl_semi_sync_master_enabled = ON;
+SET GLOBAL rpl_semi_sync_master_timeout = 1000;  -- 等待 1000ms
+
+// 方案二：Binlog 订阅（Canal / Debezium）
+// 优点：解耦主库和从库，不影响主库性能
+// 缺点：需要额外维护 Binlog 订阅服务
+
+// Canal 订阅实现（Java）
+@Service
+public class BinlogSyncService {
     @Autowired private KafkaTemplate kafkaTemplate;
 
-    // 1. 同城同步：直接复制
-    @KafkaListener(topics = "order-events")
-    public void syncOrderToSameRegion(OrderEvent event) {
-        // 同步到同城备机房
-        kafkaTemplate.send("order-events-backup", event);
-    }
+    // Canal 客户端监听 Binlog 变更
+    public void onRowData(RowData rowData) {
+        String tableName = rowData.getTableName();
+        List<Column> columns = rowData.getColumns();
 
-    // 2. 异地同步：异步复制 + 补偿
-    @Async
-    public void syncToRemoteRegion(OrderEvent event) {
-        try {
-            // 发送到异地 Kafka
-            kafkaTemplate.send("order-events-remote", event);
-        } catch (Exception e) {
-            // 记录失败，稍后重试
-            saveToFailedQueue(event);
-        }
-    }
+        // 判断变更类型
+        switch (rowData.getEventType()) {
+            case INSERT:
+            case UPDATE:
+                // 将变更序列化为消息，发送到 Kafka
+                String json = serializeToJson(tableName, columns);
+                kafkaTemplate.send("binlog-sync:" + tableName,
+                    getPrimaryKey(rowData), json);
+                break;
 
-    // 3. 补偿任务
-    @Scheduled(fixedDelay = 60000)
-    public void compensateFailedEvents() {
-        List<OrderEvent> failed = getFailedEvents();
-        for (OrderEvent event : failed) {
-            try {
-                kafkaTemplate.send("order-events-remote", event);
-                deleteFromFailedQueue(event);
-            } catch (Exception e) {
-                // 继续重试
-            }
+            case DELETE:
+                // 删除操作也要同步
+                String deleteJson = serializeToJson(tableName, columns);
+                kafkaTemplate.send("binlog-sync-delete:" + tableName,
+                    getPrimaryKey(rowData), deleteJson);
+                break;
         }
     }
 }
 ```
 
-## 流量切换
+### 跨机房同步的一致性问题
 
-```yaml
-# DNS 智能解析
-# 用户就近接入
+当两个机房同时写入同一份数据时，会产生冲突。最常见的场景是**余额扣减**：两个机房同时对同一个账户余额扣减 100 元，如果各自独立执行，结果会出错。
 
-apiVersion: v1
-kind: Service
-metadata:
-  name: myapp-global
-  annotations:
-    # 主机房
-    clouddns.example.com/geo:
-      - region: cn-north
-        weight: 100
-      # 备机房
-    clouddns.example.com/geo:
-      - region: cn-east
-        weight: 0
+**解决方案一：绝对单向写**。所有涉及金额的写操作，只能在主机房执行。备机房只读不写，主机房写入后通过消息队列同步到备机房。这种方式牺牲了可用性（主机房挂了就没法扣减），但保证了强一致性。
 
----
-# 健康检查 + 自动切换
-# 主机房故障时，自动将权重切换到备机房
-```
+**解决方案二：冲突检测 + 人工处理**。备机房允许写入，但写入时检查版本号。如果发现冲突（版本号已被其他机房更新），记录冲突日志，触发告警，由人工处理。这种方式适合非金融类数据。
 
 ```java
-// 健康检查 + 流量切换
+// 冲突检测：基于版本号的乐观锁
 @Service
-public class TrafficSwitchService {
-    @Autowired private HealthCheckService healthCheck;
-    @Autowired private DnsService dnsService;
+public class BalanceSyncService {
+    @Autowired private KafkaTemplate kafkaTemplate;
 
-    @Scheduled(fixedDelay = 5000)
-    public void monitorAndSwitch() {
-        // 检查主机房健康状态
-        boolean mainHealthy = healthCheck.isHealthy("main-region");
+    @KafkaListener(topics = "binlog-sync:account_balance", groupId = "balance-sync")
+    public void onBalanceChange(BalanceChangeEvent event) {
+        String key = event.getAccountId().toString();
 
-        if (!mainHealthy && !isInSwitch) {
-            // 触发切换
-            switchToBackup();
-            isInSwitch = true;
-        } else if (mainHealthy && isInSwitch) {
-            // 主机房恢复，等待一段时间后切回
-            if (recoverWaitCount++ > 12) {  // 等待 1 分钟
-                switchToMain();
-                isInSwitch = false;
-                recoverWaitCount = 0;
-            }
-        } else {
-            recoverWaitCount = 0;
+        // 读取当前版本
+        AccountBalance current = accountBalanceRepo.findById(event.getAccountId());
+
+        // 版本冲突检测
+        if (current.getVersion() >= event.getVersion()) {
+            // 说明本机房已经有更新的数据，忽略这条同步消息
+            log.info("跳过旧版本同步: accountId={}, currentVersion={}, eventVersion={}",
+                event.getAccountId(), current.getVersion(), event.getVersion());
+            return;
         }
-    }
 
-    private void switchToBackup() {
-        log.warn("切换到备机房");
-        dnsService.updateWeight("main-region", 0);
-        dnsService.updateWeight("backup-region", 100);
-        alertService.alert("主备切换已完成");
+        // 更新本地余额
+        current.setBalance(event.getBalance());
+        current.setVersion(event.getVersion());
+        accountBalanceRepo.save(current);
+
+        log.info("同步余额变更: accountId={}, balance={}, version={}",
+            event.getAccountId(), event.getBalance(), event.getVersion());
     }
 }
 ```
+
+## 健康检查与自动切换
+
+多活架构中最关键的组件是**健康检查和流量切换系统**。这个系统的职责是：持续监控每个机房的健康状态，在故障发生时自动将流量切换到健康机房，整个过程不需要人工干预。
+
+### 健康检查的设计
+
+```java
+// 健康检查服务
+@Service
+public class HealthCheckService {
+    @Autowired private DataSource dataSourceA;
+    @Autowired private DataSource dataSourceB;
+    @Autowired private RedisTemplate redisTemplate;
+
+    // 检查项
+    private static final int CHECK_INTERVAL_MS = 5000;  // 每 5 秒检查一次
+    private static final int THRESHOLD_UNHEALTHY = 3;  // 连续 3 次失败标记为不健康
+
+    // 每秒检查一次
+    @Scheduled(fixedDelay = 1000)
+    public void checkHealth() {
+        checkRegionA();
+        checkRegionB();
+    }
+
+    private void checkRegionA() {
+        int failures = 0;
+
+        // 检查项 1：数据库连接
+        try (Connection conn = dataSourceA.getConnection()) {
+            if (!conn.isValid(3000)) failures++;
+        } catch (Exception e) {
+            failures++;
+        }
+
+        // 检查项 2：Redis 连接
+        try {
+            redisTemplate.getConnectionFactory().getConnection().ping();
+        } catch (Exception e) {
+            failures++;
+        }
+
+        // 检查项 3：应用健康端点
+        try {
+            RestTemplate rest = new RestTemplate();
+            rest.getForObject("http://region-a-internal:8080/health",
+                String.class);
+        } catch (Exception e) {
+            failures++;
+        }
+
+        // 更新健康状态（使用 Redis 存储，跨服务共享）
+        String key = "health:region-a:failures";
+        if (failures > 0) {
+            redisTemplate.opsForValue().increment(key);
+        } else {
+            redisTemplate.delete(key);
+        }
+
+        Integer failureCount =
+            Integer.parseInt(redisTemplate.opsForValue().get(key) ?? "0");
+
+        if (failureCount >= THRESHOLD_UNHEALTHY) {
+            // 触发故障告警
+            alertService.alert("Region A 不健康，连续失败 " + failureCount + " 次");
+        }
+    }
+}
+```
+
+### 自动流量切换
+
+```java
+// 流量切换服务
+@Service
+public class TrafficSwitchService {
+    @Autowired private HealthCheckService healthCheckService;
+    @Autowired private DnsService dnsService;
+    @Autowired private AlertService alertService;
+    @Autowired private RedisTemplate redisTemplate;
+
+    private volatile boolean isInSwitch = false;
+
+    // 每 5 秒执行一次切换检查
+    @Scheduled(fixedDelay = 5000)
+    public void checkAndSwitch() {
+        // 判断主机房是否不健康
+        boolean regionAHealthy = healthCheckService.isHealthy("region-A");
+        boolean regionBHealthy = healthCheckService.isHealthy("region-B");
+
+        if (!regionAHealthy && regionBHealthy && !isInSwitch) {
+            // 触发切换：Region A → Region B
+            doSwitch("region-A", "region-B");
+
+        } else if (regionAHealthy && !isInSwitch) {
+            // Region A 恢复，等待一段时间后切回
+            String switchRecoveryKey = "switch:recovery:count";
+            Integer count = Integer.parseInt(
+                redisTemplate.opsForValue().get(switchRecoveryKey) ?? "0");
+
+            if (count >= 12) {  // 连续 12 次（1 分钟）都健康，才切回
+                doSwitchBack("region-B", "region-A");
+                redisTemplate.delete(switchRecoveryKey);
+            } else {
+                redisTemplate.opsForValue().increment(switchRecoveryKey);
+            }
+
+        } else if (!regionAHealthy && !regionBHealthy) {
+            // 两个机房都不健康，触发最高级别告警
+            alertService.critical("两个机房均不可用！");
+        }
+    }
+
+    private void doSwitch(String fromRegion, String toRegion) {
+        log.warn("执行主备切换: {} → {}", fromRegion, toRegion);
+        alertService.alert("主备切换已开始：" + fromRegion + " → " + toRegion);
+
+        // 1. 修改 DNS：逐步将流量从故障机房切到健康机房
+        // 注意：不要一次性全部切换，要分批（10% → 30% → 50% → 100%）
+        dnsService.updateWeight(fromRegion, 0);
+        dnsService.updateWeight(toRegion, 10);  // 先切 10%，观察
+
+        // 等待 30 秒，观察指标
+        try { Thread.sleep(30000); } catch (InterruptedException ignored) {}
+
+        // 2. 观察健康机房的指标（错误率、延迟）
+        boolean healthy = observeTargetRegion(toRegion);
+        if (healthy) {
+            dnsService.updateWeight(toRegion, 100);  // 切完全部流量
+            isInSwitch = true;
+            alertService.alert("主备切换完成");
+        } else {
+            // 切换后健康机房出现问题，回滚
+            log.error("目标机房 {} 不健康，回滚切换", toRegion);
+            dnsService.updateWeight(fromRegion, 100);
+            dnsService.updateWeight(toRegion, 0);
+        }
+    }
+
+    private boolean observeTargetRegion(String region) {
+        // 观察 30 秒内的错误率和延迟
+        // 错误率 > 5% 或 p99 延迟 > 1s → 不健康
+        // ...
+        return true; // 简化实现
+    }
+}
+```
+
+**分批切换的原因**：即使健康机房能承接全量流量，突然涌入的流量也会造成性能波动（CPU 抖动、连接池瞬时压力）。分批切换可以让健康机房有时间「热身」。
+
+## DNS 切换的坑
+
+DNS 切换是很多多活方案中最容易被低估的环节。
+
+### DNS 缓存问题
+
+DNS 记录在用户端有缓存，TTL（Time To Live）决定了缓存多久过期。即使你在 DNS 服务端改了记录，用户端也可能继续访问旧 IP，长达数小时。
+
+**解决方案**：
+
+1. **设置合理的 TTL**。生产环境的 DNS 记录 TTL 通常设置为 60-300 秒。太长会导致切换慢，太短会增加 DNS 查询压力。
+2. **使用 HTTPDNS / DoH / DoT**。绕过运营商 DNS 缓存，直接在客户端做 DNS 解析。阿里云 HTTPDNS、腾讯云 HTTPDNS 都提供这个能力。
+3. **客户端侧兜底**。在 SDK 层检测到请求失败后，主动尝试备用域名/IP，而不是等 DNS 缓存自然过期。
+
+```java
+// 客户端 DNS 降级逻辑
+public class DnsFailoverInterceptor implements Interceptor {
+    private List<String> ipList = Arrays.asList(
+        "1.1.1.1",  // 机房 A
+        "2.2.2.2"   // 机房 B
+    );
+
+    @Override
+    public Response intercept(Chain chain) throws IOException {
+        for (String ip : ipList) {
+            try {
+                // 逐个尝试每个 IP
+                Request request = chain.request()
+                    .newBuilder()
+                    .url(chain.request().url().newBuilder()
+                        .host(ip)
+                        .build())
+                    .build();
+
+                Response response = chain.proceed(request);
+
+                if (response.isSuccessful()) {
+                    return response;
+                }
+            } catch (Exception e) {
+                // 当前 IP 不可用，尝试下一个
+                log.warn("请求 IP {} 失败，尝试下一个: {}", ip, e.getMessage());
+            }
+        }
+
+        throw new IOException("所有机房均不可用");
+    }
+}
+```
+
+## 真实踩坑案例
+
+### 踩坑一：切换后发现「幽灵数据」
+
+某公司在故障切换后，发现备机房的数据库里有一些「幽灵订单」——这些订单在备机房创建了，但主机房宕机前同步过来了一条更新，导致订单状态不一致。
+
+排查发现：故障发生时，主机房有一个事务正在写入订单（状态 = PENDING），但还没提交。备机房同步到的数据是这条未提交事务的中间状态（部分字段已更新，部分字段未更新）。
+
+**教训**：数据库主从同步无法保证分布式事务的原子性。解决方案是使用**半同步复制**，确保事务日志至少在一个备库确认收到后才算提交。
+
+### 踩坑二：缓存击穿
+
+故障切换后，大量请求涌入健康机房。但健康机房的 Redis 缓存是空的（之前没有承载这些用户），导致所有请求直接打到数据库，数据库瞬间过载。
+
+**教训**：缓存不能只做单机房内的缓存。健康检查和缓存预热必须联动：一旦检测到主机房可能不可用，立即开始向备用机房预热缓存数据。
+
+### 踩坑三：RabbitMQ 消息重复消费
+
+故障切换后，消息队列中的消息被两个机房的消费者同时消费，导致库存被扣减两次。
+
+**教训**：MQ 消费者必须支持幂等消费。方案是在消息中添加唯一 ID，消费者在处理前先检查该 ID 是否已处理（用 Redis 或数据库唯一索引）。
+
+```java
+// 幂等消费
+@Service
+public class InventoryConsumer {
+    @Autowired private RedisTemplate redisTemplate;
+
+    @KafkaListener(topics = "inventory-deduct")
+    public void consume(InventoryDeductMessage msg) {
+        String idempotentKey = "consumed:inventory:" + msg.getMessageId();
+
+        // 检查是否已消费
+        Boolean already = redisTemplate.opsForValue()
+            .setIfAbsent(idempotentKey, "1",
+                Duration.ofHours(24));
+
+        if (Boolean.FALSE.equals(already)) {
+            log.info("消息已消费，跳过: messageId={}", msg.getMessageId());
+            return;
+        }
+
+        try {
+            // 执行库存扣减
+            inventoryService.deduct(msg.getProductId(), msg.getQuantity());
+        } catch (Exception e) {
+            // 消费失败，删除幂等标记，等待重试
+            redisTemplate.delete(idempotentKey);
+            throw e;
+        }
+    }
+}
+```
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| RTO（Recovery Time Objective） | 可靠性指标 | 恢复时间目标，从故障发生到服务恢复的最长时间，目标通常是业务可接受的 SLA |
+| RPO（Recovery Point Objective） | 可靠性指标 | 恢复点目标，允许丢失的最大数据量，如 RPO=0 表示不允许丢失任何数据 |
+| DNS 切换 | 技术名词 | 将域名的解析从故障机房 IP 改为健康机房 IP，需要注意 DNS 缓存导致切换延迟 |
+| 单元化（Cell-based Architecture） | 架构模式 | 将业务按地域或用户 ID 划分为独立单元，每个单元独立运行，单元之间不跨单元调用 |
+| 半同步复制（Semi-sync Replication） | 技术名词 | MySQL 的一种复制模式，主库写入后等待至少一个从库确认收到日志才返回客户端，提高数据安全性 |
+| Binlog 订阅 | 技术名词 | 监听 MySQL 的 Binlog（二进制日志），将数据变更事件实时推送到消息队列，用于数据同步和解耦 |
+| Canal / Debezium | 工具名 | 开源的 Binlog 订阅中间件，Canal 由阿里开发，Debezium 由 Red Hat 开发 |
+| HTTPDNS | 技术名词 | 绕过运营商 Local DNS，直接从 HTTP 端点获取最优 IP，减少 DNS 缓存导致的解析延迟 |
+| 健康检查（Health Check） | 技术名词 | 定期检查服务健康状态的机制，通常包括网络连通性、数据库可用性、依赖服务可用性等 |
+| 幂等消费（Idempotent Consumption） | 技术名词 | 同一消息重复消费结果不变，用于 MQ 消费者防止消息重复处理 |
+| 冷备 / 热备 | 架构模式 | 冷备：备机房平时关机；热备：备机房运行但不承载流量 |
+| 两地三中心 | 架构模式 | 在两个城市建设三个机房（两个 active，一个 standby），兼顾容灾和成本 |
+| 容量规划 | 工程实践 | 评估系统容量，确保备机房能够承接全量流量，是多活架构的前提 |
+| DNS 缓存 | 技术名词 | 运营商或用户侧 DNS 解析结果会被缓存，TTL 决定缓存时间，过长的 TTL 会导致切换延迟 |
 
 ## 总结
 
-跨机房多活是高可用架构的终极形态。
+跨机房多活是成本最高的架构演进之一，但它解决的是最硬的需求：**在任何情况下，用户的请求都能被处理**。
 
-**架构等级**：
+**多活等级的选择**：
 
-- 冷备：手动切换，成本低
-- 热备：自动切换，分钟级 RTO
-- 同城双活：自动切换，秒级 RTO
-- 异地多活：单元化架构，最高成本
+- **冷备**：成本最低，适合非核心系统
+- **热备**：需要实时数据同步，适合中等可用性要求的系统
+- **同城双活**：两个机房同时承载流量，适合高可用要求的系统（大多数中型互联网公司的目标）
+- **异地多活（单元化）**：应对城市级灾难，适合金融、核心交易系统
 
-**核心挑战**：
+**多活架构的三大核心问题**：
 
-- 数据一致性：CAP 理论的权衡
-- 切换速度：RTO 目标
-- 成本控制：业务价值 vs 投入
+1. **数据同步**：三类数据（用户数据、业务数据、缓存数据）各有不同策略，强一致性数据只能单向写，最终一致性数据用消息队列同步
+2. **健康检查**：多维度检查（DB、Redis、应用层），连续多次失败才触发切换，避免误判
+3. **DNS 切换**：设置合理 TTL，配合 HTTPDNS 绕过缓存，配合客户端降级兜底
 
-**核心认知**：多活架构是高可用的高级形式，但成本极高。不要盲目追求多活，先评估业务对可用性的真实需求。
+**多活架构的真正难点不是技术设计，而是运维流程和故障演练。** 一次真实的机房故障，考验的是团队在压力下的执行力和判断力。演练的频率和深度，直接决定了真实故障时的 RTO。
+
+建议每个季度至少做一次完整的故障演练，模拟机房断电、网络中断、数据中心级别的灾难。每一次演练暴露出的问题，都是真实故障中可能吃的大亏。

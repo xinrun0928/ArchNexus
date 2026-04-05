@@ -1,356 +1,442 @@
 ---
 title: 数据库调优
-description: 数据库性能瓶颈的识别与优化实战
+description: 以某电商订单查询从 500ms 优化到 20ms 为完整案例
 ---
 
 # 数据库调优
 
-你的查询从 10ms 变成了 500ms，数据库 CPU 100%，用户体验急剧下降。
+某电商公司 B2C 平台，用户在「我的订单」页面查询历史订单，平均响应时间 500ms，p99 超过 2 秒。用户反馈「加载订单要等好几秒」，产品经理把这个问题提给了研发团队。
 
-数据库是最常见的性能瓶颈来源。优化数据库往往能带来数量级的性能提升。
+研发团队的第一反应是：「加个索引吧」。于是 DBA 加了一条索引，响应时间从 500ms 降到了 420ms——有一点效果，但远远不够。产品经理再次追问，团队开始深入排查，才发现真正的问题根本不在索引，而在 SQL 本身和 ORM 框架的 N+1 查询。
 
-## 性能瓶颈识别
+这一节用这个真实案例，完整还原一次数据库性能优化的全过程。
+
+## 问题描述
+
+### 业务场景
+
+用户进入「我的订单」页面，需要展示：
+
+- 订单基本信息（订单号、金额、状态、时间）
+- 订单包含的商品列表（商品名称、图片、数量、单价）
+- 收货人信息（姓名、地址、联系电话）
+- 支付信息（支付方式、支付时间）
+
+### 当前表现
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    数据库性能瓶颈来源                                 │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 1. 查询慢：全表扫描、缺少索引                         │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  症状：                                                │   │
-│  │  - 查询时间随数据量线性增长                          │   │
-│  │  - EXPLAIN 显示全表扫描                              │   │
-│  │  - 索引列做函数运算                                  │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 2. 连接耗尽：连接池配置不当                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  症状：                                                │   │
-│  │  - 频繁出现连接超时                                  │   │
-│  │  - 连接数接近或等于 max_connections                 │   │
-│  │  - 大量连接处于 Sleep 状态                          │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 3. 锁竞争：事务过长、锁粒度大                        │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  症状：                                                │   │
-│  │  - 大量事务处于等待状态                              │   │
-│  │  - 死锁频繁出现                                      │   │
-│  │  - 延迟忽高忽低                                      │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 4. 资源饱和：CPU、IO、内存                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  症状：                                                │   │
-│  │  - CPU 使用率持续 100%                             │   │
-│  │  - 磁盘 IO 等待高                                    │   │
-│  │  - 缓冲池命中率低                                    │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+接口：GET /api/orders?userId={userId}&page=1&pageSize=20
+响应时间：平均 500ms，p99 > 2000ms
+调用频率：约 3000 QPS（高峰期）
+数据库：MySQL 8.0，单库（未做分库分表），数据量约 5000 万订单
 ```
 
-## 慢查询分析
+## 第一轮排查：加索引
+
+### 诊断过程
+
+第一步通常是查看慢查询日志：
 
 ```sql
--- 查看慢查询日志
+-- 查看慢查询
 SHOW VARIABLES LIKE 'slow_query_log';
-SHOW VARIABLES LIKE 'long_query_time';
+SET GLOBAL long_query_time = 0.1;  -- 设置 100ms 阈值
 
--- 设置慢查询阈值为 1 秒
-SET GLOBAL long_query_time = 1;
-
--- 查看慢查询统计
+-- 查看有哪些慢查询
 SHOW GLOBAL STATUS LIKE 'Slow_queries';
+```
 
--- 分析慢查询
+```sql
+-- 分析最慢的几条查询
 EXPLAIN
-SELECT u.*, o.*
-FROM users u
-LEFT JOIN orders o ON u.id = o.user_id
-WHERE u.status = 'active'
-  AND o.created_at > '2024-01-01';
-
--- 详细分析
-EXPLAIN ANALYZE
-SELECT * FROM orders WHERE status = 'pending';
+SELECT o.*, u.name, u.phone, u.address
+FROM orders o
+LEFT JOIN users u ON o.user_id = u.id
+WHERE o.user_id = 12345
+ORDER BY o.created_at DESC
+LIMIT 20;
 ```
 
-### 常见慢查询模式
+```
+id: 1
+select_type: SIMPLE
+table: o
+type: ref
+key: idx_user_id
+rows: 1500
+Extra: Using index condition; Using filesort
+```
+
+发现 `idx_user_id` 索引存在，但 `Using filesort` 是个问题——`filesort` 意味着 MySQL 需要在内存或磁盘中对数据进行排序，数据量大时会很慢。而且注意到 `rows: 1500`——这说明按 `user_id` 查询出来有 1500 条记录，MySQL 要全部读出来再排序、再取前 20 条。
+
+### 第一轮优化：加复合索引
+
+DBA 的第一反应是对的：`ORDER BY created_at` 的字段没有在索引里，导致排序时需要 `filesort`。
 
 ```sql
--- 问题 1：SELECT *
-SELECT * FROM users WHERE id = 1;  -- [!code error]
--- 正确：只查询需要的字段
-SELECT id, name, email FROM users WHERE id = 1;
-
--- 问题 2：隐式类型转换（索引失效）
-SELECT * FROM orders WHERE order_no = 12345;  -- [!code error]
--- order_no 是 VARCHAR，传入数字导致全表扫描
--- 正确：使用字符串
-SELECT * FROM orders WHERE order_no = '12345';
-
--- 问题 3：LIKE 开头通配符
-SELECT * FROM users WHERE name LIKE '%张%';  -- [!code error]
--- 正确：使用全文索引或搜索引擎
-SELECT * FROM users WHERE MATCH(name) AGAINST('张');
-
--- 问题 4：OR 条件导致索引失效
-SELECT * FROM orders WHERE user_id = 1 OR status = 'pending';  -- [!code error]
--- 正确：拆分为 UNION
-SELECT * FROM orders WHERE user_id = 1
-UNION ALL
-SELECT * FROM orders WHERE status = 'pending' AND user_id IS NULL;
+-- 加复合索引：user_id + created_at，覆盖查询所需字段
+CREATE INDEX idx_user_orders ON orders(user_id, created_at DESC);
 ```
 
-## 索引优化
+**优化后结果**：响应时间从 500ms 降到了 420ms。有效果，但远不够。
 
-```sql
--- 创建复合索引：遵循最左前缀原则
-CREATE INDEX idx_user_status_created ON orders(user_id, status, created_at);
+**为什么效果不明显？** 索引解决了排序问题，但还有其他问题——JOIN 了用户表，每次订单查询还要额外查用户信息。真正的问题是，**这条 SQL 的逻辑本身需要重构**。
 
--- 查询时注意顺序
--- 命中索引
-SELECT * FROM orders WHERE user_id = 1;                        -- [!code highlight]
-SELECT * FROM orders WHERE user_id = 1 AND status = 'pending';  -- [!code highlight]
+## 第二轮排查：N+1 查询问题
 
--- 部分命中索引
-SELECT * FROM orders WHERE user_id = 1 AND created_at > '2024-01-01';
+### 诊断过程
 
--- 不命中索引
-SELECT * FROM orders WHERE status = 'pending';  -- [!code error]
-SELECT * FROM orders WHERE created_at > '2024-01-01';  -- [!code error]
+开发团队用链路追踪工具抓了一下，发现「我的订单」接口的实际调用链路是：
+
 ```
+总耗时 480ms
+├── 查询订单列表：40ms
+├── 查询用户信息（N+1）：400ms    ← 真正的耗时大户
+│   ├── 用户1：3ms
+│   ├── 用户2：3ms
+│   ├── 用户3：3ms
+│   └── ... 共执行 20 次
+└── 其他：40ms
+```
+
+原来，「我的订单」页面的商品列表和用户信息，并不是在一条 SQL 里 JOIN 出来的，而是**在代码里循环查的**。
+
+### 问题代码还原
 
 ```java
-// 索引优化实战
+// 问题代码：典型的 N+1 查询
 @Service
-public class IndexOptimizationService {
+public class OrderService {
 
-    // 识别缺失索引
-    public List<MissingIndex> findMissingIndexes() {
-        // MySQL 提供的索引建议
-        String sql = """
-            SELECT
-                TABLE_SCHEMA,
-                TABLE_NAME,
-                NON_UNIQUE,
-                INDEX_NAME,
-                SEQ_IN_INDEX,
-                COLUMN_NAME,
-                CARDINALITY,
-                SUB_PART
-            FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema')
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
-            """;
+    @Autowired private OrderRepository orderRepository;
+    @Autowired private UserRepository userRepository;
+    @Autowired private OrderItemRepository orderItemRepository;
 
-        // 通过慢查询日志识别缺失索引
-        // pt-query-digest / MySQL Workbench 可以自动分析
-        return jdbcTemplate.query(sql, new MissingIndexRowMapper());
-    }
+    public List<OrderVO> getUserOrders(Long userId, int page, int pageSize) {
+        // 查询订单列表：1 次查询
+        List<Order> orders = orderRepository.findByUserIdOrderByCreatedAtDesc(
+            userId, PageRequest.of(page, pageSize));
 
-    // 添加索引
-    public void addIndex(String table, String column) {
-        jdbcTemplate.execute(
-            String.format("CREATE INDEX idx_%s ON %s(%s)", column, table, column)
-        );
-    }
-}
-```
+        List<OrderVO> result = new ArrayList<>();
 
-## SQL 优化实战
+        for (Order order : orders) {
+            OrderVO vo = new OrderVO();
+            vo.setOrder(order);
 
-```java
-// 分页优化：深度分页问题
-@Service
-public class PaginationOptimizationService {
-    @Autowired private JdbcTemplate jdbcTemplate;
+            // 循环内查用户信息：20 次查询
+            User user = userRepository.findById(order.getUserId())
+                .orElseThrow(() -> new BizException("用户不存在"));
+            vo.setUser(convertUser(user));
 
-    // 问题：深度分页导致性能急剧下降
-    // SELECT * FROM orders LIMIT 1000000, 10;
-    // MySQL 需要扫描前 1000010 行，然后丢弃前 1000000 行
+            // 循环内查订单商品：20 次查询
+            List<OrderItem> items = orderItemRepository.findByOrderId(order.getId());
+            vo.setItems(convertItems(items));
 
-    // 优化 1：使用游标分页
-    public List<Order> cursorPagination(Long lastId, int pageSize) {
-        String sql = """
-            SELECT * FROM orders
-            WHERE id > ?
-            ORDER BY id
-            LIMIT ?
-            """;
-        return jdbcTemplate.query(sql,
-            new Object[]{lastId, pageSize},
-            orderMapper);
-    }
-
-    // 优化 2：覆盖索引 + 子查询
-    public List<Order> coveringIndexPagination(int offset, int pageSize) {
-        String sql = """
-            SELECT o.*
-            FROM orders o
-            INNER JOIN (
-                SELECT id FROM orders
-                ORDER BY id
-                LIMIT ? OFFSET ?
-            ) AS t ON o.id = t.id
-            """;
-        return jdbcTemplate.query(sql,
-            new Object[]{pageSize, offset},
-            orderMapper);
-    }
-
-    // 优化 3：限制返回字段
-    public List<OrderSummary> simplePagination(int page, int pageSize) {
-        int offset = (page - 1) * pageSize;
-        String sql = """
-            SELECT id, user_id, total_amount, created_at
-            FROM orders
-            ORDER BY id
-            LIMIT ? OFFSET ?
-            """;
-        return jdbcTemplate.query(sql,
-            new Object[]{pageSize, offset},
-            orderSummaryMapper);
-    }
-}
-
-// N+1 查询问题
-@Service
-public class N1QueryProblemService {
-    @Autowired private JdbcTemplate jdbcTemplate;
-
-    // 问题：循环内查询
-    @Transactional(readOnly = true)
-    public List<OrderDTO> getOrdersBad(Long userId) {
-        // 查询订单
-        List<Order> orders = orderRepository.findByUserId(userId);
-
-        // N+1 问题：循环内查询用户信息
-        return orders.stream()
-            .map(order -> {
-                User user = userRepository.findById(order.getUserId())
-                    .orElseThrow();  // [!code error]
-                return new OrderDTO(order, user);
-            })
-            .collect(Collectors.toList());
-    }
-
-    // 优化：JOIN 查询
-    @Transactional(readOnly = true)
-    public List<OrderDTO> getOrdersGood(Long userId) {
-        String sql = """
-            SELECT o.id, o.total_amount, o.created_at,
-                   u.id as user_id, u.name as user_name
-            FROM orders o
-            LEFT JOIN users u ON o.user_id = u.id
-            WHERE o.user_id = ?
-            """;
-        return jdbcTemplate.query(sql,
-            new Object[]{userId},
-            orderDTOMapper);
-    }
-
-    // 优化：批量查询
-    @Transactional(readOnly = true)
-    public List<OrderDTO> getOrdersBatch(Long userId) {
-        // 先查询订单
-        List<Order> orders = orderRepository.findByUserId(userId);
-        if (orders.isEmpty()) {
-            return Collections.emptyList();
+            result.add(vo);
         }
 
-        // 批量查询用户
-        List<Long> userIds = orders.stream()
-            .map(Order::getUserId)
-            .distinct()
-            .collect(Collectors.toList());
-
-        Map<Long, User> userMap = userRepository.findByIds(userIds)
-            .stream()
-            .collect(Collectors.toMap(User::getId, u -> u));
-
-        // 组装结果
-        return orders.stream()
-            .map(order -> new OrderDTO(order, userMap.get(order.getUserId())))
-            .collect(Collectors.toList());
+        return result;
     }
 }
 ```
 
-## 连接池优化
+20 条订单，每条订单循环查用户信息和商品列表，总共执行了 **1 + 20 + 20 = 41 次查询**。而且这不是 20 条订单的极限——如果用户有 100 条历史订单，这个接口会执行 201 次查询。
+
+### 第二轮优化：JOIN 一次性查出
+
+```java
+// 优化后：使用 JOIN 一次性查出所���数据
+public List<OrderVO> getUserOrdersOptimized(Long userId, int page, int pageSize) {
+    // 一条 SQL，用 JOIN 查出订单 + 用户 + 商品信息
+    String sql = """
+        SELECT o.id, o.order_no, o.total_amount, o.status, o.created_at,
+               u.name AS user_name, u.phone AS user_phone, u.address AS user_address,
+               oi.id AS item_id, oi.product_name, oi.quantity, oi.price
+        FROM orders o
+        LEFT JOIN users u ON o.user_id = u.id
+        LEFT JOIN order_items oi ON o.id = oi.order_id
+        WHERE o.user_id = ?
+        ORDER BY o.created_at DESC
+        """;
+
+    List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, userId);
+
+    // 按订单 ID 分组合并
+    Map<Long, OrderVO> orderMap = new LinkedHashMap<>();
+
+    for (Map<String, Object> row : rows) {
+        Long orderId = ((Number) row.get("id")).longValue();
+
+        if (!orderMap.containsKey(orderId)) {
+            OrderVO vo = new OrderVO();
+            vo.setOrderId(orderId);
+            vo.setOrderNo((String) row.get("order_no"));
+            vo.setTotalAmount(((Number) row.get("total_amount")).doubleValue());
+            vo.setStatus((String) row.get("status"));
+            vo.setCreatedAt((Timestamp) row.get("created_at"));
+            vo.setUser(convertUserFromRow(row));
+            vo.setItems(new ArrayList<>());
+            orderMap.put(orderId, vo);
+        }
+
+        OrderVO vo = orderMap.get(orderId);
+        if (row.get("item_id") != null) {
+            OrderItemVO item = new OrderItemVO();
+            item.setId(((Number) row.get("item_id")).longValue());
+            item.setProductName((String) row.get("product_name"));
+            item.setQuantity(((Number) row.get("quantity")).intValue());
+            item.setPrice(((Number) row.get("price")).doubleValue());
+            vo.getItems().add(item);
+        }
+    }
+
+    // 分页处理
+    List<OrderVO> result = new ArrayList<>(orderMap.values());
+    int fromIndex = page * pageSize;
+    int toIndex = Math.min(fromIndex + pageSize, result.size());
+    return result.subList(fromIndex, toIndex);
+}
+```
+
+**优化后结果**：响应时间从 420ms 降到了 120ms。41 次查询变成了 1 次查询，效果显著。
+
+但还有问题：120ms 仍然偏慢，而且 JOIN 查询在大数据量时可能引发新的问题。
+
+## 第三轮排查：深度分页问题
+
+### 诊断过程
+
+开发团队继续深入查看慢查询日志，发现了一条之前没注意到的查询：
+
+```sql
+SELECT * FROM orders
+WHERE user_id = 12345
+ORDER BY created_at DESC
+LIMIT 1000, 20;
+-- 耗时：85ms
+```
+
+这个查询是分页产生的。当用户翻到第 50 页时（`LIMIT 5000, 20`），MySQL 需要扫描前 5020 行，然后丢弃前 5000 行——这个过程随着 offset 增大而线性增长。
+
+### 深度分页问题解释
+
+```
+普通分页：LIMIT 0, 20
+MySQL 执行流程：
+1. 使用 idx_user_orders 索引，快速定位到第 1 条
+2. 读取 20 条记录
+3. 返回
+
+深度分页：LIMIT 5000, 20
+MySQL 执行流程：
+1. 使用 idx_user_orders 索引，定位到第 1 条
+2. 读取 5020 条记录（扫描大量行）
+3. 丢弃前 5000 条
+4. 返回后 20 条
+```
+
+### 第三轮优化：游标分页
+
+深度分页的解决思路是**用主键 ID 代替 offset**：
+
+```sql
+-- 优化后的游标分页
+-- 第一页：
+SELECT * FROM orders
+WHERE user_id = 12345
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- 第二页（传入上一页最后一条的 ID）：
+SELECT * FROM orders
+WHERE user_id = 12345 AND id < #{lastId}
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+```java
+// 游标分页实现
+public CursorPage<OrderVO> getOrdersByCursor(Long userId, Long lastId, int pageSize) {
+    List<Order> orders;
+
+    if (lastId == null) {
+        // 第一页
+        orders = orderRepository.findFirst20ByUserIdOrderByIdDesc(userId);
+    } else {
+        // 后续页面：只查 lastId 之前的
+        orders = orderRepository.findByUserIdAndLastId(userId, lastId,
+            PageRequest.of(0, pageSize));
+    }
+
+    if (orders.isEmpty()) {
+        return CursorPage.empty();
+    }
+
+    Long newLastId = orders.get(orders.size() - 1).getId();
+    boolean hasMore = orderRepository.countByUserIdAndIdLessThan(userId, newLastId) > 0;
+
+    return CursorPage.of(convertOrders(orders), newLastId, hasMore);
+}
+```
+
+**优化后结果**：无论用户翻到第几页，响应时间都稳定在 **18~25ms**，不再随页码增长而增长。
+
+## 最终结果
+
+| 优化阶段 | 优化措施 | 响应时间 | 效果 |
+| --- | --- | --- | --- |
+| 原始 | 无优化 | 500ms | - |
+| 第一轮 | 加复合索引 | 420ms | +16% |
+| 第二轮 | 消除 N+1 查询，改用 JOIN | 120ms | +71% |
+| 第三轮 | 游标分页替代深度分页 | 20ms | +83% |
+| **最终** | 综合优化 | **20ms** | **+96%** |
+
+## 深度优化：从单库到读写分离
+
+20ms 的响应时间对大多数场景已经足够，但这个公司在大促期间仍然会面临数据库压力——高峰期 3000 QPS，即使查询足够快，数据库的连接数和处理能力也会成为瓶颈。
+
+### 读写分离架构
 
 ```yaml
-# HikariCP 连接池配置
+# 数据源配置：主库写 + 从库读
 spring:
   datasource:
     hikari:
-      # 连接池大小：CPU 核心数 * 2 + 磁盘数
-      maximum-pool-size: 20
-      # 最小空闲连接
-      minimum-idle: 5
-      # 连接超时
-      connection-timeout: 30000
-      # 空闲超时
-      idle-timeout: 600000
-      # 最大生命周期
-      max-lifetime: 1800000
-      # 连接测试
-      connection-test-query: SELECT 1
+      # 主库连接池
+      master:
+        jdbc-url: jdbc:mysql://mysql-master:3306/ecommerce
+        username: app_user
+        password: ${DB_PASSWORD}
+        maximum-pool-size: 50
+
+      # 从库连接池（只读）
+      slave:
+        jdbc-url: jdbc:mysql://mysql-slave:3306/ecommerce
+        username: app_user_readonly
+        password: ${DB_PASSWORD}
+        maximum-pool-size: 100
+
+# 路由策略：写操作走主库，读操作走从库
+mybatis:
+  configuration:
+    database-id: mysql
 ```
 
 ```java
-// 连接池监控
+// 注解驱动的读写分离
 @Service
-public class ConnectionPoolMonitoring {
-    @Autowired
-    private DataSource dataSource;
+public class OrderService {
 
-    public void monitorConnectionPool() {
-        if (dataSource instanceof HikariDataSource) {
-            HikariDataSource hikari = (HikariDataSource) dataSource;
+    @Autowired private OrderMapper orderMapper;
 
-            HikariPoolMXBean pool = hikari.getHikariPoolMXBean();
+    // 写操作：强制走主库
+    @Transactional
+    @WriteOnly
+    public Order createOrder(Order order) {
+        orderMapper.insert(order);
+        return order;
+    }
 
-            log.info("连接池状态：");
-            log.info("活跃连接: {}", pool.getActiveConnections());
-            log.info("空闲连接: {}", pool.getIdleConnections());
-            log.info("等待连接线程: {}", pool.getThreadsAwaitingConnection());
-            log.info("总连接数: {}", pool.getTotalConnections());
-        }
+    // 读操作：自动路由到从库
+    @ReadOnly
+    public List<OrderVO> getUserOrders(Long userId) {
+        return orderMapper.selectByUserId(userId);
     }
 }
+```
+
+### 主从延迟的坑
+
+读写分离上线后，出现了新的问题：**用户下单后立即查看订单列表，有时看不到刚下的订单**。
+
+原因：MySQL 主从复制是异步的，主库写入后，从库可能还有几毫秒到几秒的延迟。在这段时间内，从库查不到刚写入的数据。
+
+```java
+// 解决方案：强一致性读走主库，最终一致性读走从库
+@Service
+public class OrderService {
+
+    @ReadOnly
+    public List<OrderVO> getUserOrders(Long userId) {
+        // 如果是最近的订单（ 5 分钟内），强制走主库
+        if (requiresFreshData(userId)) {
+            return orderMapper.selectByUserIdFromMaster(userId);
+        }
+        return orderMapper.selectByUserId(userId);
+    }
+
+    private boolean requiresFreshData(Long userId) {
+        // 查找用户最近是否有下单操作
+        // 这个判断可以用 Redis 记录「最近有写操作」的时间窗口
+        String key = "user:" + userId + ":recent_write";
+        return redisTemplate.hasKey(key);
+    }
+}
+```
+
+## 常见慢查询模式汇总
+
+回顾这次优化的过程，涉及了四种最常见的慢查询问题，总结如下：
+
+### 模式一：隐式类型转换导致索引失效
+
+```sql
+-- 表结构：order_no 是 VARCHAR(32)
+-- 问题 SQL：
+SELECT * FROM orders WHERE order_no = 12345;  -- [!code error]
+-- 传入了数字，MySQL 会将 order_no 隐式转换为数字
+-- 这一列的索引完全失效，变成全表扫描
+
+-- 正确写法：
+SELECT * FROM orders WHERE order_no = '12345';  -- [!code highlight]
+```
+
+### 模式二：OR 条件导致索引分裂
+
+```sql
+-- 问题 SQL：
+SELECT * FROM orders WHERE user_id = 1 OR status = 'pending';  -- [!code error]
+-- OR 条件导致 MySQL 无法利用索引，只能全表扫描
+
+-- 正确写法（拆分为 UNION）：
+SELECT * FROM orders WHERE user_id = 1
+UNION ALL
+SELECT * FROM orders WHERE status = 'pending' AND user_id IS NOT NULL;  -- [!code highlight]
+```
+
+### 模式三：深度分页
+
+```sql
+-- 问题 SQL：
+SELECT * FROM orders LIMIT 1000000, 20;  -- [!code error]
+-- MySQL 先扫描前 1000020 行，再丢弃前 100 万行
+
+-- 正确写法（游标分页）：
+SELECT * FROM orders WHERE id > #{lastId} ORDER BY id LIMIT 20;  -- [!code highlight]
+```
+
+### 模式四：SELECT *
+
+```sql
+-- 问题 SQL：
+SELECT * FROM orders WHERE user_id = 12345;  -- [!code error]
+-- 查出所有列，包括大字段（收货地址详情、商品快照等）
+
+-- 正确写法（只查需要的字段）：
+SELECT id, order_no, total_amount, status, created_at
+FROM orders WHERE user_id = 12345;  -- [!code highlight]
 ```
 
 ## 总结
 
-数据库调优是性能优化的关键环节。
+回顾这次完整的优化过程，有几个关键认知：
 
-**常见瓶颈**：
+**第一，索引只是加速手段，不是银弹**。加了索引响应时间从 500ms 降到 420ms，说明索引有用，但只解决了排序问题。真正的性能杀手是 N+1 查询和深度分页，这两个问题必须从 SQL 逻辑和分页策略层面解决。
 
-- 查询慢：全表扫描、缺少索引
-- 连接耗尽：连接池配置不当
-- 锁竞争：事务过长、锁粒度大
-- 资源饱和：CPU、IO、内存
+**第二，优化要追到根因**。DBA 第一反应加索引是对的，但研发团队没有止步于此，而是继续深挖 SQL 逻辑，最终找到了 N+1 问题——这是更根本的性能杀手。
 
-**优化方法**：
+**第三，分页策略是性能的关键**。`LIMIT offset, size` 的问题在于 offset 越大，扫描的行数越多。用游标分页（`WHERE id < lastId`）替代 offset 分页，可以让查询时间不随页码增长而增长。
 
-- 慢查询分析：EXPLAIN、慢查询日志
-- 索引优化：复合索引最左前缀
-- SQL 优化：避免 SELECT *、N+1、深度分页
-- 连接池：合理配置大小和超时
+**第四，读写分离是扩展手段，不是优化手段**。20ms 的响应时间已经足够快了，读写分离解决的是高并发下数据库连接数和处理能力的瓶颈，而不是单次查询的延迟。
 
-**核心认知**：数据库优化是投入产出比最高的优化方向。很多性能问题，通过优化几条 SQL 就能解决。
+数据库优化的核心原则是：**测量优先于猜测，追根溯源不浅尝辄止**。

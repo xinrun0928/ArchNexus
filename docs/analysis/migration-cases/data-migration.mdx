@@ -1,189 +1,362 @@
 ---
 title: 数据迁移实战
-description: 数据库迁移的数据同步与校验实践
+description: 以分库分表数据迁移为完整案例
 ---
 
 # 数据迁移实战
 
-你的数据库需要升级，但数据不能丢，业务不能停。
+某电商平台单表数据量突破 5000 万，订单查询接口 p99 延迟从 30ms 飙升到 500ms。DBA 加了索引、优化了 SQL、调整了连接池，都没能解决问题。最后的诊断结论是：**单表数据量太大，B+ 树的深度已经影响到查询性能**。
 
-数据迁移是高风险操作，需要周密的计划和充分的验证。
+解决方案是分库分表：将订单表按用户 ID 分片，拆分成 16 个表，分散到 4 个库。
 
-## 迁移方案评估
+但分库分表不是简单的「拆」——旧数据怎么迁移？迁移期间新数据怎么处理？迁移完成后如何验证？任何一个环节出错，都可能导致数据丢失。
+
+这一节用这个真实案例，讲解分库分表迁移的全过程。
+
+## 背景：为什么要分库分表
+
+### 问题描述
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    数据迁移方案对比                                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 方案一：停机迁移                                      │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  流程：停止应用 → 迁移数据 → 启动新系统         │   │
-│  │                                                         │   │
-│  │  优点：简单，数据一致性好                          │   │
-│  │  缺点：业务中断时间长                              │   │
-│  │                                                         │   │
-│  │  适用场景：数据量小，可接受停机窗口               │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 方案二：双写迁移                                      │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  流程：新旧系统双写 → 增量同步 → 切换流量         │   │
-│  │                                                         │   │
-│  │  优点：业务影响小，可回退                          │   │
-│  │  缺点：实现复杂，需处理数据冲突                     │   │
-│  │                                                         │   │
-│  │  适用场景：数据量大，需要灰度切换                   │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 方案三：CDC 迁移                                      │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  流程：监听 binlog → 实时同步 → 切换流量          │   │
-│  │                                                         │   │
-│  │  优点：实时同步，延迟低                            │   │
-│  │  缺点：需要 CDC 工具，配置复杂                     │   │
-│  │                                                         │   │
-│  │  适用场景：数据量大，要求实时同步                  │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+单表订单数据：5000 万条
+查询特征：按 user_id 查询历史订单（覆盖 95% 的查询）
+问题：B+ 树深度达到 4 层，索引效率下降
 ```
 
-## 停机迁移
+MySQL 的 InnoDB 引擎使用 B+ 树作为索引结构。当数据量超过一定规模时，B+ 树的层数会增加，每次查询需要读取更多的磁盘页。
 
-### 数据量评估
+```
+B+ 树层数估算：
+- 根节点：16KB，可存储约 2000 个键
+- 每层扇出：约 200
+- 单表 5000 万条记录，每条约 1KB
 
-```sql
--- 评估迁移时间
-SELECT
-    table_name,
-    table_rows,
-    data_length / 1024 / 1024 AS data_mb,
-    index_length / 1024 / 1024 AS index_mb
-FROM information_schema.tables
-WHERE table_schema = 'mydb'
-ORDER BY (data_length + index_length) DESC
-LIMIT 10;
+第 1 层（根）：2000 条
+第 2 层：2000 × 200 = 40 万
+第 3 层：40 万 × 200 = 8000 万
+
+结论：索引深度达到 3 层（数据量 5000 万时），磁盘 IO 次数增加
 ```
 
-```bash
-# 使用 mysqldump 迁移
-# 估算时间
-# 100GB 数据约需 2-4 小时
+### 分库分表方案
 
-# 全量导出
-mysqldump -h source_host -u root -p \
-    --single-transaction \
-    --routines \
-    --triggers \
-    --events \
-    --master-data=2 \
-    mydb | gzip > backup.sql.gz
+团队选择了按 `user_id` 分片的方案：
 
-# 全量导入
-gunzip < backup.sql.gz | mysql -h target_host -u root -p mydb
+```
+分片规则：
+- 16 个分片表（0~15）
+- 分片键：user_id
+- 路由算法：user_id % 16
+
+分片后：
+- 库 0：orders_0, orders_8
+- 库 1：orders_1, orders_9
+- 库 2：orders_2, orders_10
+- 库 3：orders_3, orders_11
+- 库 4：orders_4, orders_12
+- 库 5：orders_5, orders_13
+- 库 6：orders_6, orders_14
+- 库 7：orders_7, orders_15
 ```
 
-### 无锁迁移
+## 第一阶段：方案设计（1 个月）
 
-```bash
-# pt-online-schema-change
-# 在线修改表结构，不锁表
+### 1. 分片键选择
 
-pt-online-schema-change \
-    --alter "ADD COLUMN new_col VARCHAR(100)" \
-    --charset=utf8mb4 \
-    --execute \
-    D=mydb,t=users
+分片键的选择直接影响查询模式和迁移复杂度。
+
+| 分片键 | 优点 | 缺点 |
+| --- | --- | --- |
+| user_id | 用户维度查询高效（95% 查询走 user_id） | 按订单 ID 查询需要跨分片 |
+| order_id | 订单维度查询高效 | 按用户查询需要跨分片（用户维度查询占比 95%） |
+| created_at | 时间范围查询高效 | 数据热点集中在当前月份 |
+
+团队选择了 `user_id`，因为这是最常见的查询模式。
+
+### 2. 路由规则
+
+```java
+// 分片路由算法
+public class ShardingUtils {
+
+    private static final int SHARD_COUNT = 16;
+
+    public static int calculateShardIndex(Long userId) {
+        // 路由算法：user_id % 16
+        return (int) (userId % SHARD_COUNT);
+    }
+
+    public static String getTableName(Long userId) {
+        int shardIndex = calculateShardIndex(userId);
+        return "orders_" + shardIndex;
+    }
+
+    public static int calculateDatabaseIndex(Long userId) {
+        int shardIndex = calculateShardIndex(userId);
+        return shardIndex / 4;  // 4 个库，每库 4 个表
+    }
+}
 ```
 
-## 双写迁移
+### 3. 迁移方案评估
+
+团队评估了三种迁移方案：
+
+| 方案 | 描述 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| 停机迁移 | 停止服务，全量迁移 | 简单，数据一致性好 | 业务中断时间长 | 数据量小，可接受停机 |
+| 双写迁移 | 新旧系统同时写入，增量同步 | 业务零中断 | 实现复杂，需要处理数据冲突 | 数据量大，不能停机 |
+| CDC 迁移 | 监听 Binlog 实时同步 | 实时同步，延迟低 | 需要 CDC 工具，配置复杂 | 数据量大，要求实时同步 |
+
+最终选择了 **双写迁移 + CDC 辅助校验** 的混合方案。
+
+## 第二阶段：数据迁移（2 个月）
+
+### 1. 全量迁移
+
+全量迁移是最基础的步骤：将历史数据从单表迁移到分片表。
+
+```java
+// 全量迁移任务
+@Service
+public class OrderMigrationService {
+
+    @Autowired private JdbcTemplate sourceJdbc;    // 旧库
+    @Autowired private ShardingDataSource shardingDs;  // 新库
+
+    @Transactional
+    public MigrationResult migrateBatch(long startId, int batchSize) {
+        // 1. 从旧表读取数据
+        String sql = """
+            SELECT * FROM orders
+            WHERE id > ? AND id <= ?
+            ORDER BY id
+            """;
+        List<Order> orders = sourceJdbc.query(sql,
+            new Object[]{startId, startId + batchSize},
+            orderMapper);
+
+        if (orders.isEmpty()) {
+            return MigrationResult.FINISHED;
+        }
+
+        // 2. 按分片键路由，写入分片表
+        int successCount = 0;
+        int failCount = 0;
+        long lastId = startId;
+
+        for (Order order : orders) {
+            try {
+                int shardIndex = ShardingUtils.calculateShardIndex(order.getUserId());
+                String tableName = "orders_" + shardIndex;
+
+                // 写入分片表
+                String insertSql = String.format("""
+                    INSERT INTO %s (id, user_id, order_no, total_amount, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, tableName);
+
+                jdbcTemplate(shardingDs, shardIndex).update(insertSql,
+                    order.getId(),
+                    order.getUserId(),
+                    order.getOrderNo(),
+                    order.getTotalAmount(),
+                    order.getStatus(),
+                    order.getCreatedAt(),
+                    order.getUpdatedAt()
+                );
+
+                successCount++;
+                lastId = Math.max(lastId, order.getId());
+
+            } catch (Exception e) {
+                failCount++;
+                log.error("迁移失败：orderId={}, error={}", order.getId(), e.getMessage());
+            }
+        }
+
+        return new MigrationResult(successCount, failCount, lastId);
+    }
+}
+```
+
+迁移性能调优：
+
+```java
+// 优化迁移速度
+@Service
+public class OptimizedMigrationService {
+
+    @Autowired private ShardingDataSource shardingDs;
+
+    public void migrateAll() {
+        long startTime = System.currentTimeMillis();
+        long startId = 0;
+        int batchSize = 5000;
+        int totalMigrated = 0;
+
+        while (true) {
+            MigrationResult result = migrateBatch(startId, batchSize);
+
+            if (result.isFinished()) {
+                break;
+            }
+
+            startId = result.getLastId();
+            totalMigrated += result.getSuccessCount();
+
+            // 每迁移 100 万条输出一次进度
+            if (totalMigrated % 1000000 == 0) {
+                long elapsed = System.currentTimeMillis() - startTime;
+                log.info("迁移进度：{} 万条，耗时：{} 分钟，进度：{}%",
+                    totalMigrated / 10000,
+                    elapsed / 60000,
+                    totalMigrated * 100 / TOTAL_COUNT);
+            }
+        }
+
+        log.info("全量迁移完成，总计：{} 条，耗时：{} 分钟",
+            totalMigrated,
+            (System.currentTimeMillis() - startTime) / 60000);
+    }
+}
+```
+
+5000 万条数据，按每批 5000 条，需要 10000 批次。使用批量插入优化后，迁移速度约 1 万条/分钟，总耗时约 80 小时（3~4 天）。
+
+### 2. 双写：迁移期间的数据同步
+
+全量迁移只能迁移历史数据。迁移过程中产生的新数据怎么处理？
+
+答案是**双写**：应用同时写入旧表和新表。
 
 ```java
 // 双写实现
 @Service
-public class DualWriteService {
-    @Autowired private PrimaryDataSource primaryDataSource;
-    @Autowired private SecondaryDataSource secondaryDataSource;
+public class OrderServiceWithSharding {
+
+    // 旧库数据源
+    @Autowired private DataSource legacyDataSource;
+    // 新库数据源（分片）
+    @Autowired private ShardingDataSource shardingDataSource;
 
     @Transactional
-    public void saveUser(User user) {
-        // 1. 写入主库
-        jdbcTemplate(primaryDataSource).update(
-            "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
-            user.getId(), user.getName(), user.getEmail()
+    public Order createOrder(Order order) {
+        // 1. 写入旧表（保持兼容性）
+        jdbcTemplate(legacyDataSource).update("""
+            INSERT INTO orders (id, user_id, order_no, total_amount, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            order.getId(),
+            order.getUserId(),
+            order.getOrderNo(),
+            order.getTotalAmount(),
+            order.getStatus(),
+            order.getCreatedAt(),
+            order.getUpdatedAt()
         );
 
-        // 2. 写入从库（异步）
-        asyncExecutor.execute(() -> {
-            try {
-                jdbcTemplate(secondaryDataSource).update(
-                    "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
-                    user.getId(), user.getName(), user.getEmail()
-                );
-            } catch (Exception e) {
-                log.error("Failed to write to secondary", e);
-            }
-        });
+        // 2. 写入分片表
+        int shardIndex = ShardingUtils.calculateShardIndex(order.getUserId());
+        String tableName = "orders_" + shardIndex;
+        jdbcTemplate(shardingDataSource, shardIndex).update(String.format("""
+            INSERT INTO %s (id, user_id, order_no, total_amount, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, tableName),
+            order.getId(),
+            order.getUserId(),
+            order.getOrderNo(),
+            order.getTotalAmount(),
+            order.getStatus(),
+            order.getCreatedAt(),
+            order.getUpdatedAt()
+        );
+
+        return order;
     }
 }
 ```
+
+双写的风险：**数据不一致**。如果旧表写入成功、新表写入失败，就会导致数据丢失。需要补偿机制。
+
+### 3. 增量同步：补偿双写期间的数据
+
+双写期间难免会有数据不一致的情况。团队用增量同步来修复这些差异。
 
 ```java
-// 数据补偿
+// 增量同步任务
 @Service
-public class DataCompensationService {
-    @Autowired private OffsetStore offsetStore;
+public class IncrementalSyncService {
 
-    @Scheduled(fixedDelay = 60000)  // 每分钟执行
-    public void compensate() {
-        // 1. 获取上次同步时间点
-        LocalDateTime lastSyncTime = offsetStore.getOffset("users");
+    @Autowired private JdbcTemplate legacyJdbc;
+    @Autowired private ShardingDataSource shardingDs;
 
-        // 2. 查询源库增量数据
-        List<User> users = sourceJdbc.query(
-            "SELECT * FROM users WHERE updated_at > ?",
-            new Object[]{lastSyncTime},
-            userMapper
-        );
+    // 记录同步进度
+    private AtomicLong lastSyncTimestamp = new AtomicLong(0);
 
-        // 3. 同步到目标库
-        for (User user : users) {
+    @Scheduled(fixedDelay = 60000)  // 每分钟执行一次
+    public void incrementalSync() {
+        // 1. 查找旧表中 last_sync_timestamp 之后的新增/修改记录
+        long syncPoint = lastSyncTimestamp.get();
+        long now = System.currentTimeMillis();
+
+        List<Order> changedOrders = legacyJdbc.query("""
+            SELECT * FROM orders
+            WHERE updated_at > ? AND updated_at <= ?
+            """,
+            new Object[]{new Date(syncPoint), new Date(now)},
+            orderMapper);
+
+        if (changedOrders.isEmpty()) {
+            return;
+        }
+
+        // 2. 按分片键同步到分片表
+        int successCount = 0;
+        for (Order order : changedOrders) {
             try {
-                upsertToTarget(user);
+                int shardIndex = ShardingUtils.calculateShardIndex(order.getUserId());
+                String tableName = "orders_" + shardIndex;
+
+                // 使用 REPLACE INTO（MySQL 支持主键冲突时自动覆盖）
+                String sql = String.format("""
+                    REPLACE INTO %s (id, user_id, order_no, total_amount, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, tableName);
+
+                jdbcTemplate(shardingDs, shardIndex).update(sql,
+                    order.getId(),
+                    order.getUserId(),
+                    order.getOrderNo(),
+                    order.getTotalAmount(),
+                    order.getStatus(),
+                    order.getCreatedAt(),
+                    order.getUpdatedAt()
+                );
+
+                successCount++;
+
             } catch (Exception e) {
-                log.error("Compensation failed for user: {}", user.getId(), e);
+                log.error("增量同步失败：orderId={}", order.getId(), e);
             }
         }
 
-        // 4. 更新同步时间点
-        if (!users.isEmpty()) {
-            LocalDateTime maxUpdateTime = users.stream()
-                .map(User::getUpdatedAt)
-                .max(LocalDateTime::compareTo)
-                .orElse(lastSyncTime);
-            offsetStore.saveOffset("users", maxUpdateTime);
-        }
+        // 3. 更新同步进度
+        lastSyncTimestamp.set(now);
+        log.info("增量同步完成：{} 条，耗时：{} ms", successCount,
+            System.currentTimeMillis() - now);
     }
 }
 ```
 
-## CDC 迁移
+### 4. CDC 辅助校验
 
-### Debezium 配置
+除了增量同步，团队还引入了 Binlog 订阅作为额外的校验手段。
 
 ```json
+// Debezium MySQL CDC 配置
 {
-    "name": "mysql-connector",
+    "name": "mysql-cdc-connector",
     "config": {
         "connector.class": "io.debezium.connector.mysql.MySqlConnector",
         "tasks.max": "1",
@@ -191,155 +364,229 @@ public class DataCompensationService {
         "database.port": "3306",
         "database.user": "debezium",
         "database.password": "password",
-        "database.server.id": "184054",
-        "topic.prefix": "mysql",
-        "database.include.list": "mydb",
-        "table.include.list": "mydb.users,mydb.orders",
+        "database.server.id": "184055",
+        "topic.prefix": "orders-cdc",
+        "database.include.list": "ecommerce",
+        "table.include.list": "ecommerce.orders",
         "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
         "schema.history.internal.kafka.topic": "schema-changes",
-        "include.schema.changes": "false",
         "transforms": "unwrap",
         "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState"
     }
 }
 ```
 
-```java
-// 消费 CDC 事件
-@Service
-public class CdcEventConsumer {
-    @KafkaListener(topics = "mysql.mydb.users")
-    public void consumeUserEvent(ConsumerRecord<String, UserEvent> record) {
-        UserEvent event = record.value();
-        Operation op = event.getOp();
+CDC 订阅的 Binlog 变更可以作为独立的数据源，用于和分片表对比验证，发现同步遗漏。
 
-        switch (op) {
-            case "c":  // Create
-                insertToTarget(event.getAfter());
-                break;
-            case "u":  // Update
-                updateToTarget(event.getAfter());
-                break;
-            case "d":  // Delete
-                deleteFromTarget(event.getBefore().getId());
-                break;
+## 第三阶段：灰度切换（1 个月）
+
+### 1. 切换流程
+
+```
+切换阶段划分：
+
+阶段 1（第 1 周）：读流量灰度
+- 新表读取比例：0% → 10%
+- 旧表读取比例：100% → 90%
+- 目标：验证查询正确性
+
+阶段 2（第 2 周）：读流量扩大
+- 新表读取比例：10% → 50%
+- 旧表读取比例：90% → 50%
+- 目标：验证性能提升
+
+阶段 3（第 3 周）：全量读切换
+- 新表读取比例：50% → 100%
+- 旧表读取比例：50% → 0%
+
+阶段 4（第 4 周）：停止双写
+- 旧表停止写入
+- 分片表作为唯一数据源
+```
+
+### 2. 路由网关配置
+
+```java
+// 读流量灰度配置
+@Service
+public class OrderReadRouter {
+
+    private static final int SHARD_COUNT = 16;
+
+    @Autowired private JdbcTemplate legacyJdbc;
+
+    // 按分片键路由到分片表
+    @Autowired private ShardingDataSource shardingDs;
+
+    public List<Order> getUserOrders(Long userId, int page, int pageSize) {
+        // 灰度比例：10%
+        boolean useSharding = Math.random() < 0.1;
+
+        if (useSharding) {
+            // 读分片表
+            int shardIndex = (int) (userId % SHARD_COUNT);
+            return jdbcTemplate(shardingDs, shardIndex).query("""
+                SELECT * FROM orders_""" + shardIndex + """
+                WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """,
+                new Object[]{userId, pageSize, page * pageSize},
+                orderMapper);
+        } else {
+            // 读旧表
+            return legacyJdbc.query("""
+                SELECT * FROM orders
+                WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """,
+                new Object[]{userId, pageSize, page * pageSize},
+                orderMapper);
         }
     }
 }
 ```
 
-## 数据校验
+## 第四阶段：数据校验（贯穿全程）
 
-```java
-// 全量校验
-@Service
-public class DataValidationService {
-    @Autowired private JdbcTemplate sourceJdbc;
-    @Autowired private JdbcTemplate targetJdbc;
+### 1. 记录数校验
 
-    public ValidationReport fullValidation() {
-        ValidationReport report = new ValidationReport();
-
-        // 1. 记录数校验
-        Map<String, Long> sourceCounts = getTableCounts(sourceJdbc);
-        Map<String, Long> targetCounts = getTableCounts(targetJdbc);
-
-        for (String table : sourceCounts.keySet()) {
-            if (!sourceCounts.get(table).equals(targetCounts.get(table))) {
-                report.addError(table, "记录数不一致",
-                    sourceCounts.get(table), targetCounts.get(table));
-            }
-        }
-
-        // 2. 数据校验（抽样）
-        List<String> tables = Arrays.asList("users", "orders");
-        for (String table : tables) {
-            validateTable(table, 1000);  // 抽样 1000 条
-        }
-
-        return report;
-    }
-
-    // 抽样校验
-    public void validateTable(String table, int sampleSize) {
-        List<Long> sourceIds = sourceJdbc.queryForList(
-            String.format("SELECT id FROM %s ORDER BY RAND() LIMIT %d", table, sampleSize),
-            Long.class
-        );
-
-        for (Long id : sourceIds) {
-            Map<String, Object> source = sourceJdbc.queryForMap(
-                String.format("SELECT * FROM %s WHERE id = ?", table), id);
-            Map<String, Object> target = targetJdbc.queryForMap(
-                String.format("SELECT * FROM %s WHERE id = ?", table), id);
-
-            if (!equals(source, target)) {
-                log.warn("Data mismatch in {}: id={}", table, id);
-            }
-        }
-    }
-}
-```
+最基本的校验：对比旧表和分片表的记录总数。
 
 ```sql
--- 增量数据校验
--- 检查数据同步延迟
+-- 记录数校验
 SELECT
-    (SELECT MAX(updated_at) FROM source.users) AS source_max,
-    (SELECT MAX(updated_at) FROM target.users) AS target_max,
-    TIMESTAMPDIFF(SECOND,
-        (SELECT MAX(updated_at) FROM target.users),
-        (SELECT MAX(updated_at) FROM source.users)
-    ) AS lag_seconds;
+    (SELECT COUNT(*) FROM orders) AS legacy_count,
+    (SELECT SUM(cnt) FROM (
+        SELECT COUNT(*) AS cnt FROM orders_0
+        UNION ALL SELECT COUNT(*) FROM orders_1
+        UNION ALL SELECT COUNT(*) FROM orders_2
+        UNION ALL SELECT COUNT(*) FROM orders_3
+        UNION ALL SELECT COUNT(*) FROM orders_4
+        UNION ALL SELECT COUNT(*) FROM orders_5
+        UNION ALL SELECT COUNT(*) FROM orders_6
+        UNION ALL SELECT COUNT(*) FROM orders_7
+        UNION ALL SELECT COUNT(*) FROM orders_8
+        UNION ALL SELECT COUNT(*) FROM orders_9
+        UNION ALL SELECT COUNT(*) FROM orders_10
+        UNION ALL SELECT COUNT(*) FROM orders_11
+        UNION ALL SELECT COUNT(*) FROM orders_12
+        UNION ALL SELECT COUNT(*) FROM orders_13
+        UNION ALL SELECT COUNT(*) FROM orders_14
+        UNION ALL SELECT COUNT(*) FROM orders_15
+    ) AS total) AS sharding_count;
+
+-- 如果两边记录数不一致，说明有数据丢失
 ```
 
-## 回退方案
+### 2. 内容校验
+
+记录数一致不代表内容一致。需要抽样对比具体字段。
+
+```java
+// 抽样数据校验
+@Service
+public class DataConsistencyValidator {
+
+    @Autowired private JdbcTemplate legacyJdbc;
+    @Autowired private ShardingDataSource shardingDs;
+
+    public void validateSample() {
+        // 随机抽样 1000 条记录
+        List<Long> sampleIds = legacyJdbc.queryForList("""
+            SELECT id FROM orders ORDER BY RAND() LIMIT 1000
+            """, Long.class);
+
+        int inconsistentCount = 0;
+
+        for (Long id : sampleIds) {
+            // 从旧表查
+            Order legacy = getOrderById(legacyJdbc, id);
+
+            // 从分片表查
+            Order sharding = getOrderById(shardingDs, id);
+
+            // 对比
+            if (!equals(legacy, sharding)) {
+                inconsistentCount++;
+                log.error("数据不一致：id={}, legacy={}, sharding={}",
+                    id, legacy, sharding);
+            }
+        }
+
+        if (inconsistentCount > 0) {
+            alertService.alert("分库分表数据校验失败：不一致记录 {} 条",
+                inconsistentCount);
+        }
+    }
+
+    private boolean equals(Order a, Order b) {
+        if (a == null || b == null) return false;
+        return Objects.equals(a.getId(), b.getId())
+            && Objects.equals(a.getUserId(), b.getUserId())
+            && Objects.equals(a.getOrderNo(), b.getOrderNo())
+            && Objects.equals(a.getTotalAmount(), b.getTotalAmount())
+            && Objects.equals(a.getStatus(), b.getStatus());
+    }
+}
+```
+
+## 第五阶段：回退方案
+
+迁移过程中最怕的是失败。一旦出问题，需要能在最短时间内回退。
+
+### 回退触发条件
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    回退方案                                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 紧急回退触发条件                                       │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  - 错误率 > 1%                                       │   │
-│  │  - 数据不一致率 > 0.1%                              │   │
-│  │  - 延迟 > 5 分钟                                    │   │
-│  │  - 关键业务指标异常                                 │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 回退执行步骤                                         │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  1. 停止双写                                       │   │
-│  │  2. 切换流量到旧系统                               │   │
-│  │  3. 补偿双写期间的数据到旧系统                    │   │
-│  │  4. 验证旧系统数据完整性                         │   │
-│  │  5. 恢复旧系统运行                                 │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+自动回退条件：
+- 记录数差异 > 0.1%
+- 抽样数据不一致率 > 0.01%
+- 分片表查询错误率 > 0.1%
+- 响应时间劣化 > 50%
+
+手动回退条件：
+- 重大业务逻辑错误
+- 数据污染（脏数据）
+- 外部系统（如支付、物流）对接异常
 ```
 
-## 总结
+### 回退执行步骤
 
-数据迁移是高风险操作，需要周密计划。
+```bash
+# 回退执行：
+# 1. 停止分片表写入
+# 2. 切换所有流量到旧表
+# 3. 保留分片表（用于问题排查）
+# 4. 修复问题后重新迁移
 
-**迁移方案选择**：
+# 回退命令（通过配置中心热更新）
+curl -X POST "http://apollo-config:8070/configs/xxx/xxx/application" \
+  -d 'order.sharding.enabled=false'
+```
 
-- 小数据量：停机迁移
-- 大数据量：双写迁移或 CDC 迁移
+## 最终结果
 
-**关键环节**：
+```
+分库分表迁移总结：
+迁移周期：4 个月
+分片数量：4 库 × 16 表
+数据总量：5000 万条
+迁移耗时：全量迁移 80 小时，增量同步持续 2 周
+数据一致性：校验通过，记录数差异 0.001%
 
-- 数据量评估：估算迁移时间
-- 增量同步：补偿期间的数据
-- 数据校验：记录数 + 内容
-- 回退方案：紧急回退预案
+性能提升：
+- 订单查询 p99：500ms → 20ms（提升 96%）
+- 写入吞吐量：1000 QPS → 8000 QPS（提升 700%）
 
-**核心认知**：数据迁移中最重要的是数据一致性校验。不要相信迁移脚本，一定要有独立的校验机制确保数据完整。
+主要踩坑：
+1. 全量迁移速度比预期慢 30%（batchSize 调优后改善）
+2. 双写期间有 3 次数据不一致（通过增量同步补偿修复）
+3. CDC 工具初期配置复杂（花了两周调试 Debezium）
+```
+
+## 总结：数据迁移的核心认知
+
+**第一，迁移方案比迁移执行更重要**。选择什么样的分片键、设计什么样的路由规则、采用什么迁移方案，这些决策直接决定了迁移的复杂度、周期和风险。花时间在方案设计上是值得的。
+
+**第二，双写 + 增量同步是数据迁移的标准模式**。双写保证迁移期间新数据不丢失，增量同步修复双写期间的数据不一致。两者结合，可以在业务零中断的情况下完成迁移。
+
+**第三，数据校验贯穿迁移全程**。从全量迁移到双写阶段，再到灰度切换，每一步都需要校验。校验工具要提前准备好，不能等迁移完成后再想起来校验。
+
+**第四，回退方案必须提前设计**。迁移是高风险操作，必须有明确的回退触发条件和回退执行步骤。没有回退方案的迁移，是不负责任的迁移。

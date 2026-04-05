@@ -1,421 +1,396 @@
 ---
 title: JVM 调优
-description: Java 虚拟机的性能监控与参数优化
+description: 以大促前 JVM 调优实战为完整案例
 ---
 
 # JVM 调优
 
-你的应用越来越慢，频繁 Full GC，CPU 100%。
+双十一大促前 3 天，压测团队发现了一个诡异的问题：订单服务的接口在低压力下表现正常，p99 延迟约 30ms；但当 QPS 超过 2000 时，p99 延迟突然飙升到 500ms+，GC 日志里大量出现 Full GC——每隔 30 秒就来一次 Full GC，每次耗时 3~5 秒。
 
-JVM 是 Java 应用运行的基础，错误的参数配置会导致严重的性能问题。
+开发团队的第一反应是「内存不够，加内存」。但运维翻出了监控数据：堆内存使用率只有 70%，远没到 OOM 的程度。真正的问题是**大量短期对象在短时间内晋升到 Old Gen，导致 Old Gen 频繁触发 Full GC**。
 
-## JVM 内存模型
+这一节用这个真实案例，完整还原一次大促前的 JVM 调优过程。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    JVM 内存模型                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │              ┌─────────────────────────┐                 │   │
-│  │              │        Heap           │                 │   │
-│  │              │  ┌─────────────────┐  │                 │   │
-│  │              │  │   Young Gen    │  │                 │   │
-│  │              │  │  ┌─────┬─────┐│  │                 │   │
-│  │              │  │  │Eden │S0|S1││  │                 │   │
-│  │              │  │  └─────┴─────┘│  │                 │   │
-│  │              │  └─────────────────┘  │                 │   │
-│  │              │  ┌─────────────────┐  │                 │   │
-│  │              │  │    Old Gen       │  │                 │   │
-│  │              │  └─────────────────┘  │                 │   │
-│  │              └─────────────────────────┘                 │   │
-│  │                                                         │   │
-│  │              ┌─────────────────────────┐                 │   │
-│  │              │    Metaspace           │                 │   │
-│  │              └─────────────────────────┘                 │   │
-│  │                                                         │   │
-│  │              ┌─────────────────────────┐                 │   │
-│  │              │     Thread Stack       │                 │   │
-│  │              │   (每个线程一个)       │                 │   │
-│  │              └─────────────────────────┘                 │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  Eden：新创建的对象                                  │
-│  S0/S1：Survivor 区，Minor GC 后存活的对象       │
-│  Old Gen：长期存活的对象                           │
-│  Metaspace：类元数据                               │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 问题描述
 
-## GC 基础
+### 现象
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    垃圾回收机制                                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Minor GC（Young GC）                                 │   │
-│  ├─────────────────────────────────────────────────────│   │
-│  │                                                         │   │
-│  │  触发条件：Eden 区满                              │   │
-│  │  回收区域：Eden + Survivor                         │   │
-│  │  回收频率：频繁（几秒一次）                        │   │
-│  │  停顿时间：短（通常 < 100ms）                     │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Full GC（Major GC）                                   │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  触发条件：Old 区满、Metaspace 满                  │   │
-│  │  回收区域：Young + Old + Metaspace                   │   │
-│  │  回收频率：低（可能几天一次）                        │   │
-│  │  停顿时间：长（可能 > 1s）                          │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ GC 日志格式                                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  -Xlog:gc*,gc+ref=debug,gc+heap=debug,gc+age=trace  │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+接口：POST /api/orders
+低压力（QPS < 1000）：p99 延迟 30ms，正常
+高压力（QPS > 2000）：p99 延迟 500ms+，服务开始堆积请求
+GC 表现：Full GC 每 30 秒一次，每次 3~5 秒
 ```
 
-## GC 日志分析
+### 监控数据
+
+```
+堆内存：4GB（-Xmx4g），使用率 70%
+Young Gen：2GB（-Xmn2g），Eden 使用率波动剧烈
+Old Gen：2GB，使用率持续上升，直到触发 Full GC
+Full GC 频率：每 30 秒一次
+Minor GC 频率：每 5 秒一次
+```
+
+## 第一轮诊断：GC 日志分析
+
+### 开启 GC 日志
 
 ```bash
-# 开启 GC 日志
+# JVM 启动参数中添加 GC 日志
 java -Xms4g -Xmx4g \
+     -Xmn2g \
      -XX:+UseG1GC \
-     -Xlog:gc*:file=gc.log:time:filecount=5,filesize=10m \
-     -jar app.jar
-
-# 分析 GC 日志
-# 使用 GCViewer
-java -jar gcviewer.jar gc.log
-
-# 使用 GCEasy（在线工具）
-# 上传 gc.log 到 https://gceasy.io
-
-# 命令行分析
-grep "Full GC" gc.log | wc -l  # Full GC 次数
-grep "Pause" gc.log | awk '{sum+=$NF; count++} END {print sum/count}'  # 平均停顿时间
+     -XX:MaxGCPauseMillis=200 \
+     -Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=10m \
+     -XX:+HeapDumpOnOutOfMemoryError \
+     -XX:HeapDumpPath=/var/log/heapdump.hprof \
+     -jar order-service.jar
 ```
 
+### 分析 GC 日志
+
+```bash
+# 查看 Full GC 频率
+grep "Full GC" gc.log | head -20
+
+# 输出：
+# [2026-04-05T14:30:00.123+0800] GC(45) Pause Young (Normal)
+# [2026-05-05T14:30:05.456+0800] GC(46) Pause Young (Normal)
+# [2026-05-05T14:30:30.789+0800] GC(46) Pause Full (G1 Evacuation Pause)  ← 每 30 秒一次 Full GC
+# [2026-05-05T14:31:00.234+0800] GC(47) Pause Young (Normal)
+# [2026-05-05T14:31:30.567+0800] GC(48) Pause Full (G1 Evacuation Pause)
+```
+
+### 分析对象晋升
+
+用 GC 日志分析工具（如 GCEasy）查看，发现一个关键数据：**大量对象在创建后几秒内就晋升到了 Old Gen**。
+
+```bash
+# 计算平均对象年龄
+# 在 GC 日志中找到晋升信息：
+[2026-05-05T14:30:00.123+0800] GC(45) Pause Young (Normal) 512M->256M(2048M) 12.5ms
+  age   1:    104857600 bytes,    104857600 total
+  age   2:     52428800 bytes,    157286400 total
+  age   3:     26214400 bytes,    183500800 total
+```
+
+关键发现：**对象年龄达到 3 就已经很大了**。这意味着对象在 Survivor 区只经历了几次 Minor GC 就被晋升到 Old Gen——说明 Survivor 区太小，或者 Eden 区太小，导致对象在进入 Survivor 后很快就被「挤」到 Old Gen。
+
+## 第二轮诊断：代码层面的对象问题
+
+GC 日志告诉了你「有什么问题」，但告诉不了你「是什么代码」。需要分析内存 dump。
+
+### 生成 Heap Dump
+
+```bash
+# 在 Full GC 时自动生成 dump
+# 添加 JVM 参数：
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/
+
+# 或者手动在 Full GC 后立即抓取
+jmap -dump:format=b,file=/var/log/heapdump.hprof,live <pid>
+```
+
+### 使用 MAT 分析
+
+用 Eclipse MAT（Memory Analyzer Tool）打开 dump 文件，重点关注：
+
+1. **Dominator Tree**：查看占用内存最多的对象
+2. **Leak Suspects**：自动识别可能的内存泄漏
+3. **Top Consumers**：按类统计内存占用
+
+分析结果发现了三个严重问题：
+
+### 问题一：List 积累大量历史数据
+
 ```java
-// 代码示例：避免频繁创建对象导致 GC 压力
+// 问题代码：OrderBatchProcessor
 @Service
-public class GcOptimizationService {
+public class OrderBatchProcessor {
+    // 这个 List 会随着请求不断增长
+    private List<OrderProcessingResult> processingHistory = new ArrayList<>();
 
-    // 问题：字符串拼接每次创建新对象
-    public String badStringConcat(List<String> items) {
-        String result = "";  // [!code error]
-        for (String item : items) {
-            result += item;  // 每次创建新 String
+    public void processOrders(List<Order> orders) {
+        for (Order order : orders) {
+            OrderProcessingResult result = process(order);
+            // [!code error] 每次处理结果都往 List 里加，但从不清理
+            processingHistory.add(result);
         }
-        return result;
-    }
-
-    // 优化：使用 StringBuilder
-    public String goodStringConcat(List<String> items) {
-        StringBuilder sb = new StringBuilder();
-        for (String item : items) {
-            sb.append(item);
-        }
-        return sb.toString();
-    }
-
-    // 问题：大量短期对象
-    public List<String> badPractice(Date start, Date end) {
-        List<String> results = new ArrayList<>();
-        long startTime = start.getTime();
-        long endTime = end.getTime();
-
-        // 每次循环创建新 Date 对象
-        for (long t = startTime; t < endTime; t += 3600000) {
-            Date d = new Date(t);  // [!code error]
-            results.add(format(d));
-        }
-        return results;
-    }
-
-    // 优化：复用对象
-    public List<String> goodPractice(Date start, Date end) {
-        List<String> results = new ArrayList<>();
-        long startTime = start.getTime();
-        long endTime = end.getTime();
-
-        Calendar cal = Calendar.getInstance();  // 复用
-        for (long t = startTime; t < endTime; t += 3600000) {
-            cal.setTimeInMillis(t);
-            results.add(format(cal.getTime()));
-        }
-        return results;
-    }
-
-    // 问题：自动装箱
-    public Long badAutoboxing(List<Long> ids) {
-        long sum = 0;
-        for (Long id : ids) {  // [!code error] 每次循环创建 Long 对象
-            sum += id;
-        }
-        return sum;
-    }
-
-    // 优化：使用基本类型
-    public long goodAutoboxing(List<Long> ids) {
-        long sum = 0;
-        for (Long id : ids) {
-            sum += id;  // 自动拆箱，但不额外创建对象
-        }
-        return sum;
+        log.info("已处理 {} 批订单，总处理数：{}",
+            processingHistory.size(),
+            processingHistory.stream().mapToInt(r -> r.getItems().size()).sum());
     }
 }
 ```
 
-## JVM 参数调优
+每次处理 100 个订单，结果都存在 `processingHistory` 里。在高并发下，这个 List 会快速增长，很快占满内存。
+
+### 问题二：DateFormat 每次创建
+
+```java
+// 问题代码：日期格式化
+public String formatOrderDate(Order order) {
+    // [!code error] DateFormat.format() 每次调用都创建新的 SimpleDateFormat
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    return sdf.format(order.getCreatedAt());
+}
+
+// 在订单处理链路中被高频调用
+// 每次调用创建一个新的 SimpleDateFormat 对象
+// 这些对象进入堆内存，增加 GC 压力
+```
+
+### 问题三：大 JSON 对象缓存
+
+```java
+// 问题代码：JSON 序列化结果被缓存
+@Service
+public class OrderJsonCacheService {
+    // 缓存了所有订单的 JSON 序列化结果
+    private Map<Long, String> orderJsonCache = new HashMap<>();
+
+    public String getOrderJson(Long orderId) {
+        return orderJsonCache.computeIfAbsent(orderId, id -> {
+            Order order = orderRepository.findById(id);
+            return objectMapper.writeValueAsString(order);
+        });
+    }
+}
+```
+
+当订单量达到百万级别时，这个 Map 会占用数 GB 内存。而且没有过期机制，永远不会清理。
+
+## 第一轮优化：代码层面减少对象创建
+
+### 优化一：避免 List 无限增长
+
+```java
+// 优化后：使用环形缓冲区记录最近的处理历史
+@Service
+public class OrderBatchProcessor {
+    // 使用 LinkedBlockingQueue 记录最近 1000 条处理结果
+    private static final int MAX_HISTORY_SIZE = 1000;
+    private Queue<OrderProcessingResult> processingHistory =
+        new LinkedBlockingQueue<>(MAX_HISTORY_SIZE);
+
+    public void processOrders(List<Order> orders) {
+        for (Order order : orders) {
+            OrderProcessingResult result = process(order);
+            // 如果超过最大容量，自动丢弃最老的记录
+            processingHistory.offer(result);
+        }
+        log.info("最近 {} 批处理结果，总处理数：{}",
+            processingHistory.size(),
+            processingHistory.stream()
+                .mapToInt(r -> r.getItems().size()).sum());
+    }
+}
+```
+
+### 优化二：复用 DateFormat 对象
+
+```java
+// 优化后：使用 ThreadLocal 复用 DateFormat
+@Service
+public class DateFormatService {
+    private static final ThreadLocal<DateFormat> DATE_FORMAT =
+        ThreadLocal.withInitial(() ->
+            new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+
+    public String formatOrderDate(Date date) {
+        return DATE_FORMAT.get().format(date);
+    }
+
+    // 记得清理 ThreadLocal
+    public void clear() {
+        DATE_FORMAT.remove();
+    }
+}
+
+// 或者使用 Java 8+ 的 DateTimeFormatter（线程安全）
+@Service
+public class DateFormatServiceV2 {
+    // DateTimeFormatter 是线程安全的，可以复用
+    private static final DateTimeFormatter FORMATTER =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+            .withZone(ZoneId.systemDefault());
+
+    public String formatOrderDate(Instant date) {
+        return FORMATTER.format(date);
+    }
+}
+```
+
+### 优化三：限制 JSON 缓存大小
+
+```java
+// 优化后：使用 LRU 缓存限制大小
+@Service
+public class OrderJsonCacheService {
+    // 使用 Caffeine 实现 LRU 缓存
+    private LoadingCache<Long, String> orderJsonCache;
+
+    @PostConstruct
+    public void init() {
+        orderJsonCache = Caffeine.newBuilder()
+            .maximumSize(10000)              // 最多缓存 10000 个订单
+            .expireAfterWrite(10, TimeUnit.MINUTES)  // 10 分钟过期
+            .recordStats()                   // 记录命中率
+            .build(orderId -> {
+                Order order = orderRepository.findById(orderId);
+                return objectMapper.writeValueAsString(order);
+            });
+    }
+
+    public String getOrderJson(Long orderId) {
+        return orderJsonCache.get(orderId);
+    }
+}
+```
+
+**优化后结果**：Full GC 频率从每 30 秒一次降低到每 5 分钟一次。但在大促高压力下，仍然偶发 Full GC。
+
+## 第二轮优化：JVM 参数调优
+
+### 当前参数分析
+
+```
+-Xms4g -Xmx4g      # 堆大小
+-Xmn2g             # 年轻代 2GB，Old Gen 也是 2GB
+-XX:+UseG1GC       # 使用 G1 收集器
+```
+
+问题在于 G1 的默认参数在高频请求场景下不够优化：
+
+- **Survivor Ratio**：G1 默认 `-XX:NewRatio=2`（Young:Old = 1:1），Survivor Ratio = 8
+  - 即 Eden = 1.6GB，S0 = 0.2GB，S1 = 0.2GB
+  - Survivor 区太小，对象容易晋升
+
+- **G1HeapWastePercent**：默认 5%，GC 时允许 5% 的可用空间不被回收
+  - 在高对象创建速率下，这个阈值太小
+
+### 调整后的 JVM 参数
 
 ```bash
-# JVM 调优参数
-
-# 1. 堆内存配置
--Xms4g          # 初始堆大小
--Xmx4g          # 最大堆大小
--Xms=-Xmx      # 生产环境建议相等，避免动态扩展
-
-# 2. 年轻代配置
--Xmn2g          # 年轻代大小（NewSize = MaxNewSize）
--XX:NewRatio=2  # Old/Young 比例，默认 2
-
-# 3. 元空间配置（Java 8+）
--XX:MetaspaceSize=256m
--XX:MaxMetaspaceSize=512m
-
-# 4. GC 收集器选择
-# G1（推荐用于大堆）
--XX:+UseG1GC
--XX:MaxGCPauseMillis=200  # 目标停顿时间
-
-# CMS（Java 14 已移除）
--XX:+UseConcMarkSweepGC
--XX:CMSInitiatingOccupancyFraction=70  # 触发 CMS 的阈值
-
-# ZGC（低延迟，Java 11+）
--XX:+UseZGC
--XX:MaxGCPauseMillis=2
-
-# 5. OOM 时生成堆转储
--XX:+HeapDumpOnOutOfMemoryError
--XX:HeapDumpPath=/var/log/heapdump.hprof
-
-# 6. GC 日志
--Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=10m
+# 大促期间 JVM 参数
+java -Xms4g -Xmx4g \
+     -Xmn2g \
+     -XX:+UseG1GC \
+     -XX:MaxGCPauseMillis=100 \      # 目标停顿时间从 200ms 降到 100ms
+     -XX:G1HeapRegionSize=8m \         # Region 大小 8MB（G1 默认根据堆大小自动计算）
+     -XX:G1NewSizePercent=50 \         # 年轻代初始比例 50%（让年轻代更大）
+     -XX:G1MaxNewSizePercent=60 \      # 年轻代最大比例 60%
+     -XX:SurvivorRatio=6 \            # Survivor Ratio 降低到 6（Survivor 区更大）
+     -XX:G1HeapWastePercent=10 \       # 允许更多空间不被回收
+     -XX:+UseStringDeduplication \     # 字符串去重
+     -XX:+ParallelRefProcEnabled \      # 并行处理 Reference
+     -XX:+HeapDumpOnOutOfMemoryError \
+     -XX:HeapDumpPath=/var/log/heapdump.hprof \
+     -Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=20m \
+     -jar order-service.jar
 ```
+
+关键参数调整说明：
+
+| 参数 | 原值 | 新值 | 原因 |
+| --- | --- | --- | --- |
+| `MaxGCPauseMillis` | 200ms | 100ms | 大促期间对延迟更敏感 |
+| `G1NewSizePercent` | 40% | 50% | 增加年轻代大小，减少对象晋升 |
+| `SurvivorRatio` | 8 | 6 | 增大 Survivor 区，给更多对象在年轻代回收的机会 |
+| `G1HeapWastePercent` | 5% | 10% | 减少 GC 频率，但增加每次 GC 的回收量 |
+
+## 第三轮优化：G1 调参 + ZGC 探索
+
+### 调参后的结果
+
+参数调整后，Full GC 频率从每 5 分钟一次降低到每 30 分钟一次，但**GC 停顿时间仍然是瓶颈**——每次 Full GC 停顿约 500ms，在大促高 QPS 下仍然影响用户体验。
+
+团队开始评估 **ZGC**（Z Garbage Collector）。
+
+### ZGC vs G1
+
+```
+对比维度          G1                         ZGC
+最大停顿时间       ~200ms（可配置）           <1ms（不受堆大小影响）
+吞吐量            中等                       略低于 G1
+内存占用          较低                       略高
+支持版本          Java 9+                    Java 11+
+适用场景          追求吞吐，堆 < 64GB       追求低延迟，堆可 > 64GB
+```
+
+### ZGC 上线
+
+```bash
+# ZGC JVM 参数
+java -Xms8g -Xmx8g \          # ZGC 在大堆下优势更明显
+     -XX:+UseZGC \
+     -XX:MaxGCPauseMillis=1 \  # ZGC 的停顿时间目标
+     -XX:+ZCollectionInterval=60 \  # 每 60 秒触发一次 GC（ZGC 是并发收集）
+     -XX:+ZProactive \
+     -XX:+UseNUMA \             # 开启 NUMA 感知
+     -XX:-ZGenerational \       # Java 21+ 非分代 ZGC
+     -XX:+HeapDumpOnOutOfMemoryError \
+     -XX:HeapDumpPath=/var/log/heapdump.hprof \
+     -Xlog:gc*:file=gc.log \
+     -jar order-service.jar
+```
+
+### 上线后的对比数据
+
+| 指标 | G1（调优后） | ZGC |
+| --- | --- | --- |
+| Full GC 频率 | 每 30 分钟 | 并发，几乎无停顿 |
+| GC 停顿时间 | 300~500ms | < 1ms |
+| 吞吐量 | 基准值 | -5%（可接受） |
+| 堆内存上限 | 4GB（GC 停顿问题） | 8GB（ZGC 支持更大堆） |
+| p99 延迟 | 80ms（受 GC 影响） | 25ms |
+
+## 大促当天的监控
+
+大促期间，除了常规监控，还需要特别关注以下指标：
 
 ```yaml
-# Kubernetes JVM 配置
-resources:
-  requests:
-    memory: "4Gi"
-    cpu: "2"
-  limits:
-    memory: "4Gi"
-    cpu: "2"
+# Prometheus JVM 告警规则
+groups:
+  - name: jvm_health
+    rules:
+      # Old Gen 使用率
+      - alert: OldGenUsageHigh
+        expr: jvm_memory_used_bytes{area="old"} / jvm_memory_max_bytes{area="old"} > 0.8
+        for: 5m
+        annotations:
+          summary: "Old Gen 使用率超过 80%，可能即将触发 Full GC"
 
-env:
-  - name: JAVA_OPTS
-    value: "-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
-```
+      # GC 频率异常
+      - alert: FullGCFrequencyHigh
+        expr: rate(jvm_gc_pause_seconds_count{cause="FullGC"}[5m]) > 0.1
+        for: 5m
+        annotations:
+          summary: "Full GC 频率异常，每分钟超过 6 次"
 
-## GC 优化实战
+      # 堆内存增长速率
+      - alert: HeapGrowthRateHigh
+        expr: rate(jvm_memory_used_bytes[10m]) > 1073741824
+        for: 10m
+        annotations:
+          summary: "堆内存以 > 1GB/10min 的速度增长，可能存在内存泄漏"
 
-```java
-// 优化场景：减少对象晋升到 Old Gen
-
-@Service
-public class OldGenerationOptimization {
-
-    // 问题：大量中间对象进入 Old Gen
-    public void processOrdersBad(List<Order> orders) {
-        List<OrderDTO> dtos = new ArrayList<>();
-
-        for (Order order : orders) {
-            // 每次循环创建新的 DTO
-            OrderDTO dto = new OrderDTO();  // [!code error]
-            dto.setId(order.getId());
-            dto.setAmount(order.getAmount());
-            dto.setCustomerName(order.getCustomerName());
-            // ...
-            dtos.add(dto);
-        }
-
-        // 处理完成后 list 变成垃圾
-        process(dtos);
-    }
-
-    // 优化 1：对象池复用
-    private final ObjectPool<OrderDTO> dtoPool;
-
-    public void processOrdersGood(List<Order> orders) {
-        List<OrderDTO> dtos = new ArrayList<>();
-
-        for (Order order : orders) {
-            // 从对象池获取对象
-            OrderDTO dto = dtoPool.borrowObject();
-            try {
-                dto.setId(order.getId());
-                dto.setAmount(order.getAmount());
-                // ...
-                dtos.add(dto);
-            } finally {
-                dtoPool.returnObject(dto);
-            }
-        }
-
-        process(dtos);
-    }
-
-    // 优化 2：调整 Survivor 区比例
-    // -XX:SurvivorRatio=8 (Eden/Survivor = 8/1)
-    // 适用于：大量短期对象
-
-    // 优化 3：直接晋升大对象
-    // -XX:PretenureSizeThreshold=1m
-    // 适用于：已知的大对象
-}
-```
-
-## 性能监控
-
-```java
-// JMX 监控
-@SpringBootApplication
-@EnableJmxExport annotation + 配置
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,prometheus
-  metrics:
-    tags:
-      application: ${spring.application.name}
-```
-
-```java
-// 手动监控
-public class JvmMetricsCollector {
-    public Map<String, Object> collectMetrics() {
-        Map<String, Object> metrics = new HashMap<>();
-
-        // 内存使用
-        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
-        MemoryUsage heap = memory.getHeapMemoryUsage();
-        metrics.put("heap.used", heap.getUsed());
-        metrics.put("heap.max", heap.getMax());
-        metrics.put("heap.committed", heap.getCommitted());
-
-        // GC 统计
-        List<GarbageCollectorMXBean> gcBeans =
-            ManagementFactory.getGarbageCollectorMXBeans();
-        for (GarbageCollectorMXBean gc : gcBeans) {
-            metrics.put("gc." + gc.getName() + ".count", gc.getCollectionCount());
-            metrics.put("gc." + gc.getName() + ".time", gc.getCollectionTime());
-        }
-
-        // 线程统计
-        ThreadMXBean threads = ManagementFactory.getThreadMXBean();
-        metrics.put("threads.count", threads.getThreadCount());
-        metrics.put("threads.peak", threads.getPeakThreadCount());
-
-        return metrics;
-    }
-}
-```
-
-## 常见问题与解决
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    JVM 常见问题与解决方案                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 问题 1：频繁 Full GC                                   │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  原因：                                                │   │
-│  │  - Old Gen 太小                                       │   │
-│  │  - 大量长期对象                                       │   │
-│  │  - 内存泄漏                                           │   │
-│  │                                                         │   │
-│  │  解决：                                                │   │
-│  │  - 增加 Old Gen 大小                                  │   │
-│  │  - 优化代码，减少对象生命周期                       │   │
-│  │  - 分析堆转储，找内存泄漏                           │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 问题 2：GC 停顿时间过长                               │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  原因：                                                │   │
-│  │  - 堆太大                                             │   │
-│  │  - G1 区域太大                                       │   │
-│  │                                                         │   │
-│  │  解决：                                                │   │
-│  │  - 使用 ZGC / Shenandoah                             │   │
-│  │  - 调小 MaxGCPauseMillis                            │   │
-│  │  - 减少堆大小                                        │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 问题 3：Metaspace 溢出                                │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │                                                         │   │
-│  │  原因：                                                │   │
-│  │  - 动态类加载过多                                     │   │
-│  │  - 元空间太小                                         │   │
-│  │                                                         │   │
-│  │  解决：                                                │   │
-│  │  - 增加 MaxMetaspaceSize                            │   │
-│  │  - 检查代码，限制动态类加载                        │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+      # 元空间使用
+      - alert: MetaspaceUsageHigh
+        expr: jvm_memory_used_bytes{area="metaspace"} / jvm_memory_max_bytes{area="metaspace"} > 0.85
+        annotations:
+          summary: "Metaspace 使用率超过 85%，可能触发 OOM"
 ```
 
 ## 总结
 
-JVM 调优是 Java 应用性能优化的基础。
+这次大促前的 JVM 调优过程，有几个关键认知：
 
-**核心概念**：
+**第一，JVM 参数调优是最后手段，不是首选**。真正的问题在代码里——`ArrayList` 无限增长、重复创建 `DateFormat` 对象、大 JSON 缓存没有上限。代码层面的问题不解决，调参只是治标不治本。
 
-- 堆内存：Young / Old 分代
-- GC 类型：Minor GC / Full GC
-- 收集器：G1 / ZGC / CMS
+**第二，理解 GC 原理才能调好参数**。Survivor Ratio 影响对象在年轻代的停留时间；G1 的 Region 大小影响 GC 的粒度；ZGC 的并发收集让停顿时间不受堆大小影响——理解了这些原理，才能根据实际场景做出合理的参数选择。
 
-**调优参数**：
+**第三，大促前的调优需要验证周期**。参数改了之后，至少要在压测环境跑 24 小时以上，观察 GC 行为是否符合预期。大促当天才发现问题就太晚了。
 
-- 堆大小：-Xms / -Xmx
-- 年轻代：-Xmn / -XX:NewRatio
-- 收集器：-XX:+UseG1GC
-
-**常见问题**：
-
-- 频繁 Full GC：增加 Old Gen、优化代码
-- 停顿时间过长：使用 ZGC、调优参数
-- Metaspace 溢出：增加空间、检查类加载
-
-**核心认知**：JVM 调优不是银弹，首先要优化代码减少对象创建。调参是最后手段，不是首选。
+**第四，监控比调参更重要**。有了完整的 GC 监控和告警，才能在问题发生时第一时间发现，而不是等到用户开始抱怨「页面卡」才发现。

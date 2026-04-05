@@ -1,215 +1,576 @@
 ---
 title: 高并发抢购
-description: 抢购场景下的系统架构与性能优化
+description: 公平性、实时性与防刷的多维度设计实战
 ---
 
 # 高并发抢购
 
-限量商品开抢，瞬间大量用户涌入，系统响应变慢甚至崩溃。
+2019 年 12 月，某演唱会门票在大麦网开售，5 万张票在 8 秒内售罄。与此同时，大量用户收到「系统繁忙，请稍后重试」的提示，但他们明明没有抢到票，甚至页面还没刷新完。
 
-高并发抢购是秒杀之外的另一个典型高并发场景，相比秒杀更强调实时性和公平性。
+事后分析发现，5 万张票的实际购票流程中，真正成功下单的用户只有 4.3 万人——剩余 7000 张票被 3000 个用户抢到（每个用户用脚本抢了多张），然后在二手平台以 3-10 倍的价格转卖。这 7000 张「幽灵票」导致 7000 个真实想看演唱会的用户买不到票。
 
-## 抢购 vs 秒杀
+这个场景揭示了抢购系统与秒杀系统的本质区别：**秒杀追求的是系统在峰值压力下的稳定性，而抢购追求的是系统在公平性前提下的稳定性。** 脚本党用机器抢走大部分票，平台不仅损失了真正的用户，还损失了口碑和信任。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    抢购 vs 秒杀                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────────────┬──────────────────────┐              │
-│  │ 特征                  │ 抢购                │ 秒杀           │              │
-│  ├──────────────────────┼──────────────────────┤              │
-│  │ 持续时间             │ 可能较长            │ 通常很短       │              │
-│  ├──────────────────────┼──────────────────────┤              │
-│  │ 用户行为             │ 持续刷新页面        │ 准点下单       │              │
-│  ├──────────────────────┼──────────────────────┤              │
-│  │ 库存量               │ 通常较大            │ 通常很小       │              │
-│  ├──────────────────────┼──────────────────────┤              │
-│  │ 限流策略             │ 相对宽松            │ 严格限流       │              │
-│  ├──────────────────────┼──────────────────────┤              │
-│  │ 强调点               │ 公平性、实时性     │ 稳定性         │              │
-│  └──────────────────────┴──────────────────────┘              │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 业务背景：为什么抢购比秒杀更复杂
 
-## 抢购架构
+### 抢购与秒杀的本质差异
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    抢购系统架构                                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  前端层：                                               │   │
-│  │  - 静态资源 CDN                                    │   │
-│  │  - 请求排队（先到先得）                            │   │
-│  │  - 实时库存显示                                    │   │
-│  │                                                         │   │
-│  │  网关层：                                               │   │
-│  │  - 限流                                               │   │
-│  │  - 防爬                                               │   │
-│  │  - 用户识别                                           │   │
-│  │                                                         │   │
-│  │  服务层：                                               │   │
-│  │  - 库存服务：Redis + 分布式锁                       │   │
-│  │  - 订单服务：异步下单                              │   │
-│  │  - 消息服务：削峰填谷                              │   │
-│  │                                                         │   │
-│  │  数据层：                                               │   │
-│  │  - Redis：实时库存                                 │   │
-│  │  - MySQL：订单持久化                               │   │
-│  │  - Kafka：消息队列                                 │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 维度 | 秒杀 | 抢购 |
+| --- | --- | --- |
+| **触发方式** | 准点开始（如晚上 8 点） | 随时可开始（持续数小时） |
+| **持续时间** | 极短（3-30 分钟） | 可能持续数天 |
+| **库存量** | 通常较少（100-1000 件） | 相对较多（1000-100000 件） |
+| **用户行为** | 准点刷新，集中在开始几秒 | 持续刷新，行为分散 |
+| **公平性要求** | 中等（先到先得） | 极高（一人一号一票） |
+| **防脚本要求** | 较高 | 极高 |
+| **实时库存可见性** | 不需要（直到抢完） | 需要（用户要看还剩多少） |
 
-## 分布式锁
+### 典型抢购场景
+
+**场景一：演唱会/体育赛事门票**。实名制购票，每人限购 2 张，不能转让。脚本党用大量账号抢票，导致普通用户抢不到。防脚本是核心诉求。
+
+**场景二：iPhone/华为新手机首发**。限量抢购，不限账号但限数量（一人一台）。要求购买链路流畅，同时防止黄牛党囤货。
+
+**场景三：电商限时折扣**。某个爆款商品做 3 小时折扣活动，库存 1 万件，要求实时显示剩余库存，让用户看到紧迫感。
+
+**场景四：政务预约（如疫苗、牌照）**。名额极少（每天 100 个），但需要严格的实名认证和公平排队，不能有任何漏洞。
+
+## 公平性设计
+
+### 什么是真正的公平性
+
+公平性有三个层次：
+
+**第一层：一人一号一单**。同一个账号只能购买一次，不能用多个账号绕过限制。这是最低要求，但也是最容易被攻破的一层。
+
+**第二层：一人一证一票**。演唱会门票通常要求实名制入场，同一张身份证只能买一张票。这需要跟身份认证系统实时对接。
+
+**第三层：反黄牛机制**。识别账号之间的关联关系（同一 IP、同一收货地址、同一支付账号），打击团队协作式的囤票行为。
 
 ```java
-// Redisson 分布式锁实现
+// 实名购票服务：三层校验
 @Service
-public class PurchaseLockService {
-    @Autowired private RedissonClient redisson;
+public class RealNamePurchaseService {
 
-    public boolean tryLock(Long productId, Long userId) {
-        String lockKey = "purchase:lock:" + productId + ":" + userId;
-        RLock lock = redisson.getLock(lockKey);
+    @Autowired private IdentityVerificationService identityService;
+    @Autowired private PurchaseRecordRepository purchaseRecordRepo;
 
-        try {
-            // 尝试获取锁，最多等待 100ms，锁定后自动释放
-            return lock.tryLock(100, 30000, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
-    }
-
-    public void unlock(Long productId, Long userId) {
-        String lockKey = "purchase:lock:" + productId + ":" + userId;
-        RLock lock = redisson.getLock(lockKey);
-
-        if (lock.isHeldByCurrentThread()) {
-            lock.unlock();
-        }
-    }
-}
-
-// 抢购服务
-@Service
-public class PurchaseService {
-    @Autowired private PurchaseLockService lockService;
-    @Autowired private SeckillStockService stockService;
-    @Autowired private OrderService orderService;
-
-    public PurchaseResult purchase(Long productId, Long userId) {
-        // 1. 检查是否已购买
-        if (hasPurchased(productId, userId)) {
-            return PurchaseResult.alreadyPurchased();
+    public PurchaseResult purchaseWithRealName(Long userId, Long ticketId,
+                                               String idCardNo) {
+        // === 第一层：账号维度防重 ===
+        String accountKey = "ticket:account:" + ticketId + ":" + userId;
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(accountKey))) {
+            return PurchaseResult.REJECTED("该账号已购买");
         }
 
-        // 2. 获取分布式锁
-        if (!lockService.tryLock(productId, userId)) {
-            return PurchaseResult.busy();
+        // === 第二层：身份证维度防重 ===
+        // 演唱会通常要求实名入场
+        String idCardKey = "ticket:idcard:" + ticketId + ":" + idCardNo;
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(idCardKey))) {
+            return PurchaseResult.REJECTED("该证件已购买");
         }
 
-        try {
-            // 3. 再次检查库存
-            if (!stockService.hasStock(productId)) {
-                return PurchaseResult.soldOut();
-            }
+        // === 第三层：实时身份认证 ===
+        // 跟公安身份库对接，验证身份证真实性
+        IdentityVerifyResult verifyResult =
+            identityService.verify(idCardNo, userId);
 
-            // 4. 扣减库存
-            if (!stockService.deductStock(productId, 1)) {
-                return PurchaseResult.soldOut();
-            }
-
-            // 5. 创建订单
-            Order order = orderService.createOrder(productId, userId);
-
-            return PurchaseResult.success(order);
-
-        } finally {
-            lockService.unlock(productId, userId);
+        if (!verifyResult.isValid()) {
+            return PurchaseResult.REJECTED("身份认证失败: "
+                + verifyResult.getReason());
         }
+
+        // === 第四层：黑名单关联检测 ===
+        // 检查收货地址、支付账号是否存在关联
+        List<String> riskFlags = riskDetectionService.detect(userId);
+        if (!riskFlags.isEmpty()) {
+            log.warn("检测到购票风险: userId={}, flags={}", userId, riskFlags);
+            return PurchaseResult.REJECTED("购买异常，请稍后重试");
+        }
+
+        // 通过所有检查，执行购买逻辑
+        return executePurchase(userId, ticketId, idCardNo);
     }
 }
 ```
 
-## 公平性保障
+### 防脚本的核心技术
+
+脚本的本质是模拟人类行为，快速、大量、自动化地发送请求。防脚本的核心思路是**让机器慢下来、让机器暴露出来**。
+
+**技术一：行为验证码。** 图形验证码、滑块验证码、点选验证码。这些验证码对人类友好，但对脚本来说需要图像识别或机器学习才能破解。
 
 ```java
-// 队列排队机制
+// 滑块验证码服务
 @Service
-public class PurchaseQueueService {
+public class CaptchaService {
     @Autowired private RedisTemplate<String, String> redisTemplate;
 
-    private static final String QUEUE_KEY_PREFIX = "purchase:queue:";
-    private static final String RESULT_KEY_PREFIX = "purchase:result:";
+    // 生成滑块验证码
+    public CaptchaData generateCaptcha(Long userId, Long productId) {
+        // 生成验证码 ID
+        String captchaId = UUID.randomUUID().toString();
 
-    // 加入排队队列
-    public int joinQueue(Long productId, Long userId) {
-        String queueKey = QUEUE_KEY_PREFIX + productId;
+        // 生成随机缺口位置（0-200px）
+        int gapX = ThreadLocalRandom.current().nextInt(150) + 25;
+        int gapY = ThreadLocalRandom.current().nextInt(20) + 80;
 
-        // 加入队列尾部
-        Long position = redisTemplate.opsForList().rightPush(
-            queueKey, userId.toString());
+        // 生成拼图背景图片（服务端渲染或 CDN）
+        String bgImage = renderCaptchaImage(captchaId);
+        String sliderImage = renderSliderImage(gapX, gapY);
 
-        return position.intValue();  // 返回排队位置
+        // 将正确答案存入 Redis，5 分钟过期
+        String answerKey = "captcha:answer:" + captchaId;
+        redisTemplate.opsForValue().set(answerKey,
+            gapX + "," + gapY,
+            Duration.ofMinutes(5));
+
+        // 记录验证码使用情况（防复用）
+        String usedKey = "captcha:used:" + captchaId;
+        redisTemplate.opsForValue().set(usedKey, "0",
+            Duration.ofMinutes(5));
+
+        return new CaptchaData(captchaId, bgImage, sliderImage);
     }
 
-    // 获取抢购资格
-    public PurchaseTicket getTicket(Long productId, Long userId) {
-        String queueKey = QUEUE_KEY_PREFIX + productId;
-        String resultKey = RESULT_KEY_PREFIX + productId + ":" + userId;
-
-        // 检查是否已有结果
-        String result = redisTemplate.opsForValue().get(resultKey);
-        if (result != null) {
-            return PurchaseTicket.fromResult(result);
+    // 验证滑块
+    public boolean verifyCaptcha(String captchaId, int userX, int userY) {
+        String answerKey = "captcha:answer:" + captchaId;
+        String answer = redisTemplate.opsForValue().get(answerKey);
+        if (answer == null) {
+            return false; // 验证码过期
         }
 
-        // 检查队列位置
-        Long position = redisTemplate.opsForList().indexOf(
-            queueKey, userId.toString());
+        String[] parts = answer.split(",");
+        int correctX = Integer.parseInt(parts[0]);
+        int correctY = Integer.parseInt(parts[1]);
 
-        if (position == null || position < 0) {
-            return PurchaseTicket.notInQueue();
+        // 容差：X 方向允许 ±5px，Y 方向允许 ±10px
+        boolean valid = Math.abs(userX - correctX) <= 5
+                     && Math.abs(userY - correctY) <= 10;
+
+        // 验证通过后标记为已使用（防止复用）
+        if (valid) {
+            String usedKey = "captcha:used:" + captchaId;
+            redisTemplate.opsForValue().set(usedKey, "1",
+                Duration.ofMinutes(5));
         }
 
-        // 查询当前可用库存
-        Long availableStock = getAvailableStock(productId);
+        return valid;
+    }
+}
+```
 
-        if (position < availableStock) {
-            // 有资格抢购
-            return PurchaseTicket.eligible(position.intValue());
-        } else {
-            // 排队中
-            return PurchaseTicket.waiting(position.intValue());
+**技术二：设备指纹。** 每台设备的浏览器/APP 都会暴露一些特征（Canvas 指纹、WebGL 渲染特征、字体列表、屏幕分辨率、时区等），组合起来可以唯一标识一台设备。脚本换个 IP 容易，但换设备指纹难。
+
+```java
+// 设备指纹服务
+@Service
+public class DeviceFingerprintService {
+
+    // 设备指纹评分：0-100 分，高于 80 分认为可信
+    public int evaluateFingerprint(DeviceFingerprint fingerprint) {
+        int score = 0;
+
+        // Canvas 指纹一致性（30分）
+        // 真实浏览器的 Canvas 渲染会有微小差异，脚本往往返回相同值
+        if (fingerprint.isCanvasConsistent()) {
+            score += 30;
+        }
+
+        // WebGL 渲染特征（20分）
+        if (fingerprint.hasWebGLFeature()) {
+            score += 20;
+        }
+
+        // 屏幕分辨率和颜色深度（10分）
+        if (fingerprint.getScreenDepth() >= 24) {
+            score += 10;
+        }
+
+        // TLS 指纹（20分）
+        // 不同浏览器的 TLS 握手参数不同，脚本通常使用统一库的 TLS 指纹
+        if (fingerprint.isTlsFingerprintNormal()) {
+            score += 20;
+        }
+
+        // 行为分析（20分）
+        // 真实用户的鼠标移动轨迹有随机性，脚本往往是直线或匀速
+        if (fingerprint.isMouseTrajectoryNatural()) {
+            score += 20;
+        }
+
+        return score;
+    }
+}
+```
+
+**技术三：IP 画像与威胁情报。** 数据中心 IP（云服务器）大量出现在抢购场景中，基本可以断定为脚本。IDC IP 打分为 0 分，住宅 IP 打分 80 分以上。
+
+```java
+// IP 画像服务
+@Service
+public class IpProfileService {
+    // IP 维度评估
+    public IpProfile getProfile(String ip) {
+        // 查询 IP 库：判断是否为数据中心 IP
+        IpType type = ipGeoService.getIpType(ip);
+
+        if (type == IpType.DATACENTER) {
+            // 云服务器 IP，大概率是脚本
+            return IpProfile.builder()
+                .ip(ip)
+                .type(IpType.DATACENTER)
+                .score(0) // 直接判为脚本
+                .riskReason("数据中心IP，不允许参与抢购")
+                .build();
+        }
+
+        if (type == IpType.PROXY || type == IpType.VPN) {
+            return IpProfile.builder()
+                .ip(ip)
+                .type(type)
+                .score(30)
+                .riskReason("代理/VPN IP，可信度低")
+                .build();
+        }
+
+        return IpProfile.builder()
+            .ip(ip)
+            .type(IpType.RESIDENTIAL)
+            .score(80)
+            .build();
+    }
+}
+```
+
+## 分布式锁 vs Redis 原子操作
+
+和秒杀类似，抢购系统也需要解决高并发下的库存扣减问题。但有一个关键区别：**抢购通常需要更严格的互斥——同一用户不能重复购买，而秒杀的库存扣减是用户无关的。**
+
+### 方案一：分布式锁
+
+分布式锁的核心思路是：**在扣减库存前，对「用户 + 商品」这个维度加锁，保证同一用户的并发请求串行执行。**
+
+```java
+// 分布式锁实现
+@Service
+public class DistributedLockService {
+    @Autowired private RedissonClient redissonClient;
+
+    public <T> T executeWithLock(String lockKey, long waitTime,
+                                  long leaseTime, Callable<T> action) {
+        RLock lock = redissonClient.getLock(lockKey);
+
+        try {
+            // tryLock：尝试获取锁，最多等待 waitTime，获得后自动释放
+            boolean acquired = lock.tryLock(waitTime, leaseTime,
+                TimeUnit.MILLISECONDS);
+
+            if (!acquired) {
+                throw new LockAcquireFailedException("获取锁失败: " + lockKey);
+            }
+
+            return action.call();
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new LockAcquireFailedException("获取锁被中断", e);
+        } finally {
+            // 释放锁
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+
+// 抢购服务：分布式锁方案
+@Service
+public class PurchaseServiceWithLock {
+    @Autowired private DistributedLockService lockService;
+    @Autowired private PurchaseRepository purchaseRepository;
+    @Autowired private StockService stockService;
+
+    public PurchaseResult purchase(Long userId, Long productId) {
+        String lockKey = "purchase:lock:" + productId + ":" + userId;
+
+        return lockService.executeWithLock(lockKey,
+            100,  // 最多等待 100ms
+            3000, // 锁定后 3s 自动释放
+            () -> {
+                // ========== 锁内的逻辑（串行执行）==========
+
+                // 1. 再次检查是否已购买（双重检查）
+                if (purchaseRepository.existsByUserAndProduct(userId, productId)) {
+                    return PurchaseResult.ALREADY_PURCHASED;
+                }
+
+                // 2. 检查库存
+                int stock = stockService.getStock(productId);
+                if (stock <= 0) {
+                    return PurchaseResult.SOLD_OUT;
+                }
+
+                // 3. 扣减库存
+                stockService.decreaseStock(productId, 1);
+
+                // 4. 创建购买记录
+                Purchase purchase = new Purchase();
+                purchase.setUserId(userId);
+                purchase.setProductId(productId);
+                purchase.setStatus(PurchaseStatus.SUCCESS);
+                purchaseRepository.save(purchase);
+
+                return PurchaseResult.SUCCESS;
+            });
+    }
+}
+```
+
+**分布式锁的优点**：逻辑清晰，调试方便，同一用户的并发请求天然串行，不存在重复购买。
+
+**分布式锁的缺点**：
+
+- 每个用户的每个请求都要获取锁，高并发时锁竞争严重
+- 锁获取失败的用户体验差（直接返回失败）
+- 如果锁的持有时间过长，会造成大量请求堆积
+- 分布式锁有获取失败的场景，不是完全可靠的
+
+### 方案二：Redis 原子操作（推荐用于抢购）
+
+分布式锁的核心问题是**把并发变成了串行**，浪费了大量可以并行处理的机会。更好的方案是**用 Redis 原子操作来保证正确性，同时保持高并发**。
+
+```java
+// Redis 原子操作方案
+@Service
+public class PurchaseServiceWithRedis {
+    @Autowired private RedisTemplate<String, String> redisTemplate;
+    @Autowired private StockService stockService;
+    @Autowired private PurchaseRepository purchaseRepository;
+
+    private static final String STOCK_KEY = "purchase:stock:";
+    private static final String USER_KEY = "purchase:user:";
+    private static final String RESULT_KEY = "purchase:result:";
+
+    public PurchaseResult purchase(Long userId, Long productId) {
+        String stockKey = STOCK_KEY + productId;
+        String userKey = USER_KEY + productId + ":" + userId;
+
+        // 1. 检查是否已购买（SETNX 原子操作）
+        // SETNX 的语义是：key 不存在时才设置成功
+        // 如果设置失败，说明用户已经购买过
+        Boolean notPurchased = redisTemplate.opsForValue()
+            .setIfAbsent(userKey, "1", Duration.ofHours(24));
+
+        if (Boolean.FALSE.equals(notPurchased)) {
+            return PurchaseResult.ALREADY_PURCHASED;
+        }
+
+        try {
+            // 2. Redis Lua 原子扣减库存
+            String deductResult = stockService.deductStockLua(productId, 1);
+
+            if (!"1".equals(deductResult)) {
+                // 库存不足，删除用户购买标记
+                redisTemplate.delete(userKey);
+                return PurchaseResult.SOLD_OUT;
+            }
+
+            // 3. 扣减成功后，创建正式购买记录
+            Purchase purchase = new Purchase();
+            purchase.setUserId(userId);
+            purchase.setProductId(productId);
+            purchase.setStatus(PurchaseStatus.SUCCESS);
+            purchaseRepository.save(purchase);
+
+            return PurchaseResult.SUCCESS;
+
+        } catch (Exception e) {
+            // 任何异常：删除用户标记并回滚库存
+            redisTemplate.delete(userKey);
+            stockService.rollbackStock(productId, 1);
+            throw e;
         }
     }
 }
 ```
+
+**Redis 原子操作方案的优点**：
+
+- 库存扣减操作完全并行，无锁竞争
+- Redis 单线程保证原子性，不存在超卖
+- 性能远高于分布式锁（Redis 可达 10-20 万 QPS）
+
+**Redis 原子操作方案的缺点**：
+
+- 逻辑比分布式锁稍复杂
+- 扣减失败时需要手动回滚用户购买标记
+- 需要额外的补偿机制（定时扫描 Redis 和 MySQL 的一致性）
+
+### 两种方案的选择
+
+| 场景 | 推荐方案 | 理由 |
+| --- | --- | --- |
+| **高价值限量票（演唱会）** | 分布式锁 | 正确性 > 性能，一张票价值数百到数千元，不允许任何闪失 |
+| **电商限时抢购（库存较大）** | Redis 原子操作 | 性能 > 正确性，少量超卖可接受（平台补偿），但用户体验要保证 |
+| **政务预约（绝对公平）** | 分布式锁 + 队列 | 队列保证顺序，锁保证原子性，宁可慢一点也要对 |
+| **iPhone 首发（中等库存）** | Redis 原子操作 + 风控 | 高并发下 Redis 原子操作足够，加风控防止黄牛 |
+
+## 实时库存展示
+
+抢购系统通常需要展示实时库存，让用户看到「还剩多少」，制造紧迫感。这个功能看似简单，但背后有几个坑。
+
+### 方案一：直接读 Redis
+
+最简单的方式是直接查 Redis 库存：
+
+```java
+public int getAvailableStock(Long productId) {
+    String key = "purchase:stock:" + productId;
+    String stock = redisTemplate.opsForValue().get(key);
+    return stock == null ? 0 : Integer.parseInt(stock);
+}
+```
+
+问题：**Redis 库存的变化是离散的**，比如从 100 → 0，用户看到的库存变化是跳跃式的。体验不够「丝滑」，而且高并发下大量请求都在读同一个 Key，热 Key 问题会很明显。
+
+### 方案二：库存分段 + 概率展示
+
+更好的做法是把库存分成多个区段，不同区段展示不同精度：
+
+```java
+// 实时库存展示服务
+@Service
+public class RealTimeStockService {
+
+    public StockDisplay getDisplay(Long productId) {
+        int stock = getRealStock(productId);
+
+        if (stock > 100) {
+            // 高库存时展示精确数字
+            return new StockDisplay(stock, "仅剩 " + stock + " 件");
+        } else if (stock > 20) {
+            // 中等库存展示区间
+            return new StockDisplay(stock, "仅剩 10-20 件");
+        } else if (stock > 0) {
+            // 低库存营造紧迫感
+            return new StockDisplay(stock, "库存紧张，仅剩 " + stock + " 件");
+        } else {
+            return new StockDisplay(0, "已售罄");
+        }
+    }
+
+    // 缓存库存数字，减少 Redis 访问
+    // 使用本地缓存（Caffeine）减轻 Redis 压力
+    @Cacheable(value = "stock", key = "#productId", cacheManager = "caffeineCacheManager")
+    public int getCachedStock(Long productId) {
+        return getRealStock(productId);
+    }
+}
+```
+
+### 方案三：倒计时 + 固定库存展示
+
+有些抢购活动不需要实时库存，只需要告知用户「还有 X 分钟开始 / 结束」。这种场景更简单：
+
+```java
+// 抢购活动状态服务
+public ActivityStatus getActivityStatus(Long activityId) {
+    Activity activity = activityRepository.findById(activityId);
+
+    LocalDateTime now = LocalDateTime.now();
+
+    if (now.isBefore(activity.getStartTime())) {
+        // 即将开始
+        Duration remaining = Duration.between(now, activity.getStartTime());
+        return ActivityStatus.builder()
+            .phase(Phase.NOT_STARTED)
+            .message("距开始还有 " + formatDuration(remaining))
+            .build();
+    }
+
+    if (now.isAfter(activity.getEndTime())) {
+        return ActivityStatus.builder()
+            .phase(Phase.ENDED)
+            .message("已结束")
+            .build();
+    }
+
+    // 进行中：不需要展示库存，让用户直接参与
+    return ActivityStatus.builder()
+        .phase(Phase.ONGOING)
+        .message("抢购进行中")
+        .build();
+}
+```
+
+## 真实踩坑案例
+
+### 踩坑一：分布式锁的「死锁」
+
+某公司用了 Redisson 分布式锁，在代码里用了 `lock.tryLock(100, 3000, TimeUnit.MILLISECONDS)`，锁的持有时间是 3 秒。但在压测时发现，10% 的请求超时，甚至整个服务都冻住了。
+
+排查发现问题：`finally` 块里没有检查 `lock.isHeldByCurrentThread()`。当业务逻辑抛异常时，如果恰好持有锁的线程不是当前线程，`unlock()` 会抛 `IllegalMonitorStateException`，导致整个请求链路被中断。
+
+更严重的是，`tryLock` 的 `leaseTime` 设置为 3 秒，但实际业务执行时间超过 3 秒（涉及数据库操作）。锁自动释放后，另一个请求获取了锁，但前一个请求还在执行——两个请求同时操作同一份数据，直接导致超卖。
+
+**教训**：分布式锁的持有时间一定要大于业务最大执行时间，或者设置 `leaseTime = -1`（不自动释放，靠心跳续约）。
+
+### 踩坑二：库存回滚后又被扣减
+
+某次抢购活动中，Redis 库存因为超时未支付被回滚了 50 件，但随后有 30 个用户收到了「购买成功」的通知——这些用户明明应该被回滚。
+
+排查发现：回滚库存和通知用户是两个独立操作。在回滚库存之后、通知发送之前，有 30 个新请求读到了 Redis 的旧库存（还没更新），并成功扣减了库存。
+
+**教训**：Redis 库存回滚和用户通知必须放在同一个事务内，或者用消息队列保证顺序——回滚完成后再处理新请求。或者用「预扣库存 → 确认支付 → 真正扣减」两阶段模式，第一阶段失败直接释放，不存在中间状态。
+
+### 踩坑三：设备指纹被绕过
+
+某公司上线了设备指纹风控系统，效果很好，拦截了 60% 的脚本请求。但一周后黄牛圈子里开始流传一份教程：「如何在抢购脚本中模拟真实浏览器环境」。
+
+原来黄牛们通过 Chrome DevTools Protocol 操控真实浏览器来发送请求，每台浏览器只用一次，完全模拟了真实用户的行为。设备指纹系统对这种「真机脚本」完全失效。
+
+**教训**：设备指纹只是反脚本的一个环节，不能作为唯一防线。真正的反脚本需要多层联动：设备指纹 + 行为分析 + 购买频率 + 收货地址聚类 + 实时风控模型。单一维度的防御都容易被绕过。
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| 实名购票 | 业务名词 | 要求购票人提供真实身份信息（身份证号、姓名），入场时核验，防止票务转卖 |
+| 设备指纹（Device Fingerprint） | 技术名词 | 采集浏览器的 Canvas 渲染、WebGL 特征、TLS 指纹等，组合成唯一标识设备的技术 |
+| SETNX（SET if Not eXists） | 指令名 | Redis 命令，当 key 不存在时才设置值，常用于分布式锁和防重放 |
+| Canvas 指纹 | 技术名词 | 不同浏览器和显卡渲染 Canvas 时的微小差异，可作为设备唯一标识 |
+| TLS 指纹 | 技术名词 | 不同浏览器发送 TLS 握手请求时的参数差异，OpenSSL、Go、Java 等库的指纹各不相同 |
+| Redisson | 框架名 | Java 语言的 Redis 客户端，提供了丰富的分布式锁、限流等工具类 |
+| 双重检查锁定（DCL） | 设计模式 | 在加锁前后都检查条件，用于减少锁竞争，提升性能 |
+| CTA/CAPTCHA | 技术名词 | Completely Automated Public Turing test to tell Computers and Humans Apart，区分人机的自动化测试，常见形式有图形验证码、滑块验证码等 |
+| 代理池 / IP 代理 | 技术名词 | 通过大量代理服务器隐藏真实 IP 地址，绕过 IP 限流 |
+| 黄牛（Ticket Scalper） | 业务名词 | 通过囤积稀缺资源（票、号、限量商品）转卖获利的行为和人 |
+| 黄牛党 | 业务名词 | 从事黄牛行为的群体，常使用脚本批量抢购 |
+| 订单确认时效 | 业务名词 | 抢购成功后要求用户在指定时间内完成支付，否则库存释放 |
+| 限流算法 | 技术名词 | 控制请求速率的算法，常见有令牌桶、滑动窗口、漏桶算法 |
 
 ## 总结
 
-高并发抢购需要在公平性和性能之间找到平衡。
+抢购系统的核心是**在保证公平性的前提下，实现高并发**。这比秒杀的难度高了一个层次。
 
-**核心设计**：
+**公平性三维保障**：
 
-- 分布式锁：保证一人一号一单
-- 队列机制：保障公平性
-- Redis 库存：高性能实时扣减
-- 异步订单：削峰处理
+- **账号维度**：一人一号一单，用 Redis SETNX 原子操作保证
+- **身份维度**：一人一证一票，与身份认证系统实时对接
+- **设备维度**：设备指纹 + 行为分析 + 关联分析，打击团队囤票
 
-**与秒杀的差异**：
+**防脚本三道防线**：
 
-- 持续时间更长
-- 更强调公平性
-- 库存量相对较大
-- 限流相对宽松
+- **让机器慢下来**：验证码、延迟响应
+- **让机器暴露**：设备指纹、TLS 指纹、IP 画像
+- **让机器无效**：一人一号锁死、黑名单联动
 
-**核心认知**：抢购系统的核心是公平性和实时性的平衡。队列机制可以保障公平性，但会增加延迟；锁机制可以保证准确性，但会带来性能开销。
+**方案选择**：
+
+- **高价值、严格公平**（演唱会票）→ 分布式锁 + 队列 + 多重校验
+- **中等价值、高并发**（电商抢购）→ Redis 原子操作 + 风控系统
+- **绝对公平**（政务预约）→ 完全串行 + 严格实名 + 人工复核
+
+**真正让抢购系统难的不是技术，而是「道高一尺魔高一丈」的攻防博弈。** 风控系统需要持续迭代，黄牛的技术也在进步。但核心原则不变：让真实用户有更好的体验，让脚本的成本高于收益。
