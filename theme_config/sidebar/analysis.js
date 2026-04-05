@@ -3,10 +3,7 @@ export const analysisSidebar = [
     text: '知名架构解析',
     link: '/analysis/famous-architectures/',
     items: [
-      {
-        text: 'Google 架构演进',
-        link: '/analysis/famous-architectures/google',
-      },
+      { text: 'Google 架构演进', link: '/analysis/famous-architectures/google' },
       { text: 'Netflix 架构', link: '/analysis/famous-architectures/netflix' },
       { text: 'Uber 架构', link: '/analysis/famous-architectures/uber' },
       { text: '阿里架构', link: '/analysis/famous-architectures/alibaba' },
@@ -19,10 +16,7 @@ export const analysisSidebar = [
       { text: '大型故障复盘', link: '/analysis/failure-cases/major-incidents' },
       { text: '故障根因分析', link: '/analysis/failure-cases/root-cause' },
       { text: '故障预防措施', link: '/analysis/failure-cases/prevention' },
-      {
-        text: '应急响应流程',
-        link: '/analysis/failure-cases/incident-response',
-      },
+      { text: '应急响应流程', link: '/analysis/failure-cases/incident-response' },
     ],
   },
   {
