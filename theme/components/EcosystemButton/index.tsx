@@ -15,9 +15,13 @@ import './index.css';
 import { ecosystemButton } from '../../../theme_config/ecosystemButton';
 
 export const EcosystemButton = () => {
+  // 组件自管理的展开状态，不依赖外部控制
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
+  // mousedown 而非 click：mousedown 先于 click 触发，
+  // 这样点击下拉菜单内的链接时，dropdown 能在点击事件冒泡前关闭，
+  // 避免 click 打到关闭的 DOM 上导致导航失效
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (
@@ -40,6 +44,7 @@ export const EcosystemButton = () => {
         aria-label="生态导航"
         aria-expanded={isOpen}
       >
+        {/* 2x2 网格图标：暗示多个生态项目 */}
         <svg
           className="ecosystem-button-icon"
           viewBox="0 0 24 24"
@@ -62,13 +67,16 @@ export const EcosystemButton = () => {
         </div>
         <div className={`ecosystem-button-list ${ecosystemButton.length === 1 ? 'single' : ''}`}>
           {ecosystemButton.map((item) => {
+            // 以 http(s):// 开头判定为外部链接，内部链接走前端路由（无协议头）
             const isExternal = item.link.startsWith('http://') || item.link.startsWith('https://');
             return (
               <a
                 key={item.name}
                 href={item.link}
                 className="ecosystem-button-item"
+                // 外部链接用 target="_blank" 新窗口打开，内部链接用当前窗口（支持前端路由）
                 target={isExternal ? '_blank' : undefined}
+                // 新窗口时必须加 noopener noreferrer：防止新页面通过 window.opener 操控本页面
                 rel={isExternal ? 'noopener noreferrer' : undefined}
                 onClick={() => setIsOpen(false)}
               >
