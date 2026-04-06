@@ -1,6 +1,6 @@
 export const analysisSidebar = [
   {
-    text: '知名架构',
+    text: '知名架构解析',
     link: '/analysis/famous-architectures/',
     items: [
       { text: 'Google 演进史', link: '/analysis/famous-architectures/google' },
@@ -18,7 +18,7 @@ export const analysisSidebar = [
     ],
   },
   {
-    text: '故障案例',
+    text: '故障案例分析',
     link: '/analysis/failure-cases/',
     items: [
       { text: '大型故障复盘', link: '/analysis/failure-cases/major-incidents' },
@@ -28,7 +28,7 @@ export const analysisSidebar = [
     ],
   },
   {
-    text: '性能调优',
+    text: '性能调优案例',
     link: '/analysis/optimization-cases/',
     items: [
       { text: '数据库调优', link: '/analysis/optimization-cases/database' },
@@ -38,7 +38,7 @@ export const analysisSidebar = [
     ],
   },
   {
-    text: '架构迁移',
+    text: '架构迁移案例',
     link: '/analysis/migration-cases/',
     items: [
       {
@@ -54,7 +54,7 @@ export const analysisSidebar = [
     ],
   },
   {
-    text: '极限场景',
+    text: '知名架构解析',
     link: '/analysis/extreme-scenarios/',
     items: [
       { text: '秒杀系统设计', link: '/analysis/extreme-scenarios/seckill' },
