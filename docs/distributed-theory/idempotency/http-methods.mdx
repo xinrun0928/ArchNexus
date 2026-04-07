@@ -1,0 +1,397 @@
+---
+title: HTTP 幂等性
+description: 深入理解 HTTP 各方法的幂等性特征，以及 RESTful API 设计中的幂等性原则
+---
+
+# HTTP 幂等性
+
+HTTP 协议在设计之初就考虑了幂等性。RFC 7231 明确定义了 HTTP 方法的幂等性特征：**哪些方法幂等，哪些不幂等，不是随便定的，而是有严格规定的**。
+
+理解这些规定，是设计 RESTful API 的基础。但很多人对这些规定的理解是模糊的——PUT 和 PATCH 有什么区别？POST 为什么不是幂等的？状态码和幂等性有什么关系？这些问题，本篇逐一解答。
+
+## HTTP 方法幂等性一览
+
+| 方法 | 幂等性 | 说明 |
+| --- | --- | --- |
+| GET | **幂等** | 只读操作，不改变资源状态 |
+| HEAD | **幂等** | 与 GET 类似，只返回头部信息 |
+| PUT | **幂等** | 用相同的值覆盖，状态不变 |
+| DELETE | **幂等** | 资源不存在和删除后不存在，结果一样 |
+| POST | **非幂等** | 每次 POST 创建新资源 |
+| PATCH | **非幂等** | 部分更新，累积效果可能不同 |
+| OPTIONS | **幂等** | 查询支持的 HTTP 方法 |
+
+## GET：天然幂等
+
+GET 是最纯粹的幂等操作。它的语义是「读取资源」，不应该有任何副作用。
+
+```http
+GET /api/users/123 HTTP/1.1
+Host: api.example.com
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": 123,
+  "name": "张三",
+  "email": "zhang@example.com"
+}
+```
+
+无论调用多少次 GET，只要用户 123 的数据不变，返回结果就完全一样。这就是幂等。
+
+:::warning
+**注意**：虽然 GET 语义上是幂等的，但有些接口会记录访问日志、更新 TTL、甚至修改缓存统计。这些「副作用」在技术上使 GET 不再「纯粹幂等」。设计 API 时，应该尽量保持 GET 的纯粹性。
+:::
+
+## PUT：完整替换，幂等保证
+
+PUT 的语义是「用给定的数据完整替换资源」。如果两次 PUT 的数据相同，资源的最终状态就相同——这就是幂等。
+
+```http
+PUT /api/users/123 HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+
+{
+  "id": 123,
+  "name": "张三",
+  "email": "zhang@example.com"
+}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": 123,
+  "name": "张三",
+  "email": "zhang@example.com"
+}
+```
+
+第二次调用同样的 PUT：
+
+```http
+PUT /api/users/123 HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+
+{
+  "id": 123,
+  "name": "张三",
+  "email": "zhang@example.com"
+}
+```
+
+结果完全一样：**幂等**。
+
+### PUT 的关键点
+
+1. **客户端决定资源 ID**：PUT 通常用于更新已知 ID 的资源
+2. **完整替换**：PUT 会用请求体的数据完全替换服务器上的资源
+3. **不存在则创建**：如果资源不存在，PUT 可以选择创建它
+
+```java
+// PUT 的幂等性在代码层面的体现
+public void updateUser(Long userId, UserRequest request) {
+    // 无论调用多少次，只要 request 相同，最终状态就相同
+    User user = new User();
+    user.setId(userId);
+    user.setName(request.getName());
+    user.setEmail(request.getEmail());
+    // 完整替换，不依赖原有值
+    userRepository.save(user);
+}
+```
+
+## DELETE：目标状态幂等
+
+DELETE 的语义是「删除资源」。关键在于：删除的目标状态是「资源不存在」，无论资源是否已经被删除，最终状态一样。
+
+```http
+DELETE /api/users/123 HTTP/1.1
+Host: api.example.com
+```
+
+```http
+HTTP/1.1 204 No Content
+```
+
+再次调用：
+
+```http
+DELETE /api/users/123 HTTP/1.1
+Host: api.example.com
+```
+
+```http
+HTTP/1.1 404 Not Found
+```
+
+第二次返回 404，但这是**幂等的**——因为「资源不存在」是 DELETE 的目标状态，无论资源是「被删除」还是「本来就不存在」，最终状态一样。
+
+:::info
+有些 API 在删除已删除的资源时返回 200 而不是 404，这完全合理——只要调用方理解「200 表示操作成功」，即可认为幂等。幂等性关注的是结果，而不是状态码。
+:::
+
+```java
+// DELETE 的幂等性实现
+public DeleteResult deleteUser(Long userId) {
+    Optional<User> existing = userRepository.findById(userId);
+    if (existing.isEmpty()) {
+        // 资源不存在，也是「删除成功」的目标状态
+        return DeleteResult.NOT_FOUND;
+    }
+    userRepository.delete(existing.get());
+    return DeleteResult.DELETED;
+}
+```
+
+## POST：非幂等的本质
+
+POST 的语义是「创建新资源」或「提交数据」。每次 POST 都会产生一个新资源——这与幂等的定义「执行一次和执行多次效果相同」相矛盾。
+
+```http
+POST /api/orders HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+
+{
+  "productId": "PROD-001",
+  "quantity": 2,
+  "amount": 100.00
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /api/orders/ORD-20240115-001
+Content-Type: application/json
+
+{
+  "id": "ORD-20240115-001",
+  "status": "CREATED",
+  "createdAt": "2024-01-15T10:30:00Z"
+}
+```
+
+再次发送同样的 POST：
+
+```http
+POST /api/orders HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+
+{
+  "productId": "PROD-001",
+  "quantity": 2,
+  "amount": 100.00
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /api/orders/ORD-20240115-002
+Content-Type: application/json
+
+{
+  "id": "ORD-20240115-002",
+  "status": "CREATED",
+  "createdAt": "2024-01-15T10:31:00Z"
+}
+```
+
+创建了两笔订单——**非幂等**。
+
+### POST 的适用场景
+
+| 场景 | 为什么用 POST |
+| --- | --- |
+| 创建资源，ID 由服务器生成 | 服务器才能知道最终 ID |
+| 触发一个动作（如支付、退款） | 每次调用都是新的业务操作 |
+| 上传文件 | 服务器需要决定存储位置 |
+| 复杂查询 | 没有合适的资源路径映射 |
+
+## PATCH：部分更新，非幂等的灰色地带
+
+PATCH 用于「部分更新」资源。问题在于：PATCH 的语义是「将当前值修改为目标值」，而「修改」这个动作本身可能不是幂等的。
+
+### 场景一：绝对值 PATCH（幂等）
+
+```json
+// PATCH /api/users/123
+// 将 name 修改为 "李四"
+// 无论执行多少次，结果都是 name = "李四"
+{ "op": "replace", "path": "/name", "value": "李四" }
+```
+
+### 场景二：增量 PATCH（非幂等）
+
+```json
+// 将 quantity 增加 1
+// 执行一次：quantity = 2
+// 执行两次：quantity = 3（变了！）
+{ "op": "add", "path": "/quantity", "value": 1 }
+```
+
+```json
+// 将 amount 减少 10%
+// 执行一次：amount = 90
+// 执行两次：amount = 81（变了！）
+{ "op": "multiply", "path": "/amount", "value": 0.9 }
+```
+
+:::warning
+PATCH 的幂等性取决于 patch 文档的内容：
+
+- **绝对值替换**（replace）：幂等
+- **相对值修改**（add、multiply）：非幂等
+
+设计 API 时，应该明确区分这两种场景，或者在文档中说明 PATCH 的语义。
+:::
+
+## 状态码与幂等性
+
+HTTP 状态码的设计也与幂等性有关：
+
+| 状态码 | 含义 | 与幂等性的关系 |
+| --- | --- | --- |
+| 200 OK | 操作成功，响应包含结果 | 不关心幂等性 |
+| 201 Created | 新资源创建成功 | 通常用于 POST |
+| 204 No Content | 操作成功，无响应体 | 常用于 PUT、DELETE |
+| 404 Not Found | 资源不存在 | DELETE 的合法结果（幂等） |
+| 409 Conflict | 资源冲突 | 业务层面的冲突检测 |
+| 422 Unprocessable Entity | 请求格式正确但无法处理 | 参数校验失败 |
+
+:::info
+**201 Created 的幂等性**
+
+201 表示「新资源被创建」。如果用 POST 创建资源，重复调用会产生多个 201。但如果用 PUT 创建不存在的资源，第二次调用会返回 200 而不是 201——因为资源已经存在，不需要再「创建」。
+
+这两种情况都是合理的，关键在于：幂等性关注的是「结果状态」，而不是「状态码」。
+:::
+
+## RESTful 设计建议
+
+### 原则一：正确选择方法
+
+| 操作类型 | 推荐方法 | 说明 |
+| --- | --- | --- |
+| 查询 | GET | 天然幂等 |
+| 创建（ID 由服务器生成） | POST | 非幂等，可接受 |
+| 创建/更新（ID 由客户端指定） | PUT | 幂等 |
+| 完整替换 | PUT | 幂等 |
+| 部分更新（绝对值） | PATCH | 可幂等 |
+| 部分更新（相对值） | POST | 非幂等 |
+| 删除 | DELETE | 幂等 |
+
+### 原则二：幂等性应该明确
+
+```java
+// 推荐：明确幂等性
+@PutMapping("/users/{id}")
+public ResponseEntity<User> updateUser(
+    @PathVariable Long id,
+    @RequestBody UserRequest request,
+    @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey
+) {
+    // PUT 本身幂等，但如果需要更强的保证，可以加上幂等 key
+    return ResponseEntity.ok(userService.update(id, request));
+}
+```
+
+### 原则三：幂等 key 的使用场景
+
+对于 POST 这类非幂等操作，可以引入幂等 key：
+
+```http
+POST /api/orders HTTP/1.1
+Host: api.example.com
+X-Idempotency-Key: idem-20240115-abc123
+Content-Type: application/json
+
+{
+  "productId": "PROD-001",
+  "quantity": 2
+}
+```
+
+服务端记录这个 key，第一次处理后存储结果，后续相同 key 的请求直接返回缓存结果。
+
+## 幂等性权衡矩阵
+
+| 场景 | 推荐方法 | 幂等性 | 是否需要额外幂等处理 |
+| --- | --- | --- | --- |
+| 查询用户信息 | GET | **幂等** | 不需要 |
+| 更新用户名 | PUT | **幂等** | 不需要 |
+| 更新用户名（部分字段） | PATCH | **可能幂等** | 取决于 patch 内容 |
+| 创建订单 | POST | **非幂等** | **需要** |
+| 扣减库存（固定值） | PATCH | **幂等** | 不需要 |
+| 扣减库存（相对值） | POST | **非幂等** | **需要** |
+| 删除订单 | DELETE | **幂等** | 不需要 |
+| 支付扣款 | POST | **非幂等** | **需要** |
+
+## 术语表
+
+| 术语 | 英文 | 定义 |
+| --- | --- | --- |
+| REST | Representational State Transfer | 一种 API 设计风格 |
+| PUT | PUT | HTTP 方法，完整替换资源 |
+| PATCH | PATCH | HTTP 方法，部分更新资源 |
+| 幂等 Key | Idempotency Key | 用于标识唯一请求的令牌 |
+| 状态码 | Status Code | HTTP 响应中的处理结果代码 |
+| 201 Created | Created | 资源创建成功 |
+| 204 No Content | No Content | 操作成功但无响应体 |
+
+## 思考题
+
+**问题 1**：为什么 HTTP DELETE 是幂等的，但删除数据库中的多条记录却可能不是幂等的？
+<details>
+<summary>参考答案</summary>
+
+HTTP DELETE 的幂等性基于其语义：「目标状态是资源不存在」。删除 id=123 的资源，无论资源是否已存在，最终状态都是「id=123 的资源不存在」。
+
+但如果 DELETE 的语义是「删除所有状态为 PENDING 的订单」，重复执行会产生不同结果——第一次删除 10 条，第二次删除 0 条。这个场景下，DELETE 不再幂等。
+
+解决方案：使用更细粒度的资源定位（如 DELETE /orders/123），而不是批量操作。
+
+</details>
+
+**问题 2**：PUT 和 PATCH 都能用于更新资源，什么时候应该选择 PUT，什么时候应该选择 PATCH？
+<details>
+<summary>参考答案</summary>
+
+选择 PUT 的场景：
+- 客户端需要完整控制资源状态
+- 每次更新都包含所有字段
+- 需要幂等保证
+
+选择 PATCH 的场景：
+- 只更新部分字段
+- 字段值是相对变化（如数量 +1）
+- 减少网络传输（只传需要修改的字段）
+
+但要注意：PATCH 的「部分更新」特性使其在语义上可能非幂等。如果需要幂等，应该使用绝对值替换的 PATCH 文档。
+
+</details>
+
+**问题 3**：如果一个 POST 接口需要保证幂等，有哪些实现方式？
+<details>
+<summary>参考答案</summary>
+
+主要有三种方式：
+
+1. **业务层面生成唯一键**：客户端生成订单号（如时间戳 + 用户 ID），服务端用订单号作为唯一索引，重复提交会因唯一键冲突而幂等。
+
+2. **幂等 Key**：服务端存储「已处理的请求 ID」，收到新请求时检查是否已处理过，如已处理则返回之前的结果。
+
+3. **状态机控制**：业务表设计状态字段，只有在特定状态下才能执行操作，其他状态直接返回成功（幂等）。
+
+这三种方式各有优劣，实际项目中可以组合使用。
+
+</details>

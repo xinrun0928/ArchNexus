@@ -4,6 +4,8 @@ import * as path from 'node:path';
 import { defineConfig } from '@rspress/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
 
+import mermaid from 'rspress-plugin-mermaid';
+
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
 
@@ -68,7 +70,14 @@ export default defineConfig({
   },
 
   builderConfig: {
-    plugins: [pluginSass()]
+    plugins: [
+      pluginSass(),
+      mermaid({
+        mermaidConfig: {
+          theme: 'forest',
+        },
+      })
+    ]
   },
 
   // ==============================================
