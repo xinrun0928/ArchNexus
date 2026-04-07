@@ -1,23 +1,21 @@
-import { analysisSidebar } from './sidebar/analysis';
-import { availabilitySidebar } from './sidebar/availability';
-import { concurrencySidebar } from './sidebar/concurrency';
-import { consistencySidebar } from './sidebar/consistency';
-import { evolutionSidebar } from './sidebar/evolution';
+import { distributedTheorySidebar } from './sidebar/distributed-theory';
 import { patternsSidebar } from './sidebar/patterns';
-import { performanceSidebar } from './sidebar/performance';
-import { principlesSidebar } from './sidebar/principles';
-import { securitySidebar } from './sidebar/security';
 import { systemDesignSidebar } from './sidebar/system-design';
+import { performanceJvmSidebar } from './sidebar/performance-jvm';
+import { resilienceSidebar } from './sidebar/resilience';
+import { observabilitySidebar } from './sidebar/observability';
+import { cloudNativeSidebar } from './sidebar/cloud-native';
+import { securitySidebar } from './sidebar/security';
+import { evolutionCasesSidebar } from './sidebar/evolution-cases';
 
 export const sidebar = {
-  '/principles/': principlesSidebar,
+  '/distributed-theory/': distributedTheorySidebar,
   '/patterns/': patternsSidebar,
   '/system-design/': systemDesignSidebar,
-  '/performance/': performanceSidebar,
-  '/availability/': availabilitySidebar,
-  '/consistency/': consistencySidebar,
-  '/concurrency/': concurrencySidebar,
-  '/evolution/': evolutionSidebar,
+  '/performance-jvm/': performanceJvmSidebar,
+  '/resilience/': resilienceSidebar,
+  '/observability/': observabilitySidebar,
+  '/cloud-native/': cloudNativeSidebar,
   '/security/': securitySidebar,
-  '/analysis/': analysisSidebar,
+  '/evolution-cases/': evolutionCasesSidebar,
 };

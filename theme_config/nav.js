@@ -1,5 +1,5 @@
 export const nav = [
-{
+  {
     text: '分布式理论',
     link: '/distributed-theory/',
     items: [

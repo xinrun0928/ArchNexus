@@ -39,8 +39,7 @@ export default defineConfig({
    * 用于 SEO 搜索引擎优化，提升站点被搜索概率
    * 简洁概括站点内容，便于搜索引擎收录
    */
-  description:
-    '系统梳理 Java 后端核心知识与架构设计能力，从基础到进阶，一步一步成为真正的架构师',
+  description: '系统梳理 Java 后端核心知识与架构设计能力，从基础到进阶，一步一步成为真正的架构师',
 
   /**
    * 网站 favicon 图标（浏览器标签小图标）
@@ -76,17 +75,12 @@ export default defineConfig({
   // 主题外观配置（导航、侧边栏、搜索、页脚等）
   // ==============================================
   themeConfig: {
-    // // 顶部导航栏配置
-    // nav: nav,
 
-    // // 侧边栏配置
-    // sidebar: sidebar,
+    // 顶部导航栏配置
+    nav: nav,
 
-    /**
-     * 技术栈配置
-     * 详见 theme_config/techStacks.ts
-     */
-    // techStacks: [], // 默认读取 theme_config/techStacks.ts，无需在此重复配置
+    // 侧边栏配置
+    sidebar: sidebar,
 
     /**
      * 搜索框开关
