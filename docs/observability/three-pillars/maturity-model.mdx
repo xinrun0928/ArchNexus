@@ -1,0 +1,277 @@
+---
+description: 可观测性成熟度模型：从基础监控到智能可观测性的五级演进路径
+---
+
+# 可观测性成熟度模型
+
+不是每个团队都需要一步到位达到最高成熟度。成熟度模型的价值在于：**让你知道自己现在在哪，下一步应该做什么**。资源有限的情况下，把有限的力量投入到最需要改进的地方，才能最大化 ROI。
+
+可观测性成熟度模型描述了从「无监控」到「智能可观测」的五个阶段。每个阶段都有明确的特征、核心工作和投入产出比。
+
+## 成熟度等级概览
+
+| 等级 | 名称 | 核心特征 | 故障定位时间 | 团队成熟度 |
+|---|---|---|---|---|
+| **Level 1** | 基础监控 | 主机监控 + 阈值告警 | 数小时 | 小团队/初创期 |
+| **Level 2** | 标签化改造 | 服务级指标 + 统一标签 | 1-2 小时 | 成长期团队 |
+| **Level 3** | 链路追踪 | 引入 TraceID + 日志关联 | 15-30 分钟 | 中型团队 |
+| **Level 4** | 关联分析 | 三大支柱互通 + 统一视图 | 5-15 分钟 | 大型团队 |
+| **Level 5** | 智能可观测 | AI 根因推荐 + 故障自愈 | 分钟级以内 | 平台化团队 |
+
+## Level 1：基础监控
+
+### 特征
+
+- 有监控（Zabbix/Nagios 或云厂商监控）
+- 主机级别监控（CPU、内存、磁盘、网络）
+- 少量服务级监控
+- 告警规则靠经验配置，误报率高
+- 故障定位靠「登录服务器、grep 日志」
+
+### 核心工作
+
+这一阶段不需要追求完美，先把**最基本的监控建起来**：
+
+```yaml title="Level 1 必做监控"
+# 主机健康
+- host: node_cpu_usage > 80%
+- host: node_memory_usage > 85%
+- host: node_disk_usage > 90%
+
+# 核心服务存活
+- service: process_count == 0  # 进程消失
+- service: port_connectable == false  # 端口不可达
+```
+
+### 评估标准
+
+如果团队面临「服务挂了不知道」的情况，说明还在 Level 1 以下。Level 1 的目标是：**任何服务不可用，5 分钟内有人收到告警**。
+
+## Level 2：标签化改造
+
+### 特征
+
+- 服务级指标已经存在（QPS、延迟、错误率）
+- 告警规则按服务配置，但标签不统一
+- 有了 Grafana 仪表盘，但各服务各自为政
+- 可以按服务查询指标，但无法跨服务关联
+
+### 核心工作
+
+这一阶段的核心是**标签规范化**，这是后续所有工作的基础。
+
+统一标签规范（参考 OTel Semantic Conventions）：
+
+```yaml title="统一标签规范"
+# 必须有的标签
+- service     # 服务名称（唯一标识）
+- environment # 环境：production/staging/dev
+- region      # 地域：cn-east-1/cn-west-1
+
+# 推荐有的标签
+- version     # 服务版本
+- pod         # Pod 名称（K8s 环境）
+- cluster     # 集群名称
+
+# 禁止作为标签的值（高基数）
+# ❌ user_id ❌ session_id ❌ order_id ❌ trace_id
+```
+
+Prometheus Relabel 配置：
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # 提取 K8s annotation 中的 service name
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_name]
+        action: keep
+        regex: .+
+
+      # 统一标签名
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_name]
+        target_label: service
+
+      # 从 pod name 提取 version
+      - source_labels: [__meta_kubernetes_pod_name]
+        regex: '(.*)-[a-f0-9]{10}-[a-z0-9]{5}'
+        replacement: '${1}'
+        target_label: service_name
+```
+
+### 评估标准
+
+Level 2 的标志是：**可以用一条 PromQL 查询跨所有服务的同一指标**。比如：
+
+```yaml
+# 按服务查看 QPS，无需为每个服务写单独的查询
+sum(rate(http_requests_total[5m])) by (service)
+```
+
+## Level 3：链路追踪
+
+### 特征
+
+- 引入链路追踪（Jaeger/Zipkin/Tempo）
+- 服务间调用有了 TraceID
+- 日志中开始包含 TraceID
+- 可以定位「某个请求慢在哪一步」，但日志和链路还需要手动跳转
+
+### 核心工作
+
+这一阶段的核心是**链路追踪落地 + TraceID 注入日志**。
+
+OTel Agent 部署（Kubernetes）：
+
+```yaml title="otel-agent-daemonset.yaml"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-agent
+spec:
+  selector:
+    matchLabels:
+      app: otel-agent
+  template:
+    metadata:
+      labels:
+        app: otel-agent
+    spec:
+      containers:
+        - name: otel-agent
+          image: otel/opentelemetry-collector-contrib:latest
+          args:
+            - --config=/etc/otel/config.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+      volumes:
+        - name: config
+          configMap:
+            name: otel-agent-config
+```
+
+OTel Collector 配置（接收并转发）：
+
+```yaml title="otel-config.yaml"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]
+```
+
+### 评估标准
+
+Level 3 的标志是：**可以用 TraceID 查出一次请求在所有服务中的日志**。如果还需要手动登录每台服务器 grep，说明链路追踪还没有完全落地。
+
+## Level 4：关联分析
+
+### 特征
+
+- 三大支柱数据互通（Prometheus + Loki + Tempo 通过 Grafana 串联）
+- 告警可以直接跳转到对应的链路和日志
+- 可以回答「这个接口 P99 升高时，哪些日志和链路是相关的」
+- 有了根因分析的基本能力
+
+### 核心工作
+
+这一阶段的核心是**统一视图 + 关联查询**。
+
+Grafana 数据源配置：
+
+```ini title="grafana.ini"
+[datasources]
+[datasources.prometheus]
+name = Prometheus
+type = prometheus
+url = http://prometheus:9090
+access = proxy
+
+[datasources.loki]
+name = Loki
+type = loki
+url = http://loki:3100
+access = proxy
+
+[datasources.tempo]
+name = Tempo
+type = tempo
+url = http://tempo:3100
+access = proxy
+```
+
+Grafana Explore 中的关联查询（通过变量引用）：
+
+```
+# 从链路查询结果中提取 traceId，跳转到日志查询
+{service="$service"} | json | traceId="$traceId"
+```
+
+这一阶段还需要建立**SLO 监控**，用错误预算衡量系统健康度，而不仅仅是「某个指标是否超标」。
+
+### 评估标准
+
+Level 4 的标志是：**告警触发后，工程师不需要再切换工具，直接在告警页面就能看到相关的链路和日志**。
+
+## Level 5：智能可观测性
+
+### 特征
+
+- AI/ML 参与根因分析（异常检测 + 根因推荐）
+- 告警触发时自动附带根因分析结果
+- 部分故障可以自动恢复（自愈机制）
+- 可观测性数据驱动业务决策（转化率分析、A/B 测试分析）
+
+### 核心工作
+
+这一阶段不是每个团队都需要，也不是每个团队都能负担的。典型的工作包括：
+
+**智能告警**：基于历史数据训练的异常检测模型，可以发现传统阈值无法发现的性能退化。
+
+**根因推荐**：当告警触发时，自动分析 Trace、日志、指标的关联，推荐最可能的根因。
+
+**故障自愈**：基于可观测数据的自动化响应，比如：检测到数据库连接池耗尽 → 自动扩容连接池 → 验证恢复。
+
+### 评估标准
+
+Level 5 的标志是：**告警触发后，值班工程师可以直接按照系统推荐的根因和解决方案处理，不需要自己做排查**。
+
+## 演进优先级建议
+
+| 团队规模 | 当前 Level | 优先目标 | 建议 |
+|---|---|---|---|
+| < 5 人 | Level 1-2 | Level 2-3 | 先把链路追踪落地，这是投入产出比最高的改进 |
+| 5-20 人 | Level 2-3 | Level 3-4 | 完善 TraceID 注入，建立关联分析能力 |
+| 20-50 人 | Level 3-4 | Level 4 | 统一视图建设，SLO 监控落地 |
+| 50+ 人 | Level 4 | Level 5 | 智能告警，平台化建设 |
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. 可观测性成熟度的五个等级分别是什么？每个等级的核心特征是什么？
+2. Level 2（标签化改造）的核心工作是什么？为什么说标签规范化是后续工作的基础？
+3. Level 3（链路追踪）的标志是什么？OTel Agent 和 Collector 的角色分工是什么？
+4. Level 4（关联分析）相比 Level 3 的核心改进在哪里？Grafana Explore 的关联查询是如何工作的？
+5. 对于一个 10 人团队，当前处于 Level 2，应该优先做什么？为什么链路追踪是投入产出比最高的改进？

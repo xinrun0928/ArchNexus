@@ -1,0 +1,375 @@
+---
+description: Resilience4j 熔断器实战
+---
+
+# Resilience4j 熔断器实战
+
+Resilience4j 是 Java 生态中最流行的轻量级容错库，专为函数式编程和响应式编程设计。相比 Hystrix，Resilience4j 没有对 Hystrix 的依赖，更轻量、更灵活。
+
+本节通过一个完整的电商系统示例，讲解如何在实际项目中使用 Resilience4j 实现熔断器。
+
+## Resilience4j 核心模块
+
+| 模块 | 说明 |
+| --- | --- |
+| **resilience4j-circuitbreaker** | 熔断器 |
+| **resilience4j-ratelimiter** | 限流器 |
+| **resilience4j-retry** | 重试机制 |
+| **resilience4j-bulkhead** | 舱壁隔离 |
+| **resilience4j-timelimiter** | 超时控制 |
+| **resilience4j-metrics** | 指标收集 |
+
+## 项目依赖
+
+```xml title="pom.xml"
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+    <version>2.2.0</version>
+</dependency>
+
+<!-- 健康检查支持 -->
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-micrometer</artifactId>
+    <version>2.2.0</version>
+</dependency>
+
+<!-- 熔断器监控 -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+## 完整配置示例
+
+```yaml title="application.yml"
+resilience4j:
+  # 熔断器配置
+  circuitbreaker:
+    configs:
+      default:
+        # 滑动窗口类型：COUNT_BASED 或 TIME_BASED
+        sliding-window-type: COUNT_BASED
+        # 滑动窗口大小
+        sliding-window-size: 10
+        # 最小请求数：窗口内请求数少于这个值时不计算失败率
+        minimum-number-of-calls: 5
+        # 失败率阈值（百分比）
+        failure-rate-threshold: 50
+        # 慢调用阈值
+        slow-call-duration-threshold: 2s
+        # 慢调用失败率阈值
+        slow-call-rate-threshold: 80
+        # 熔断器打开后的等待时间
+        wait-duration-in-open-state: 60s
+        # 半开状态允许的请求数
+        permitted-number-of-calls-in-half-open-state: 3
+        # 自动从打开状态转为半开
+        automatic-transition-from-open-to-half-open-enabled: true
+        # 允许在半开状态停留的最大时间
+        max-wait-duration-in-half-open-state: 30s
+
+    instances:
+      # 商品服务熔断器：更敏感
+      productService:
+        base-config: default
+        sliding-window-size: 5
+        failure-rate-threshold: 40
+        wait-duration-in-open-state: 30s
+
+      # 支付服务熔断器：更严格
+      paymentService:
+        base-config: default
+        sliding-window-size: 20
+        failure-rate-threshold: 30
+        wait-duration-in-open-state: 120s
+        permitted-number-of-calls-in-half-open-state: 5
+
+      # 推荐服务熔断器：相对宽松
+      recommendationService:
+        base-config: default
+        sliding-window-size: 100
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 30s
+        # 推荐服务允许慢调用
+        slow-call-rate-threshold: 50
+```
+
+## 业务代码示例
+
+### 订单服务
+
+```java title="OrderService.java"
+@Service
+@Slf4j
+public class OrderService {
+
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final ProductFeignClient productFeignClient;
+    private final PaymentFeignClient paymentFeignClient;
+    private final UserFeignClient userFeignClient;
+
+    public OrderService(CircuitBreakerRegistry circuitBreakerRegistry,
+                       ProductFeignClient productFeignClient,
+                       PaymentFeignClient paymentFeignClient,
+                       UserFeignClient userFeignClient) {
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
+        this.productFeignClient = productFeignClient;
+        this.paymentFeignClient = paymentFeignClient;
+        this.userFeignClient = userFeignClient;
+    }
+
+    public Order createOrder(CreateOrderRequest request) {
+        CircuitBreaker productCircuitBreaker =
+            circuitBreakerRegistry.circuitBreaker("productService");
+        CircuitBreaker paymentCircuitBreaker =
+            circuitBreakerRegistry.circuitBreaker("paymentService");
+
+        // 1. 获取商品信息（带熔断保护）
+        Product product = Decorators.ofSupplier(() -> productFeignClient.getProduct(request.getProductId()))
+            .withCircuitBreaker(productCircuitBreaker)
+            .withFallback(List.of(Exception.class),
+                e -> handleProductFallback(request.getProductId(), e))
+            .decorate()
+            .get();
+
+        // 2. 检查用户状态（带熔断保护）
+        User user = Decorators.ofSupplier(() -> userFeignClient.getUser(request.getUserId()))
+            .withCircuitBreaker(circuitBreakerRegistry.circuitBreaker("userService"))
+            .withFallback(List.of(Exception.class),
+                e -> handleUserFallback(request.getUserId(), e))
+            .decorate()
+            .get();
+
+        // 3. 创建订单
+        Order order = new Order();
+        order.setId(UUID.randomUUID().toString());
+        order.setProductId(product.getId());
+        order.setUserId(user.getId());
+        order.setPrice(product.getPrice());
+        order.setStatus(OrderStatus.CREATED);
+
+        // 4. 处理支付（带熔断保护）
+        PaymentResult paymentResult = Decorators.ofSupplier(() ->
+                paymentFeignClient.processPayment(order.getId(), order.getPrice()))
+            .withCircuitBreaker(paymentCircuitBreaker)
+            .withFallback(List.of(Exception.class),
+                e -> handlePaymentFallback(order, e))
+            .decorate()
+            .get();
+
+        order.setPaymentStatus(paymentResult.getStatus());
+        return order;
+    }
+
+    // 商品服务降级：返回缓存数据或默认商品
+    private Product handleProductFallback(Long productId, Exception e) {
+        log.warn("商品服务调用失败，触发降级: productId={}, error={}", productId, e.getMessage());
+        Product cachedProduct = productCache.get(productId);
+        if (cachedProduct != null) {
+            return cachedProduct;
+        }
+        // 返回默认商品，保证订单流程继续
+        return Product.defaultProduct(productId);
+    }
+
+    // 用户服务降级：返回默认用户
+    private User handleUserFallback(Long userId, Exception e) {
+        log.warn("用户服务调用失败，触发降级: userId={}, error={}", userId, e.getMessage());
+        return User.defaultUser(userId);
+    }
+
+    // 支付服务降级：创建订单但标记为待支付
+    private PaymentResult handlePaymentFallback(Order order, Exception e) {
+        log.warn("支付服务调用失败，触发降级: orderId={}, error={}", order.getId(), e.getMessage());
+        // 标记为待支付，稍后重试
+        return PaymentResult.pending("支付服务暂时不可用，请稍后重试");
+    }
+}
+```
+
+### 熔断器事件监听
+
+```java title="CircuitBreakerEventListener.java"
+@Component
+@Slf4j
+public class CircuitBreakerEventListener {
+
+    @Autowired
+    private CircuitBreakerRegistry registry;
+
+    @PostConstruct
+    public void init() {
+        registry.getAllCircuitBreakers().forEach(this::registerListeners);
+    }
+
+    private void registerListeners(CircuitBreaker circuitBreaker) {
+        String name = circuitBreaker.getName();
+
+        // 状态转换事件
+        circuitBreaker.getEventPublisher()
+            .onStateTransition(event -> {
+                StateTransition transition = event.getStateTransition();
+                log.warn("熔断器 [{}] 状态转换: {} -> {}",
+                    name,
+                    transition.getFromState(),
+                    transition.getToState());
+
+                // 发送告警
+                if (transition.getToState() == State.OPEN) {
+                    alertingService.sendAlert("CIRCUIT_BREAKER_OPEN",
+                        "熔断器 " + name + " 已打开");
+                }
+            })
+            .onFailureRateExceeded(event -> {
+                log.warn("熔断器 [{}] 失败率超标: {}%",
+                    name, event.getFailureRate());
+            })
+            .onSlowCallRateExceeded(event -> {
+                log.warn("熔断器 [{}] 慢调用率超标: {}%",
+                    name, event.getSlowCallRate());
+            })
+            .onCallNotPermitted(event -> {
+                log.warn("熔断器 [{}] 拒绝请求（熔断器打开）", name);
+            })
+            .onError(event -> {
+                log.debug("熔断器 [{}] 记录错误: {}", name, event.getThrowable().getMessage());
+            });
+    }
+}
+```
+
+## 监控配置
+
+### Prometheus 指标暴露
+
+```yaml title="application.yml"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,circuitbreakers,circuitbreakerevents
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+```
+
+### Prometheus 告警规则
+
+```yaml title="circuitbreaker-alerts.yaml"
+groups:
+- name: circuitbreaker
+  rules:
+  # 熔断器打开告警
+  - alert: CircuitBreakerOpen
+    expr: circuitbreaker_state{state="open"} == 1
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "熔断器 {{ $labels.name }} 已打开"
+      description: "熔断器 {{ $labels.name }} 已打开超过 1 分钟"
+
+  # 熔断器打开率告警
+  - alert: HighCircuitBreakerOpenRate
+    expr: |
+      sum(rate(circuitbreaker_calls_total{result="rejected"}[5m])) by (name)
+      / sum(rate(circuitbreaker_calls_total[5m])) by (name) > 0.5
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "熔断器 {{ $labels.name }} 拒绝率超过 50%"
+      description: "熔断器 {{ $labels.name }} 在 5 分钟内拒绝了超过 50% 的请求"
+
+  # 熔断器失败率高告警
+  - alert: HighCircuitBreakerFailureRate
+    expr: circuitbreaker_failure_rate > 70
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "熔断器 {{ $labels.name }} 失败率超过 70%"
+```
+
+## 健康检查集成
+
+```java title="CircuitBreakerHealthIndicator.java"
+@Component
+@Slf4j
+public class CircuitBreakerHealthIndicator implements ReactiveHealthIndicator {
+
+    @Autowired
+    private CircuitBreakerRegistry registry;
+
+    @Override
+    public Mono<Health> health() {
+        Map<String, CircuitBreaker> circuitBreakers = registry.getAllCircuitBreakers();
+
+        Map<String, Object> details = new HashMap<>();
+        boolean allHealthy = true;
+
+        for (Map.Entry<String, CircuitBreaker> entry : circuitBreakers.entrySet()) {
+            CircuitBreaker circuitBreaker = entry.getValue();
+            CircuitBreakerMetrics metrics = circuitBreaker.getMetrics();
+
+            Map<String, Object> cbDetails = new HashMap<>();
+            cbDetails.put("state", circuitBreaker.getState().toString());
+            cbDetails.put("failureRate", metrics.getFailureRate());
+            cbDetails.put("slowCallRate", metrics.getSlowCallRate());
+            cbDetails.put("bufferedCalls", metrics.getNumberOfBufferedCalls());
+            cbDetails.put("failedCalls", metrics.getNumberOfFailedCalls());
+
+            details.put(entry.getKey(), cbDetails);
+
+            if (circuitBreaker.getState() == State.OPEN) {
+                allHealthy = false;
+            }
+        }
+
+        if (allHealthy) {
+            return Mono.just(Health.up().withDetails(details).build());
+        } else {
+            return Mono.just(Health.down().withDetails(details).build());
+        }
+    }
+}
+```
+
+## 与 Spring Cloud 集成
+
+```java title="Resilience4jConfig.java"
+@Configuration
+public class Resilience4jConfig {
+
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry(
+            CircuitBreakerConfigurationProperties properties) {
+        return CircuitBreakerRegistry.of(properties.createDefaultConfig());
+    }
+}
+
+@Component
+class CircuitBreakerConfigurationProperties {
+    // 从 application.yml 读取配置
+}
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **Resilience4j 是轻量级容错库**：比 Hystrix 更灵活，没有额外依赖
+2. **每个依赖服务应该独立配置熔断器**：根据服务重要性和特性差异化配置
+3. **降级逻辑是关键**：熔断器打开时返回什么，决定了用户体验
+4. **事件监听不可少**：状态转换、失败率超标等事件要监控和告警
+5. **Prometheus 集成是标配**：暴露指标、配置告警，是生产环境的必要实践

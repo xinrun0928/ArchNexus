@@ -1,0 +1,289 @@
+---
+description: 滑动窗口限流
+---
+
+# 滑动窗口限流
+
+固定窗口限流的边界突发问题，是滑动窗口限流要解决的核心问题。
+
+固定窗口限流虽然简单，但存在一个致命缺陷：**边界突发**。假设每秒限流 100 个请求，如果前 1 秒快结束时涌入了 100 个请求，后 1 秒刚开始又涌入 100 个请求，在 2 秒内就会有 200 个请求通过，远超每秒 100 的限制。
+
+滑动窗口限流通过滑动的时间窗口解决这个问题。
+
+## 固定窗口 vs 滑动窗口
+
+```mermaid
+flowchart LR
+    subgraph 固定窗口（有问题）
+        A["0s"] --> B["1s"] --> C["2s"]
+        A -->|"100 个| A
+        B -->|"100 个| B
+        C -->|"100 个| C
+        Note over A,C: 2 秒内通过 300 个，实际限制 200
+    end
+
+    subgraph 滑动窗口（正确）
+        D["0s"] --> E["0.5s"] --> F["1s"] --> G["1.5s"]
+        D -->|"50 个| D
+        E -->|"50 个| E
+        F -->|"50 个| F
+        G -->|"50 个| G
+        Note over D,G: 任意时刻，1 秒内最多 100 个
+    end
+```
+
+## 滑动窗口原理
+
+滑动窗口限流的核心思想：**将时间轴划分为多个小窗口，每个小窗口独立计数，最终的限流基于所有小窗口的总和。**
+
+### 实现方式
+
+| 方式 | 说明 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| **分段计数** | 将时间窗口分成 N 个小段，每段独立计数 | 实现简单 | 边界仍有小突发 |
+| **精确滑动** | 每个请求根据精确时间戳计算 | 最精确 | 实现复杂 |
+
+### 分段计数实现
+
+```java title="SlidingWindowRateLimiter.java"
+public class SlidingWindowRateLimiter {
+
+    private final int windowSizeSeconds;  // 窗口大小（秒）
+    private final int maxRequests;        // 窗口内最大请求数
+    private final AtomicInteger[] counters;  // 每个小窗口的计数器
+    private final int bucketCount;         // 小窗口数量
+    private volatile long windowStartTime; // 窗口开始时间
+    private final AtomicLong position;     // 当前小窗口位置
+
+    public SlidingWindowRateLimiter(int windowSizeSeconds, int maxRequests, int bucketCount) {
+        this.windowSizeSeconds = windowSizeSeconds;
+        this.maxRequests = maxRequests;
+        this.bucketCount = bucketCount;
+        this.counters = new AtomicInteger[bucketCount];
+        for (int i = 0; i < bucketCount; i++) {
+            counters[i] = new AtomicInteger(0);
+        }
+        this.windowStartTime = System.currentTimeMillis() / 1000 * 1000;
+        this.position = new AtomicLong(0);
+    }
+
+    public boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long windowStart = now / 1000 * 1000;
+
+        // 检查是否进入新的时间窗口
+        if (windowStart > windowStartTime) {
+            resetWindow(windowStart);
+        }
+
+        // 计算当前请求应该计入哪个桶
+        int bucket = (int) (position.get() % bucketCount);
+
+        // 获取当前窗口的总计数
+        int total = getTotalCount();
+
+        if (total < maxRequests) {
+            counters[bucket].incrementAndGet();
+            return true;
+        }
+
+        return false;
+    }
+
+    private int getTotalCount() {
+        int total = 0;
+        for (AtomicInteger counter : counters) {
+            total += counter.get();
+        }
+        return total;
+    }
+
+    private void resetWindow(long newWindowStart) {
+        windowStartTime = newWindowStart;
+        position.incrementAndGet();
+
+        // 只清空最老的桶，避免每次都清空所有桶
+        int oldBucket = (int) ((position.get() - bucketCount) % bucketCount);
+        if (oldBucket >= 0 && oldBucket < bucketCount) {
+            counters[oldBucket].set(0);
+        }
+    }
+}
+```
+
+### 精确滑动窗口实现
+
+基于时间戳的精确滑动窗口：
+
+```java title="PreciseSlidingWindow.java"
+public class PreciseSlidingWindow {
+
+    private final int windowSizeMs;        // 窗口大小（毫秒）
+    private final int maxRequests;           // 窗口内最大请求数
+    private final Queue<Long> requests;    // 存储请求时间戳
+
+    public PreciseSlidingWindow(int windowSizeMs, int maxRequests) {
+        this.windowSizeMs = windowSizeMs;
+        this.maxRequests = maxRequests;
+        this.requests = new ConcurrentLinkedQueue<>();
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSizeMs;
+
+        // 移除窗口外的请求
+        while (!requests.isEmpty() && requests.peek() < windowStart) {
+            requests.poll();
+        }
+
+        // 检查是否超过限制
+        if (requests.size() < maxRequests) {
+            requests.offer(now);
+            return true;
+        }
+
+        return false;
+    }
+
+    public int getCurrentCount() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSizeMs;
+
+        return (int) requests.stream()
+            .filter(timestamp -> timestamp >= windowStart)
+            .count();
+    }
+}
+```
+
+## Redis 滑动窗口实现
+
+Redis 实现滑动窗口需要使用有序集合（ZSET）：
+
+```lua title="sliding_window.lua"
+-- Redis 滑动窗口限流 Lua 脚本
+-- KEYS[1]: 限流 key
+-- ARGV[1]: 窗口大小（毫秒）
+-- ARGV[2]: 最大请求数
+-- ARGV[3]: 当前时间戳（毫秒）
+-- ARGV[4]: 请求 ID
+
+local key = KEYS[1]
+local windowSizeMs = tonumber(ARGV[1])
+local maxRequests = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local requestId = ARGV[4]
+
+local windowStart = now - windowSizeMs
+
+-- 移除窗口外的请求
+redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+-- 获取当前窗口内的请求数
+local currentCount = redis.call('ZCARD', key)
+
+if currentCount < maxRequests then
+    -- 添加当前请求
+    redis.call('ZADD', key, now, requestId)
+    -- 设置过期时间
+    redis.call('PEXPIRE', key, windowSizeMs)
+    return 1  -- 成功
+else
+    return 0  -- 失败
+end
+```
+
+```java title="RedisSlidingWindowLimiter.java"
+public class RedisSlidingWindowLimiter {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final String luaScript;
+
+    public RedisSlidingWindowLimiter(RedisTemplate<String, String> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+        this.luaScript = loadScript("sliding_window.lua");
+    }
+
+    /**
+     * 尝试获取令牌
+     * @param key 限流 key
+     * @param windowSizeMs 窗口大小（毫秒）
+     * @param maxRequests 窗口内最大请求数
+     * @return 是否成功
+     */
+    public boolean tryAcquire(String key, int windowSizeMs, int maxRequests) {
+        String requestId = UUID.randomUUID().toString();
+
+        Long result = redisTemplate.execute(
+            new DefaultRedisScript<>(luaScript, Long.class),
+            List.of(key),
+            windowSizeMs,
+            maxRequests,
+            System.currentTimeMillis(),
+            requestId
+        );
+        return result != null && result == 1;
+    }
+
+    /**
+     * 获取当前窗口内的请求数
+     */
+    public long getCurrentCount(String key, int windowSizeMs) {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSizeMs;
+
+        // 移除过期数据并计数
+        Long removed = redisTemplate.opsForZSet().removeRangeByScore(key, Double.NEGATIVE_INFINITY, windowStart);
+        return redisTemplate.opsForZSet().zCard(key);
+    }
+}
+```
+
+## 三种窗口算法对比
+
+| 算法 | 精确度 | 实现复杂度 | 内存开销 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| **固定窗口** | 低（边界突发） | 简单 | 低 | 不推荐生产使用 |
+| **滑动窗口（分段）** | 中 | 中等 | 中 | 一般限流 |
+| **滑动窗口（精确）** | 高 | 复杂 | 高 | 精细控制 |
+| **令牌桶** | 高 | 中等 | 低 | 需要突发 |
+| **漏桶** | 高 | 中等 | 中 | 平滑输出 |
+
+## 滑动窗口监控
+
+```yaml title="滑动窗口监控指标"
+# Prometheus 指标
+sliding_window:
+  - name: requests_total
+    type: counter
+    labels: [result]
+    description: "总请求数 (allowed/rejected)"
+
+  - name: current_window_count
+    type: gauge
+    description: "当前滑动窗口内的请求数"
+
+  - name: window_utilization
+    type: gauge
+    description: "窗口利用率（当前请求数/最大请求数）"
+
+  # 告警规则
+  - alert: HighWindowUtilization
+    expr: sliding_window_window_utilization > 0.9
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "滑动窗口利用率超过 90%"
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **滑动窗口解决了固定窗口的边界突发问题**：任意时刻窗口内的请求数都不超过限制
+2. **分段计数实现简单**：将时间窗口分成多个小段，每段独立计数
+3. **精确滑动窗口最准确**：基于时间戳精确计算
+4. **Redis 实现用有序集合**：ZSET 的 score 存储时间戳
+5. **滑动窗口比令牌桶/漏桶实现更简单**：适合不需要突发的场景

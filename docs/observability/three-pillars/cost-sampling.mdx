@@ -1,0 +1,327 @@
+---
+description: 可观测性成本与采样策略：如何在数据量与成本之间找到平衡
+---
+
+# 可观测性成本与采样策略
+
+Stripe 在 2020 年的一篇技术博客中分享了一组数据：他们每天产生 800TB 的可观测性数据，年度存储成本达到数百万美元。这不是个例——随着微服务数量增长，可观测性数据的增速往往超过业务增速。
+
+可观测性数据的成本主要有三部分：**采集成本（Agent/CPU）**、**传输成本（网络带宽）**、**存储成本（磁盘/云存储）**。这三部分都与数据量成正比，而数据量由采样率、服务数量、Span 复杂度共同决定。
+
+本文的核心问题是：**如何在保证可观测性的同时，控制数据成本？**
+
+## 成本来源分析
+
+### 指标成本
+
+指标的成本相对可控，因为它已经是聚合数据：
+
+- 单个指标（带标签）：约 1-10 KB/天（取决于时间序列数量）
+- Prometheus 存储空间：压缩后约每指标每天 0.1-1 KB
+
+```yaml
+# 一个 Histogram 指标实际产生多少时间序列？
+# 假设有 5 个 buckets（0.1, 0.5, 1, 2.5, 5, 10），加上 _sum 和 _count
+# 按 service + method + status + le 分组：
+# 5(buckets) + 1(_sum) + 1(_count) = 7 个时间序列 per 组合
+
+# 假设有 20 个服务、4 种方法、10 种状态码
+# 7 * 20 * 4 * 10 = 5,600 个时间序列
+# 每天约 5.6 MB（压缩后）
+```
+
+指标的成本主要来自**时间序列数量（Cardinality）**，而不是数据量。
+
+### 链路追踪成本
+
+链路追踪的成本最高，因为每个请求都会产生一条完整的 Trace：
+
+```java
+// 一个用户下单请求的 Span 数量估算
+// API Gateway: 1 Span
+// Auth Service: 1 Span
+// Order Service: 1 Span (自身) + 3 Spans (调用下游)
+//   └─> Payment Service: 1 Span
+//   └─> Inventory Service: 1 Span + 1 DB Span
+//   └─> Notification Service: 1 Span
+// Total: 约 8-15 个 Span per 请求
+
+// 假设日均 100 万 QPS，每个请求 10 个 Span：
+// 每天 1000 万个 Span
+// 每个 Span 平均 1-5 KB（包含 Attributes、Events）
+// 每天约 10-50 GB 原始数据
+```
+
+链路追踪的成本来自：**QPS × 每请求 Span 数 × 采样率**。
+
+### 日志成本
+
+日志成本最高，因为日志是未经聚合的原始数据：
+
+```
+# 一个中等规模的订单服务，日均日志量估算
+# 日均 QPS: 10,000
+# 平均每秒日志: 50 条（每个请求约 5 条日志）
+# 每条日志: 约 500 bytes（JSON 格式）
+
+# 每天日志量: 50 * 86400 * 500 bytes = 2.16 GB
+# 一年: 约 800 GB
+# 多服务 × 3（开发/测试/生产）= 每年 TB 级
+```
+
+## 采样策略
+
+采样是控制成本的核心手段。但采样也意味着**放弃部分数据的可见性**。采样策略的核心是：**对绝大多数请求采集少量数据，对问题请求采集完整数据**。
+
+### 采样类型对比
+
+| 类型 | 说明 | 优势 | 劣势 |
+|---|---|---|---|
+| **头部采样（Head-based）** | 在请求入口决定是否采样 | 简单，入口处就知道采样率 | 无法区分「好请求」和「坏请求」 |
+| **尾部采样（Tail-based）** | 请求结束后根据结果决定是否采样 | 保留所有慢/错误请求 | 需要等待请求完成，占用内存 |
+| **自适应采样** | 动态调整采样率，基于当前负载 | 自动平衡成本和覆盖度 | 配置复杂 |
+| **规则采样** | 按业务规则（接口、用户、错误）采样 | 精准控制 | 需要维护规则 |
+
+### 头部采样实现
+
+OTel SDK 的头部采样配置：
+
+```yaml title="application.yml"
+otel:
+  traces:
+    exporter: otlp
+    sampler:
+      # 固定采样率：1%
+      type: trace_id_ratio
+      ratio: 0.01
+
+      # 或者：基于服务名的采样
+      # parent_based 采样（遵循上游的采样决策）
+```
+
+### 尾部采样实现
+
+尾部采样需要在 OTel Collector 层实现，因为它需要等待请求完成：
+
+```yaml title="otel-collector-config.yaml"
+processors:
+  tail_sampling:
+    decision_wait: 10s       # 等待请求完成的最多时间
+    num_traces: 100000       # 内存中追踪缓存大小
+    expected_new_traces_per_sec: 10000
+    policies:
+      # 保留所有错误请求
+      - name: errors-policy
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+
+      # 保留所有慢请求（超过 1 秒）
+      - name: latency-policy
+        type: latency
+        latency: { threshold_ms: 1000 }
+
+      # 保留特定接口的请求
+      - name: important-routes-policy
+        type: string_attribute
+        string_attribute:
+          key: http.route
+          values: ["/api/payment", "/api/order"]
+
+      # 按比例采样（兜底）
+      - name: probabilistic-policy
+        type: probabilistic
+        probabilistic: { sampling_percentage: 10 }
+```
+
+### 自适应采样
+
+自适应采样的核心思想：QPS 高时降低采样率，QPS 低时提高采样率：
+
+```java title="AdaptiveSampler.java"
+public class AdaptiveSampler implements Sampler {
+
+    private final Sampler fallback;
+    private final AtomicReference<Double> currentRatio;
+    private final Meter meter;
+
+    public AdaptiveSampler(Sampler fallback, Meter meter) {
+        this.fallback = fallback;
+        this.currentRatio = new AtomicReference<>(1.0);
+
+        // 监控当前 QPS
+        meter.gaugeBuilder("sampling.ratio")
+            .setDescription("Current sampling ratio")
+            .ofLongs()
+            .buildWithCallback(measurement ->
+                measurement.record((long)(currentRatio.get() * 100)));
+    }
+
+    @Override
+    public SamplingResult shouldSample(
+            Context parentContext,
+            String traceId,
+            String name,
+            SpanKind kind,
+            Attributes initialAttributes,
+            List<Link> parentLinks) {
+
+        // 根据当前负载动态调整采样率
+        double qps = getCurrentQPS();
+
+        double targetRatio;
+        if (qps > 100000) {
+            targetRatio = 0.01;    // 10 万 QPS 以上，1%
+        } else if (qps > 10000) {
+            targetRatio = 0.05;    // 1-10 万 QPS，5%
+        } else if (qps > 1000) {
+            targetRatio = 0.10;    // 1 千-1 万 QPS，10%
+        } else {
+            targetRatio = 1.0;      // 1 千 QPS 以下，100%
+        }
+
+        currentRatio.set(targetRatio);
+
+        // 使用固定比例采样
+        if (Math.random() < targetRatio) {
+            return SamplingResult.recordAndSample();
+        } else {
+            return SamplingResult.drop();
+        }
+    }
+
+    private double getCurrentQPS() {
+        // 从指标中读取当前 QPS
+        // 实际实现中可以从 Prometheus 查询
+        return 50000.0; // 示例值
+    }
+}
+```
+
+## 日志采样策略
+
+日志的采样比链路追踪更复杂，因为日志不是请求级别的——你需要决定采样哪条日志，而不是哪个请求。
+
+### 基于错误的采样
+
+```yaml title="logback-spring.xml"
+<!-- 100% 保留 ERROR 日志 -->
+<springProfile name="prod">
+    <logger name="root" level="INFO">
+        <!-- ERROR 日志不走采样 -->
+        <appender-ref ref="ERROR_FILE"/>
+    </logger>
+
+    <!-- INFO 日志采样 10% -->
+    <logger name="root" level="INFO">
+        <appender-ref ref="SAMPLED_FILE"/>
+    </logger>
+</springProfile>
+```
+
+### 基于百分比的采样
+
+```java title="SamplingRateFilter.java"
+@Aspect
+@Component
+public class LoggingAspect {
+
+    private static final double SAMPLE_RATE = 0.1; // 10%
+    private final Random random = new Random();
+
+    @Around("execution(* com.example..*.*(..))")
+    public Object logMethod(ProceedingJoinPoint joinPoint) throws Throwable {
+        boolean shouldLog = random.nextDouble() < SAMPLE_RATE;
+
+        if (!shouldLog) {
+            return joinPoint.proceed();
+        }
+
+        // ... 正常日志记录
+        return joinPoint.proceed();
+    }
+}
+```
+
+### 智能日志采样
+
+只采样能代表整体分布的日志，而非随机丢弃：
+
+```python title="loki-sampling.py"
+# Loki 采样策略：保留「代表性日志」
+# 思路：按 message 模板哈希分组，每个组保留固定比例
+
+pipeline_stages:
+  - json:
+      expressions:
+        message_template: message
+
+  # 按 message 模板分组
+  - labels:
+      values:
+        message_template: message_template
+
+# 超过 100 种不同 message 模板时，触发采样
+# 这是 Loki 的自动采样机制
+```
+
+## 成本控制最佳实践
+
+### 实践一：标签基数控制
+
+```yaml
+# 检查高基数标签
+# Cardinality > 10000 的标签需要警惕
+count({__name__=~".*"}) by (__name__, label_name)
+  > 10000
+```
+
+```yaml title="prometheus.yml"
+# 拒绝高基数的指标
+metric_relabel_configs:
+  - source_labels: [__name__, user_id]
+    regex: '.*,user_[0-9]+'
+    action: drop
+```
+
+### 实践二：数据过期策略
+
+```yaml title="prometheus.yml"
+storage:
+  tsdb:
+    out_of_order_time_window: 15m
+    # 数据保留时间
+    retention.time: 30d
+
+# Loki 数据保留
+limits_config:
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h  # 7 天
+```
+
+### 实践三：多级存储
+
+```yaml title="thanos.yml"
+stores:
+  - prometheus:9090
+  - sidecar:19191
+
+ruler:
+  alert:
+    query_url: http://thanos-ruler:9090
+
+  # 规则查询使用长期存储
+  query_stores:
+    - store: thanos-store:10901
+
+# 冷热分层：30 天内用 SSD，30 天后用对象存储
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. 可观测性数据的三种主要成本来源是什么？哪种成本最高？
+2. 头部采样（Head-based）和尾部采样（Tail-based）的核心区别是什么？为什么尾部采样能保留更多有价值的请求？
+3. 链路追踪的自适应采样是如何工作的？QPS 高低与采样率的关系是什么？
+4. 日志采样相比链路追踪采样更复杂的原因是什么？基于错误的采样和基于百分比的采样分别适用什么场景？
+5. 标签基数（Cardinality）为什么是指标成本的核心问题？如何控制高基数标签？

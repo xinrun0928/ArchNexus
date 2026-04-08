@@ -1,0 +1,240 @@
+---
+description: 爆炸半径（Blast Radius）控制
+---
+
+# 爆炸半径（Blast Radius）控制
+
+「在生产环境做故障注入？这不是搞破坏吗？」
+
+这是大多数人对混沌工程的第一反应。但混沌工程的核心原则之一，就是**严格控制爆炸半径**——确保实验的影响范围是可控的、有限的、不影响大多数用户的。
+
+爆炸半径（Blast Radius）就是故障实验的影响范围。控制爆炸半径的能力，是混沌工程能不能在生产环境安全落地的关键。
+
+## 什么是爆炸半径
+
+```
+爆炸半径 = 故障影响到的用户/请求/功能的范围
+
+爆炸半径越小，实验越安全
+```
+
+举个具体的例子：
+
+| 实验 | 爆炸半径 | 影响 |
+| --- | --- | --- |
+| 杀死 1% 的 Pod | 约 1% 的用户流量 | 用户几乎无感知 |
+| 杀死 50% 的 Pod | 约 50% 的用户流量 | 部分用户受影响 |
+| 杀死整个可用区 | 整个区域的用户 | 重大事故 |
+
+**混沌工程的目标不是制造大爆炸，而是制造可控的小爆炸。**
+
+## 爆炸半径控制的策略
+
+### 策略一：流量抽样（Traffic Gating）
+
+只对一小部分流量注入故障：
+
+```yaml title="traffic-sampling.yaml"
+chaos:
+  experiment:
+    # 只影响 10% 的流量
+    # 90% 的流量正常通过，完全不受影响
+    traffic_percentage: 10
+
+    # 通过 Header 标记实验流量
+    header_match:
+      header: "X-Chaos-Experiment"
+      value: "true"
+```
+
+**实际效果**：10000 QPS 的系统，只有 1000 QPS 会受到故障影响，9000 QPS 完全正常。
+
+### 策略二：用户 ID 抽样
+
+只对特定用户群体注入故障：
+
+```yaml title="user-sampling.yaml"
+chaos:
+  experiment:
+    # 只影响用户 ID 末尾为 0-9 的用户（约 10%）
+    user_filter:
+      type: "modulo"
+      field: "user_id"
+      divisor: 10
+      remainder: 0
+```
+
+**适用场景**：内部员工账号、Beta 用户、测试账号优先作为实验对象。
+
+### 策略三：地域限制
+
+只对特定地域注入故障：
+
+```yaml title="region-restriction.yaml"
+chaos:
+  experiment:
+    # 只影响上海地域的用户
+    region_filter:
+      - "cn-east-1"  # 上海
+      - "cn-east-2"  # 南京
+```
+
+**适用场景**：有地域隔离的系统，可以选择低峰地域进行实验。
+
+### 策略四：时间窗口
+
+只在低峰期进行实验：
+
+```yaml title="time-window.yaml"
+chaos:
+  experiment:
+    # 只允许在以下时间窗口进行实验
+    allowed_hours:
+      - "02:00-05:00"  # 凌晨 2-5 点
+      - "14:00-16:00"  # 下午 2-4 点
+```
+
+**数据参考**：凌晨 2-5 点通常是流量最低的时段，此时进行实验影响最小。
+
+### 策略五：金丝雀隔离
+
+将故障注入限制在金丝雀版本：
+
+```yaml title="canary-isolation.yaml"
+# 在金丝雀发布时进行混沌实验
+# 只影响 5% 的金丝雀流量
+# 95% 的用户使用稳定版本，完全不受影响
+canary:
+  weight: 5
+  chaos_enabled: true
+```
+
+## 爆炸半径的量化
+
+每次实验前，应该评估爆炸半径的量化指标：
+
+```python
+def estimate_blast_radius(
+    traffic_percentage: float,
+    affected_users: int,
+    experiment_duration_seconds: int
+) -> dict:
+    """
+    评估爆炸半径
+    """
+    affected_requests = traffic_percentage / 100 * estimated_qps * experiment_duration_seconds
+
+    return {
+        "affected_users_percent": traffic_percentage,
+        "affected_users_count": int(affected_users * traffic_percentage / 100),
+        "affected_requests": affected_requests,
+        "risk_level": "LOW" if traffic_percentage < 5 else "MEDIUM" if traffic_percentage < 20 else "HIGH"
+    }
+
+# 示例
+result = estimate_blast_radius(
+    traffic_percentage=5,
+    affected_users=1000000,
+    experiment_duration_seconds=60
+)
+print(f"风险等级: {result['risk_level']}")
+print(f"影响用户: {result['affected_users_count']} 人")
+print(f"影响请求: {result['affected_requests']} 个")
+```
+
+## 紧急停止机制
+
+任何混沌实验，都必须有紧急停止机制：
+
+```yaml title="safety-guard.yaml"
+chaos:
+  safety:
+    # 自动停止条件
+    auto_stop:
+      conditions:
+        - name: "error_rate_threshold"
+          metric: "http_requests_total{status='5xx'}"
+          threshold: 0.05
+          action: "STOP"
+
+        - name: "latency_threshold"
+          metric: "p99_latency"
+          threshold: "2000ms"
+          action: "STOP"
+
+        - name: "cpu_threshold"
+          metric: "node_cpu_usage"
+          threshold: 0.95
+          action: "STOP"
+
+    # 手动停止
+    manual_stop:
+      enabled: true
+      channels:
+        - "pagerduty"
+        - "slack"
+        - "webhook"
+```
+
+## 渐进式扩大原则
+
+从最小爆炸半径开始，逐步扩大：
+
+```
+第一步：测试环境，影响 0% 真实流量
+    ↓
+第二步：生产环境，影响 1% 流量
+    ↓
+第三步：生产环境，影响 5% 流量
+    ↓
+第四步：生产环境，影响 10% 流量
+    ↓
+... 逐步扩大，直到达到目标
+```
+
+**核心原则**：每一步都要验证上一步没有产生负面影响。
+
+## 真实案例：Chaos Mesh 的爆炸半径控制
+
+Chaos Mesh 提供了多种爆炸半径控制方式：
+
+```yaml title="chaos-mesh-experiment.yaml"
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: pod-failure-experiment
+spec:
+  action: pod-failure
+  mode: one           # 只影响 1 个 Pod
+  duration: 60s
+
+  # 爆炸半径控制
+  selector:
+    namespaces:
+      - production
+    labelSelectors:
+      app: order-service
+    podMode: one       # 随机选择 1 个 Pod
+
+  # 百分比控制（Chaos Mesh 1.7+）
+  percentage: "10"     # 只影响 10% 的 Pod
+```
+
+## 质量判断标准
+
+一篇「爆炸半径控制」的文章是否达标，要看它是否回答了：
+
+1. ✅ 什么是爆炸半径，如何量化？
+2. ✅ 有哪些控制策略（流量抽样、用户抽样、时间窗口等）？
+3. ✅ 是否有紧急停止机制？
+4. ❌ 只是放策略列表，没有具体示例——不达标
+
+## 本章总结
+
+**核心要点**：
+
+1. **爆炸半径是混沌工程安全的核心**：控制影响范围是实验的前提
+2. **多种策略可叠加使用**：流量抽样 + 时间窗口 + 紧急停止
+3. **渐进式扩大**：从 1% 开始，逐步扩大到目标范围
+4. **紧急停止机制不可少**：任何实验都必须能立即停止
+5. **量化评估爆炸半径**：每次实验前评估影响范围，而不是凭感觉

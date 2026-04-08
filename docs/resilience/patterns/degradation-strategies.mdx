@@ -1,0 +1,403 @@
+---
+description: 降级策略：返回默认值/空结果/缓存
+---
+
+# 降级策略：返回默认值/空结果/缓存
+
+降级的核心是返回一个「有损但有用」的结果。
+
+降级不是简单地返回 null 或空数组，那样会导致下游代码空指针异常或逻辑错误。好的降级策略应该返回一个「有意义」的默认值，让调用方能够继续处理，而不是崩溃。
+
+## 三种降级策略
+
+| 策略 | 适用场景 | 数据新鲜度 | 实现复杂度 |
+| --- | --- | --- | --- |
+| **默认值** | 所有场景 | 无数据 | 简单 |
+| **缓存数据** | 读多写少 | 可能过时 | 中等 |
+| **静态内容** | 内容展示类 | 完全过时 | 简单 |
+
+## 默认值降级
+
+### 基础默认值
+
+```java title="DefaultValueFallback.java"
+@Service
+public class DefaultValueFallback {
+
+    // 用户服务降级
+    public User getDefaultUser() {
+        return User.builder()
+            .id(0L)
+            .name("Guest")
+            .email("guest@example.com")
+            .level(UserLevel.NORMAL)
+            .build();
+    }
+
+    // 商品服务降级
+    public Product getDefaultProduct() {
+        return Product.builder()
+            .id(0L)
+            .name("商品信息加载中")
+            .status(ProductStatus.UNAVAILABLE)
+            .price(BigDecimal.ZERO)
+            .build();
+    }
+
+    // 列表服务降级
+    public List<Product> getDefaultProductList() {
+        // 返回空列表，而不是 null
+        return Collections.emptyList();
+    }
+
+    // 数字服务降级
+    public Integer getDefaultCount() {
+        return 0;
+    }
+
+    // 布尔服务降级
+    public Boolean getDefaultBoolean() {
+        return false;
+    }
+}
+```
+
+### 业务语义默认值
+
+默认值应该有业务意义，不能随便返回一个空对象：
+
+```java title="BusinessDefaultFallback.java"
+@Service
+public class BusinessDefaultFallback {
+
+    // 库存服务降级：假设库存充足
+    public Inventory getDefaultInventory(Long productId) {
+        return Inventory.builder()
+            .productId(productId)
+            .available(999)  // 返回大数字，让用户能下单
+            .reserved(0)
+            .build();
+    }
+
+    // 价格服务降级：返回原价
+    public Price getDefaultPrice(Long productId) {
+        return Price.builder()
+            .productId(productId)
+            .originalPrice(BigDecimal.ZERO)  // 价格为零可能有问题
+            .discountPrice(BigDecimal.ZERO)
+            .build();
+    }
+
+    // 会员折扣降级：不打折
+    public Discount getDefaultDiscount(Long userId) {
+        return Discount.builder()
+            .userId(userId)
+            .discountRate(BigDecimal.ONE)  // 1 表示不打折
+            .description("系统繁忙，暂无折扣")
+            .build();
+    }
+
+    // 物流服务降级：假设普通配送
+    public ShippingInfo getDefaultShippingInfo(Long orderId) {
+        return ShippingInfo.builder()
+            .orderId(orderId)
+            .shippingMethod("standard")
+            .estimatedDays(7)
+            .cost(BigDecimal.ZERO)
+            .build();
+    }
+}
+```
+
+## 缓存降级
+
+### 本地缓存降级
+
+```java title="LocalCacheFallback.java"
+@Service
+public class LocalCacheFallback {
+
+    private final LoadingCache<String, Object> localCache;
+
+    public LocalCacheFallback() {
+        this.localCache = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .build(key -> loadFromRemote(key));
+    }
+
+    public Product getProduct(Long productId) {
+        String cacheKey = "product:" + productId;
+
+        try {
+            // 尝试获取实时数据
+            Product product = productService.getProduct(productId);
+            // 成功时更新缓存
+            localCache.put(cacheKey, product);
+            return product;
+        } catch (Exception e) {
+            // 降级：返回缓存数据
+            Product cached = (Product) localCache.getIfPresent(cacheKey);
+            if (cached != null) {
+                log.warn("返回缓存商品数据: productId={}", productId);
+                return cached;
+            }
+
+            // 缓存也没有，返回默认值
+            log.error("商品服务降级，无缓存: productId={}", productId);
+            return getDefaultProduct(productId);
+        }
+    }
+
+    private Product loadFromRemote(String cacheKey) {
+        // 初始化时加载的数据
+        throw new UnsupportedOperationException("Should not be called directly");
+    }
+}
+```
+
+### Redis 缓存降级
+
+```java title="RedisCacheFallback.java"
+@Service
+public class RedisCacheFallback {
+
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final ProductService productService;
+
+    private static final String PRODUCT_CACHE_KEY = "product:";
+    private static final Duration CACHE_TTL = Duration.ofHours(1);
+
+    public Product getProduct(Long productId) {
+        String cacheKey = PRODUCT_CACHE_KEY + productId;
+
+        try {
+            // 尝试获取实时数据
+            Product product = productService.getProduct(productId);
+            // 更新缓存
+            redisTemplate.opsForValue().set(cacheKey, product, CACHE_TTL);
+            return product;
+        } catch (Exception e) {
+            // 降级：返回缓存数据
+            return getCachedProduct(productId);
+        }
+    }
+
+    private Product getCachedProduct(Long productId) {
+        String cacheKey = PRODUCT_CACHE_KEY + productId;
+        Object cached = redisTemplate.opsForValue().get(cacheKey);
+
+        if (cached instanceof Product) {
+            log.warn("返回 Redis 缓存商品: productId={}", productId);
+            return (Product) cached;
+        }
+
+        log.error("商品服务降级，无缓存: productId={}", productId);
+        return getDefaultProduct(productId);
+    }
+}
+```
+
+### 缓存降级策略
+
+```java title="CacheFallbackStrategy.java"
+@Service
+public class CacheFallbackStrategy {
+
+    public <T> T getWithFallback(String cacheKey,
+                                  Supplier<T> remoteLoader,
+                                  Class<T> type) {
+        // 1. 尝试从缓存获取
+        T cached = getFromCache(cacheKey, type);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 2. 尝试从远程获取
+        try {
+            T result = remoteLoader.get();
+            if (result != null) {
+                updateCache(cacheKey, result);
+            }
+            return result;
+        } catch (Exception e) {
+            // 3. 降级：返回缓存或默认值
+            return getFallback(cacheKey, type, e);
+        }
+    }
+
+    private <T> T getFallback(String cacheKey, Class<T> type, Exception e) {
+        log.warn("服务降级: cacheKey={}, error={}", cacheKey, e.getMessage());
+
+        // 尝试返回旧缓存
+        T cached = getFromCache(cacheKey, type);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 返回类型对应的默认值
+        return getDefaultValue(type);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T getDefaultValue(Class<T> type) {
+        if (type == List.class) {
+            return (T) Collections.emptyList();
+        }
+        if (type == Map.class) {
+            return (T) Collections.emptyMap();
+        }
+        if (type == String.class) {
+            return (T) "";
+        }
+        if (type == Integer.class || type == int.class) {
+            return (T) Integer.valueOf(0);
+        }
+        if (type == Boolean.class || type == boolean.class) {
+            return (T) Boolean.FALSE;
+        }
+        return null; // 对于复杂类型，返回 null 需要调用方处理
+    }
+}
+```
+
+## 空结果 vs 默认值
+
+空结果和默认值的选择：
+
+| 场景 | 推荐策略 | 原因 |
+| --- | --- | --- |
+| 列表数据 | 空列表 `[]` | 调用方可以遍历，不会 NPE |
+| 单个对象 | 默认对象 | 调用方可以访问属性 |
+| 数字统计 | 默认 0 | 下游计算不会出错 |
+| 布尔判断 | 根据业务语义决定 | 需要判断「未查到」还是「查到 false」 |
+
+```java title="EmptyVsDefault.java"
+public class EmptyVsDefault {
+
+    // 用户列表：返回空列表
+    public List<User> getUsers(Long organizationId) {
+        try {
+            return userService.getUsersByOrganization(organizationId);
+        } catch (Exception e) {
+            // 降级：返回空列表
+            return Collections.emptyList();
+        }
+    }
+
+    // 用户详情：返回默认用户
+    public User getUser(Long userId) {
+        try {
+            return userService.getUser(userId);
+        } catch (Exception e) {
+            // 降级：返回默认用户
+            return User.guest();
+        }
+    }
+
+    // 订单数量：返回 0
+    public Integer getOrderCount(Long userId) {
+        try {
+            return orderService.getOrderCount(userId);
+        } catch (Exception e) {
+            // 降级：返回 0
+            return 0;
+        }
+    }
+
+    // 会员状态：需要区分「未查到」和「不是会员」
+    public Optional<Membership> getMembership(Long userId) {
+        try {
+            return Optional.ofNullable(membershipService.getMembership(userId));
+        } catch (Exception e) {
+            // 降级：返回空 Optional，表示未知
+            return Optional.empty();
+        }
+    }
+}
+```
+
+## 降级组合策略
+
+```java title="CompositeFallback.java"
+public class CompositeFallback {
+
+    public RecommendationResult getRecommendation(Long userId) {
+        // 策略链：实时 → Redis 缓存 → 本地缓存 → 默认值
+        return getFromRemote(userId)
+            .or(this::getFromRedisCache, userId)
+            .or(this::getFromLocalCache, userId)
+            .or(this::getDefault, userId)
+            .resolve();
+    }
+
+    private Optional<RecommendationResult> getFromRemote(Long userId) {
+        return Optional.of(recommendationService.getRecommendation(userId));
+    }
+
+    private Optional<RecommendationResult> getFromRedisCache(Long userId) {
+        String key = "recommendation:" + userId;
+        RecommendationResult cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            log.warn("Redis 缓存降级: userId={}", userId);
+            return Optional.of(cached);
+        }
+        return Optional.empty();
+    }
+
+    private Optional<RecommendationResult> getFromLocalCache(Long userId) {
+        RecommendationResult cached = localCache.getIfPresent(userId);
+        if (cached != null) {
+            log.warn("本地缓存降级: userId={}", userId);
+            return Optional.of(cached);
+        }
+        return Optional.empty();
+    }
+
+    private Optional<RecommendationResult> getDefault(Long userId) {
+        log.error("所有降级策略失败，返回默认推荐: userId={}", userId);
+        return Optional.of(getHotProducts());
+    }
+}
+```
+
+## 降级监控
+
+```yaml title="降级监控指标"
+# 降级相关指标
+degradation:
+  - name: fallback_total
+    type: counter
+    labels: [resource, strategy]
+    description: "降级总次数 (redis/local/default)"
+
+  - name: fallback_rate
+    type: gauge
+    labels: [resource]
+    description: "降级率"
+
+  - name: cache_hit_fallback
+    type: counter
+    description: "缓存命中降级"
+
+  - name: default_fallback
+    type: counter
+    description: "默认值降级"
+
+# 告警
+alerts:
+  - name: HighFallbackRate
+    condition: fallback_rate > 0.1
+    severity: warning
+    message: "降级率超过 10%"
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **降级策略有三种**：默认值、缓存数据、静态内容
+2. **默认值应该有业务意义**：不能随便返回空对象
+3. **缓存降级要处理数据新鲜度**：缓存数据可能过时
+4. **空列表 vs 默认对象**：根据数据类型选择合适的降级策略
+5. **降级链式策略**：实时 → 缓存 → 默认值，逐级降级

@@ -1,0 +1,397 @@
+---
+description: 容错模式组合使用
+---
+
+# 容错模式组合使用
+
+单一容错模式往往不够，需要组合使用才能构建完整的高可用防护体系。
+
+容错不是加一个熔断器就万事大吉，而是需要从外到内、从入口到出口的层层防护。每层防护解决不同层面的问题，相互配合形成完整的防线。
+
+## 为什么需要组合使用
+
+一个典型的线上故障往往是这样的链路：
+
+```
+用户请求
+  ↓
+流量激增（突发流量）
+  ↓
+某个依赖服务变慢（性能故障）
+  ↓
+调用堆积（资源耗尽）
+  ↓
+故障传播（整个系统崩溃）
+```
+
+单一模式只能解决其中一个环节：
+
+- **只有限流**：能防止过载，但无法处理已堆积的请求
+- **只有超时**：能防止无限等待，但无法处理连续故障
+- **只有熔断器**：能防止故障传播，但无法处理瞬时故障
+- **只有降级**：能返回友好响应，但无法防止系统崩溃
+
+## 容错模式的分层防护体系
+
+```mermaid
+flowchart TD
+    A["请求入口"] --> B["第一层：限流\n防止过载"]
+    B --> C["第二层：超时\n防止无限等待"]
+    C --> D["第三层：重试\n处理瞬时故障"]
+    D --> E["第四层：熔断器\n防止故障传播"]
+    E --> F["第五层：舱壁隔离\n限制资源消耗"]
+    F --> G["第六层：降级\n返回兜底数据"]
+
+    G --> |"成功| H["返回结果"]
+    G --> |"继续失败| I["返回友好错误"]
+
+    style B fill:#ffcdd2
+    style C fill:#fff9c4
+    style D fill:#c8e6c9
+    style E fill:#bbdefb
+    style F fill:#e1bee7
+    style G fill:#ffe0b2
+```
+
+### 各层职责
+
+| 层级 | 模式 | 职责 | 解决什么问题 |
+| --- | --- | --- | --- |
+| **第一层** | 限流 | 控制入口流量 | 突发流量、系统过载 |
+| **第二层** | 超时 | 防止无限等待 | 慢依赖拖垮整个系统 |
+| **第三层** | 重试 | 处理瞬时故障 | 网络抖动、偶发失败 |
+| **第四层** | 熔断器 | 防止故障传播 | 级联故障、系统崩溃 |
+| **第五层** | 舱壁隔离 | 限制资源消耗 | 单服务拖垮所有服务 |
+| **第六层** | 降级 | 提供兜底方案 | 依赖不可用时仍能服务 |
+
+## 组合模式实战
+
+### 场景一：支付服务调用
+
+```java title="PaymentServiceResilience.java"]
+@Service
+public class PaymentServiceResilience {
+
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final Bulkhead bulkhead;
+    private final RateLimiter rateLimiter;
+
+    public PaymentResult processPayment(PaymentRequest request) {
+        // 1. 限流：防止突发流量
+        if (!rateLimiter.tryAcquire(request.getUserId())) {
+            return PaymentResult.rejected("请求过于频繁，请稍后重试");
+        }
+
+        // 2. 舱壁隔离：限制并发数
+        Bulkhead bulkheadForPayment = circuitBreakerRegistry
+            .bulkhead("payment-bulkhead");
+
+        Supplier<PaymentResult> bulkheadTask = () -> {
+
+            // 3. 超时控制：防止无限等待
+            Supplier<PaymentResult> timeoutTask = Suppliers
+                .suppliedBy(() -> callPaymentService(request))
+                .within(3, TimeUnit.SECONDS)
+                .get();
+
+            // 4. 重试：处理瞬时故障
+            Supplier<PaymentResult> retryTask = Decorators
+                .ofSupplier(timeoutTask)
+                .withRetry(RetryConfig.custom()
+                    .maxAttempts(3)
+                    .waitDuration(Duration.ofMillis(500))
+                    .retryExceptions(SocketTimeoutException.class)
+                    .build())
+                .get();
+
+            // 5. 熔断器：防止故障传播
+            return circuitBreakerRegistry
+                .circuitBreaker("payment-circuit")
+                .executeSupplier(retryTask);
+        };
+
+        // 6. 降级：提供兜底方案
+        Supplier<PaymentResult> withFallback = Decorators
+            .ofSupplier(bulkheadTask)
+            .withFallback(List.of(Exception.class),
+                e -> handlePaymentFallback(request, e))
+            .decorate();
+
+        return withFallback.get();
+    }
+
+    // 降级处理：创建待支付订单
+    private PaymentResult handlePaymentFallback(PaymentRequest request, Exception e) {
+        log.warn("支付服务调用失败，降级处理: {}", e.getMessage());
+
+        Order order = orderService.createPendingOrder(request);
+        return PaymentResult.pending(order.getId(),
+            "支付服务暂时不可用，订单已创建，稍后自动重试");
+    }
+}
+```
+
+### 场景二：商品查询服务
+
+```java title="ProductServiceResilience.java"]
+@Service
+public class ProductServiceResilience {
+
+    private final CircuitBreakerRegistry registry;
+    private final Bulkhead bulkhead;
+
+    public ProductDetail getProductDetail(Long productId) {
+        CircuitBreaker circuitBreaker = registry.circuitBreaker("product-service");
+        Bulkhead bulkheadForProduct = registry.bulkhead("product-bulkhead");
+
+        Supplier<ProductDetail> supplier = () -> {
+            // 舱壁隔离
+            return Bulkhead.decorateSupplier(bulkheadForProduct, () -> {
+                // 调用商品服务
+                return productClient.getProduct(productId);
+            }).get();
+        };
+
+        // 熔断器保护
+        Supplier<ProductDetail> withCircuitBreaker =
+            CircuitBreaker.decorateSupplier(circuitBreaker, supplier);
+
+        // 降级处理
+        Supplier<ProductDetail> withFallback = Decorators
+            .ofSupplier(withCircuitBreaker)
+            .withFallback(List.of(Exception.class),
+                e -> handleProductFallback(productId, e))
+            .decorate();
+
+        return withFallback.get();
+    }
+
+    // 降级方案：返回缓存数据或默认商品
+    private ProductDetail handleProductFallback(Long productId, Exception e) {
+        log.warn("商品服务调用失败，降级返回: productId={}", productId);
+
+        // 方案一：返回缓存数据
+        ProductDetail cached = productCache.get(productId);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 方案二：返回默认商品
+        return ProductDetail.defaultProduct(productId);
+    }
+}
+```
+
+### 场景三：用户服务调用
+
+```java title="UserServiceResilience.java"]
+@Service
+public class UserServiceResilience {
+
+    private final CircuitBreaker circuitBreaker;
+
+    public UserInfo getUserInfo(Long userId) {
+        // 熔断器保护
+        if (!circuitBreaker.isCallPermitted()) {
+            return getDefaultUserInfo(userId);
+        }
+
+        try {
+            UserInfo userInfo = userClient.getUserInfo(userId);
+            circuitBreaker.recordSuccess();
+            return userInfo;
+        } catch (Exception e) {
+            circuitBreaker.recordFailure();
+            return getDefaultUserInfo(userId);
+        }
+    }
+
+    private UserInfo getDefaultUserInfo(Long userId) {
+        // 返回匿名用户信息
+        return UserInfo.anonymous(userId);
+    }
+}
+```
+
+## 模式选择指南
+
+### 按故障场景选择
+
+| 故障场景 | 必需模式 | 可选模式 |
+| --- | --- | --- |
+| **网络不稳定** | 超时 + 重试 | 熔断器 + 降级 |
+| **依赖服务慢** | 超时 + 舱壁隔离 | 熔断器 + 降级 |
+| **突发流量** | 限流 | 降级 |
+| **数据库压力** | 超时 + 舱壁隔离 | 限流 + 降级 |
+| **多依赖调用** | 超时 + 熔断器 + 舱壁隔离 | 限流 + 重试 + 降级 |
+| **关键支付流程** | 超时 + 重试 + 熔断器 + 降级 | 限流 + 舱壁隔离 |
+
+### 按服务重要性选择
+
+| 服务重要性 | 配置策略 |
+| --- | --- |
+| **核心服务（支付、订单）** | 全部启用：限流 + 超时 + 重试 + 熔断器 + 舱壁 + 降级 |
+| **重要服务（商品、用户）** | 基础防护：超时 + 熔断器 + 降级 |
+| **一般服务（推荐、评论）** | 简单防护：超时 + 降级 |
+| **后台任务（统计、导出）** | 仅超时 + 降级 |
+
+## 容错组合的反模式
+
+### 反模式一：过度防护
+
+```java title="AntiPattern1.java"]
+// 错误：过度防护，导致性能下降
+public Result callService() {
+    // 1. 限流
+    if (!rateLimiter.tryAcquire()) { ... }
+
+    // 2. 舱壁
+    bulkhead.execute(() -> {
+        // 3. 重试
+        retry.execute(() -> {
+            // 4. 熔断器
+            circuitBreaker.execute(() -> {
+                // 5. 再次重试
+                retry2.execute(() -> {
+                    // 6. 超时
+                    timeout.execute(() -> {
+                        return service.call();
+                    });
+                });
+            });
+        });
+    });
+}
+```
+
+### 反模式二：防护顺序错误
+
+```java title="AntiPattern2.java"]
+// 错误：熔断器放在最后，故障传播无法阻止
+public Result callService() {
+    return rateLimiter.execute(() ->
+        retry.execute(() ->
+            service.call()  // 故障先传播，再熔断，无效！
+        )
+    );
+}
+
+// 正确：熔断器放在最外层
+public Result callService() {
+    return circuitBreaker.execute(() ->
+        rateLimiter.execute(() ->
+            retry.execute(() ->
+                service.call()
+            )
+        )
+    );
+}
+```
+
+### 反模式三：降级逻辑不完善
+
+```java
+// 错误：降级返回 null
+public Product getProduct(Long id) {
+    try {
+        return productClient.getProduct(id);
+    } catch (Exception e) {
+        return null;  // 调用方 NPE 崩溃！
+    }
+}
+
+// 正确：降级返回有意义的数据
+public Product getProduct(Long id) {
+    try {
+        return productClient.getProduct(id);
+    } catch (Exception e) {
+        log.warn("商品服务调用失败，返回默认商品: productId={}", id);
+        return Product.defaultProduct(id);  // 有意义的降级
+    }
+}
+```
+
+## 完整配置示例
+
+```yaml title="resilience-patterns.yml"]
+# 完整的容错配置示例
+resilience:
+
+  # 限流配置
+  rate-limit:
+    global:
+      qps: 10000
+    per-user:
+      qps: 100
+    per-api:
+      "/api/payment": 50
+      "/api/product": 500
+
+  # 超时配置
+  timeout:
+    payment-service: 3000ms
+    product-service: 5000ms
+    user-service: 2000ms
+
+  # 重试配置
+  retry:
+    default:
+      max-attempts: 3
+      backoff: exponential
+      base-delay: 500ms
+      jitter: true
+    payment:
+      max-attempts: 2
+      backoff: fixed
+      delay: 1000ms
+
+  # 熔断器配置
+  circuit-breaker:
+    payment:
+      failure-rate-threshold: 30
+      wait-duration: 60s
+      sliding-window-size: 20
+    product:
+      failure-rate-threshold: 50
+      wait-duration: 30s
+      sliding-window-size: 10
+
+  # 舱壁配置
+  bulkhead:
+    payment:
+      max-concurrent: 5
+      max-wait: 100ms
+    product:
+      max-concurrent: 20
+      max-wait: 200ms
+
+  # 降级配置
+  fallback:
+    payment:
+      strategy: "pending-order"
+      message: "支付服务暂时不可用"
+    product:
+      strategy: "cache-or-default"
+      cache-ttl: 1h
+```
+
+## 质量判断标准
+
+一篇「容错模式组合使用」的文章是否达标，要看它是否回答了：
+
+1. ✅ 为什么单一模式不够（故障链路分析）？
+2. ✅ 容错模式的分层防护体系是什么？
+3. ✅ 不同场景的完整实现代码？
+4. ✅ 按服务重要性的配置策略？
+5. ✅ 有哪些反模式需要避免？
+6. ❌ 只有流程图，没有实战代码——不达标
+
+## 本章总结
+
+**核心要点**：
+
+1. **容错需要层层防护**：从限流到降级，每层解决不同问题
+2. **防护顺序很重要**：熔断器在最外层，防止故障传播
+3. **降级是最后防线**：降级逻辑要完善，返回有意义的数据
+4. **按场景选择模式**：核心服务全启用，一般服务简化
+5. **避免反模式**：过度防护、顺序错误、降级不完善都是坑

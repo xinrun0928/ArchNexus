@@ -1,0 +1,353 @@
+---
+description: 日志采集器对比：Filebeat vs Fluentd vs Vector 的选型指南
+---
+
+# 日志采集器对比（Fluentd / Vector / Filebeat）
+
+日志采集器是日志系统的「管道工」——负责从应用服务器收集日志、做一些预处理、然后转发到存储系统。选择错误的采集器，可能导致日志丢失、性能瓶颈或运维噩梦。
+
+## 三种采集器对比
+
+| 维度 | Filebeat | Fluentd | Vector |
+|---|---|---|---|
+| **开发方** | Elastic | Treasure Data | Datadog |
+| **语言** | Go | Ruby + C | Rust |
+| **性能** | 高 | 中 | **极高** |
+| **资源占用** | 低 | 中 | **极低** |
+| **插件生态** | 丰富 | **最丰富** | 发展中 |
+| **配置语法** | YAML | Ruby DSL | TOML/YAML |
+| **内存安全** | ✅ | ⚠️ 有内存泄漏历史 | ✅ |
+| **适用场景** | ELK 生态 | 通用/多目标 | 高性能/低资源 |
+
+## Filebeat：轻量采集器
+
+### 优势
+
+- **轻量**：资源占用低，适合大规模部署
+- **ELK 原生**：与 Elasticsearch、Logstash 无缝集成
+- **自动发现**：支持 K8s、Docker 自动服务发现
+- **背压处理**：能处理下游压力，不丢失日志
+
+### 劣势
+
+- **插件有限**：相比 Fluentd，插件数量少
+- **处理能力弱**：复杂转换需要搭配 Logstash
+- **不支持复杂路由**：多目标路由配置复杂
+
+### 部署场景
+
+Filebeat 适合**ELK 生态为主、架构简单的场景**：
+
+```yaml title="filebeat.yml（Kubernetes 部署）"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat
+spec:
+  selector:
+    matchLabels:
+      app: filebeat
+  template:
+    metadata:
+      labels:
+        app: filebeat
+    spec:
+      serviceAccountName: filebeat
+      containers:
+        - name: filebeat
+          image: docker.elastic.co/beats/filebeat:8.12.0
+          args:
+            - "-c"
+            - /etc/filebeat.yml
+            - "-e"
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/filebeat.yml
+              subPath: filebeat.yml
+            - name: data
+              mountPath: /usr/share/filebeat/data
+            - name: varlog
+              mountPath: /var/log
+            - name: dockersock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: config
+          configMap:
+            name: filebeat-config
+        - name: data
+          hostPath:
+            path: /var/lib/filebeat
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: dockersock
+          hostPath:
+            path: /var/run/docker.sock
+```
+
+```yaml title="filebeat-config.yml"
+filebeat.inputs:
+  - type: container
+    paths:
+      - /var/log/containers/*.log
+    processors:
+      - add_kubernetes_metadata:
+          host: ${NODE_NAME}
+          matchers:
+            - logs_path:
+                logs_path: "/var/log/containers/"
+
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+  index: "logs-%{+yyyy.MM.dd}-%{agent.version}"
+```
+
+## Fluentd：插件之王
+
+### 优势
+
+- **插件生态最丰富**：2000+ 插件，覆盖几乎所有数据源和目标
+- **多目标路由**：可以同时发送到 ES、Loki、S3、自定义存储
+- **统一日志层**：适合混合云和多云环境
+
+### 劣势
+
+- **Ruby 性能**：核心是 Ruby 实现，高吞吐下 CPU 占用较高
+- **内存泄漏历史**：早期版本存在内存泄漏
+- **配置复杂**：Ruby DSL 配置语法学习曲线较陡
+
+### 部署场景
+
+Fluentd 适合**多目标路由、需要灵活插件的场景**：
+
+```xml title="fluent.conf（多目标路由）"
+# 源：容器日志
+<source>
+  @type tail
+  @id input-tail-containers
+  path /var/log/containers/*.log
+  pos_file /var/log/fluentd-containers.log.pos
+  tag kubernetes.*
+  @type json
+  time_key time
+  time_format %Y-%m-%dT%H:%M:%S.%L
+</source>
+
+# 源：应用日志
+<source>
+  @type tail
+  @id input-tail-app
+  path /var/log/app/*.log
+  pos_file /var/log/fluentd-app.log.pos
+  tag app.*
+  <parse>
+    @type json
+  </parse>
+</source>
+
+# Filter：处理 Kubernetes 元数据
+<filter kubernetes.**>
+  @type kubernetes_metadata
+  kubernetes_url https://#{ENV['KUBERNETES_SERVICE_HOST']}:#{ENV['KUBERNETES_SERVICE_PORT']}
+  verify_ssl false
+  cache_size 1000
+</filter>
+
+# Filter：脱敏
+<filter app.**>
+  @type record_transformer
+  enable_ruby true
+  <record>
+    password "***"
+    token "***"
+    ${record["message"].gsub(/token=[^&\s]+/, "token=***")}
+  </record>
+</filter>
+
+# 输出：Elasticsearch
+<match kubernetes.**>
+  @type elasticsearch
+  @id output-es-k8s
+  host elasticsearch.logging.svc.cluster.local
+  port 9200
+  index_name logs-k8s-%Y.%m.%d
+  type_name _doc
+  logstash_format true
+  <buffer>
+    @type file
+    path /var/log/fluentd-buffers/es.buffer
+    flush_interval 10s
+    flush_thread_count 8
+    overflow_action block
+  </buffer>
+</match>
+
+# 输出：S3（冷存储）
+<match app.**>
+  @type s3
+  @id output-s3
+  s3_bucket my-logs-bucket
+  s3_region us-east-1
+  path logs/app/
+  buffer_path /var/log/fluentd-buffers/s3.buffer
+  <buffer>
+    @type file
+    timekey 3600
+    timekey_wait 600
+    flush_interval 300
+  </buffer>
+</match>
+
+# 输出：Kafka（实时流）
+<match **>
+  @type kafka2
+
+  brokers kafka:9092
+  topic_key traceId
+  default_topic logs-stream
+
+  <buffer>
+    @type file
+    path /var/log/fluentd-buffers/kafka.buffer
+    flush_interval 5s
+  </buffer>
+</match>
+```
+
+## Vector：高性能新选择
+
+### 优势
+
+- **Rust 实现**：内存安全、性能极高
+- **资源占用极低**：相同吞吐量下，比 Filebeat 和 Fluentd 低 5-10 倍
+- **流处理能力**：内置 filter、transform、aggregate 等复杂处理
+- **拓扑感知**：能理解服务间的依赖关系
+
+### 劣势
+
+- **插件生态仍在发展中**：相比 Fluentd 插件较少
+- **社区规模较小**：但增长速度快
+- **配置语法**：TOML/YAML 两种格式，初期选择困惑
+
+### 部署场景
+
+Vector 适合**高性能需求、容器化环境、存储成本敏感的场景**：
+
+```toml title="vector.toml（Kubernetes + 多目标）"
+[sources.kubernetes]
+type = "kubernetes_logs"
+annotation_fields.enabled = true
+
+[sources.app_logs]
+type = "file"
+include = ["/var/log/app/*.log"]
+glob_minimum_cooldown_ms = 500
+
+# Transform：JSON 解析
+[transforms.parse_json]
+type = "remap"
+inputs = ["app_logs"]
+source = '''
+. = parse_json!(.message)
+. timestamp = parse_timestamp!(.timestamp, format: "%Y-%m-%dT%H:%M:%S.%L")
+'''
+
+# Transform：添加元数据
+[transforms.enrich_metadata]
+type = "add_fields"
+inputs = ["parse_json"]
+fields.environment = "production"
+fields.cluster = "main"
+
+# Transform：脱敏
+[transforms.redact]
+type = "remap"
+inputs = ["enrich_metadata"]
+source = '''
+if exists(.password) {
+    .password = "***"
+}
+if exists(.token) {
+    .token = "***"
+}
+'''
+
+# 输出：Elasticsearch
+[sinks.elasticsearch]
+type = "elasticsearch"
+inputs = ["redact"]
+endpoint = "http://elasticsearch:9200"
+index = "logs-%Y.%m.%d"
+compression = "gzip"
+
+# 输出：Kafka
+[sinks.kafka]
+type = "kafka"
+inputs = ["redact"]
+topic = "logs-stream"
+bootstrap_servers = "kafka:9092"
+
+# 输出：Loki
+[sinks.loki]
+type = "loki"
+inputs = ["redact"]
+endpoint = "http://loki:3100"
+labels.app = "{{ service }}"
+labels.level = "{{ level }}"
+labels.environment = "production"
+
+# 健康检查
+[sinks.console]
+type = "console"
+inputs = ["kubernetes"]
+encoding.codec = "json"
+```
+
+## 选型决策树
+
+```
+开始选择日志采集器
+
+需要发送到多个不同目标？
+    └── 是（ES + S3 + Kafka）→ Fluentd
+
+Elastic Stack 生态为主？
+    └── 是 → Filebeat
+
+对性能/资源占用要求极高？
+    └── 是 → Vector
+
+需要最丰富的插件生态？
+    └── 是 → Fluentd
+
+容器化环境、K8s 部署？
+    └── 是 → Vector 或 Filebeat
+
+运维团队熟悉 ELK？
+    └── 是 → Filebeat
+
+不确定 / 混合需求？
+    └── → Vector（长期趋势）
+```
+
+## 性能对比数据
+
+| 采集器 | 吞吐量（MB/s） | CPU 使用率 | 内存占用 |
+|---|---|---|---|
+| **Vector** | 150+ | 低 | ~50MB |
+| **Filebeat** | 80+ | 中 | ~150MB |
+| **Fluentd** | 30-50 | 中-高 | ~200-500MB |
+
+数据来源：Vector 官方 benchmark，在 4 核 8GB 机器上测试。
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. Filebeat、Fluentd、Vector 三种采集器在「性能」和「插件生态」两个维度上各有什么优势？
+2. 为什么说 Vector 适合「存储成本敏感」的场景？它在资源占用上的优势来自哪里？
+3. 在什么情况下应该选择 Fluentd 而不是 Filebeat？多目标路由是典型的什么场景？
+4. 三种采集器在 Kubernetes 部署上的配置有什么共同点和差异？
+5. 如果当前使用 Fluentd 遇到了性能瓶颈（CPU 高、内存泄漏），迁移到 Vector 的代价和收益是什么？

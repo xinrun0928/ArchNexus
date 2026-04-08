@@ -1,0 +1,307 @@
+---
+description: 黄金指标（Golden Signals）：延迟、流量、错误、饱和度
+---
+
+# 黄金指标（延迟 / 流量 / 错误 / 饱和度）
+
+2017 年，Google SRE 团队在《Site Reliability Engineering》一书中提出了**黄金指标（Golden Signals）**概念。四个简单的问题：用户访问慢不慢（Latency）、系统忙不忙（Traffic）、有没有出错（Errors）、有没有快撑不住（Saturation）。这四个指标，覆盖了服务健康状况的 80%。
+
+为什么黄金指标重要？因为它解决了「该监控什么」这个问题。很多团队的监控是「看到什么加什么」，结果监控面板堆了几百个指标，但出问题的时候反而不知道该看哪个。黄金指标是一种**优先级框架**：先确保这四个指标能看准，再根据需要补充其他指标。
+
+## 四个黄金指标
+
+### 1. Latency（延迟）
+
+「这个请求花了多长时间？」这是用户最能感知到的指标。但「延迟」不是简单的一个数字——你需要的不是平均值，而是**分布**。
+
+平均值会说谎。想象一个系统：99% 的请求在 10ms 内完成，1% 的请求在 5 秒后才完成，平均延迟是 60ms，看起来还不错。但这 1% 的慢请求可能影响了数万个用户。
+
+**正确做法：使用分位数**。P50（Median）、P90、P99、P99.9 分别代表不同层次的慢请求。
+
+```yaml
+# P50：中位数，一半请求在此时间内完成
+histogram_quantile(0.50,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# P99：99% 请求在此时间内完成
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# 按服务维度分解 P99
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+)
+```
+
+延迟监控还需要注意**区分成功和失败**。系统故障时，错误请求往往返回得很快（立即失败），如果把快错和慢对混在一起统计，会掩盖真实问题。
+
+```yaml
+# 正确：按 HTTP 状态码分组，错误和成功的延迟分开看
+# 正常请求的 P99（200/201）
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket{status=~"2.."}[5m])) by (le)
+)
+
+# 错误请求的 P99（5xx）
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket{status=~"5.."}[5m])) by (le)
+)
+```
+
+### 2. Traffic（流量）
+
+「系统正在处理多少请求？」流量指标反映的是系统负载，可以用来判断系统是否接近容量上限、是否有异常流量涌入。
+
+```yaml
+# 每秒请求数（QPS）
+sum(rate(http_requests_total[5m]))
+
+# 按服务维度分解 QPS
+sum(rate(http_requests_total[5m])) by (service)
+
+# 按 HTTP 方法和状态码分解
+sum(rate(http_requests_total[5m])) by (method, status)
+```
+
+流量监控的核心价值在于**容量规划**和**异常检测**：
+
+- 流量突然飙高 → 可能是 CC 攻击或突发热点事件
+- 流量持续下降 → 可能是依赖服务不可用、接口异常或外部流量流失
+- 流量周期性波动 → 帮你在高峰期前做好扩容准备
+
+### 3. Errors（错误）
+
+「请求中有多少失败了？」错误率的微小变化可能意味着重大故障。错误率从 0.1% 上升到 1%，看起来只有 0.9% 的差距，但如果是 10 万 QPS 的系统，每分钟就多了 9000 个错误请求。
+
+```yaml
+# HTTP 5xx 错误率
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+
+# 按错误类型分解
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (status, service)
+
+# 服务端返回的 4xx 客户端错误（可能是恶意请求或参数问题）
+sum(rate(http_requests_total{status=~"4.."}[5m])) by (uri)
+```
+
+**错误监控需要区分不同的错误类型**：
+
+| 错误类型 | 含义 | 处理策略 |
+|---|---|---|
+| **5xx 服务端错误** | 服务端故障，需要立即关注 | 告警 + 自动扩容 |
+| **4xx 客户端错误** | 可能是恶意请求或客户端 bug | 监控趋势，不立即告警 |
+| **超时（无响应）** | 可能是依赖服务挂了 | 特殊告警 |
+| **熔断打开** | 依赖服务不可用，降级中 | 警告，排查依赖服务 |
+
+### 4. Saturation（饱和度）
+
+「系统的各个资源有多满？」延迟飙升、流量下降，往往是因为某个资源被耗尽了。饱和度是故障的先行指标——在系统真正崩溃前，饱和度会提前发出信号。
+
+```yaml
+# CPU 使用率
+100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance))
+
+# 内存使用率
+node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+
+# 磁盘使用率
+100 * (1 - node_filesystem_avail_bytes / node_filesystem_size_bytes)
+
+# 服务端队列积压（连接池满、线程池满）
+jvm_threads_state{state="RUNNABLE", application="order-service"}
+```
+
+饱和度监控的关键是**关注资源瓶颈而非总量**。比如 CPU 使用率 80% 不一定是问题，但如果你的线程池队列已经积压了 10000 个待处理任务，这才是真正的饱和。
+
+```yaml
+# 综合延迟和饱和度的告警规则
+# 当 P99 延迟 > 500ms 且队列积压 > 100 时告警
+(
+    histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
+)
+and
+(
+    sum(jvm_queues_pending{type="thread-pool"}[5m]) > 100
+)
+```
+
+## 黄金指标的采集设计
+
+### 设计原则
+
+1. **标签层级要合理**：`service`、`endpoint`、`status` 是必须有的标签，`instance`、`pod` 用于定位
+2. **错误和成功的指标分开**：避免慢错被快对拉平
+3. **延迟用 Histogram 记录分位数**：而不是 Summary（Summary 无法二次聚合）
+4. **饱和度要选对资源**：不同服务的瓶颈不同，Web 服务看 CPU + 连接池，IO 密集型看磁盘和网络
+
+### 推荐的黄金指标埋点
+
+```java title="GoldenSignalsCollector.java"
+@Service
+public class GoldenSignalsCollector {
+
+    private final Meter meter;
+
+    // 延迟分布（Histogram）
+    private final DoubleHistogram latencyHistogram;
+
+    // 请求计数器
+    private final LongCounter requestCounter;
+
+    // 错误计数器
+    private final LongCounter errorCounter;
+
+    // 饱和度仪表
+    private final LongUpDownCounter activeRequests;
+
+    public GoldenSignalsCollector(Meter meter) {
+        this.meter = meter;
+
+        this.latencyHistogram = meter.histogramBuilder("http_request_duration_seconds")
+            .setDescription("HTTP 请求延迟分布")
+            .setUnit("s")
+            .ofLongs()
+            .setExplicitBucketBoundariesAdvice(
+                List.of(5L, 10L, 25L, 50L, 100L, 250L, 500L, 1000L, 2500L, 5000L, 10000L))
+            .build();
+
+        this.requestCounter = meter.counterBuilder("http_requests_total")
+            .setDescription("HTTP 请求总数")
+            .setUnit("1")
+            .build();
+
+        this.errorCounter = meter.counterBuilder("http_errors_total")
+            .setDescription("HTTP 错误总数")
+            .setUnit("1")
+            .build();
+
+        this.activeRequests = meter.upDownCounterBuilder("http_active_requests")
+            .setDescription("当前活跃的 HTTP 请求数")
+            .setUnit("1")
+            .ofLongs()
+            .build();
+    }
+
+    public void recordRequest(String method, String uri, int status, long durationMs) {
+        Attributes baseAttrs = Attributes.of(
+            AttributeKey.stringKey("http.method"), method,
+            AttributeKey.stringKey("http.uri"), uri,
+            AttributeKey.longKey("http.status_code"), (long) status
+        );
+
+        // 记录延迟（毫秒转秒）
+        latencyHistogram.record(durationMs, baseAttrs);
+
+        // 计数器 +1
+        requestCounter.add(1, baseAttrs);
+
+        // 如果是 5xx 错误，错误计数器 +1
+        if (status >= 500) {
+            Attributes errorAttrs = Attributes.of(
+                AttributeKey.stringKey("http.method"), method,
+                AttributeKey.stringKey("http.uri"), uri,
+                AttributeKey.longKey("http.status_code"), (long) status
+            );
+            errorCounter.add(1, errorAttrs);
+        }
+    }
+
+    public void requestStarted() {
+        activeRequests.add(1);
+    }
+
+    public void requestEnded() {
+        activeRequests.add(-1);
+    }
+}
+```
+
+## 黄金指标的告警配置
+
+```yaml title="prometheus-alerts.yml"
+groups:
+  - name: golden-signals
+    rules:
+      # 延迟告警
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+          ) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "服务 {{ $labels.service }} P99 延迟超过 1 秒"
+          description: "当前 P99 延迟 {{ $value | humanizeDuration }}"
+
+      - alert: CriticalLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+          ) > 5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "服务 {{ $labels.service }} P99 延迟超过 5 秒"
+
+      # 错误率告警
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          /
+          sum(rate(http_requests_total[5m])) by (service)
+          > 0.01
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "服务 {{ $labels.service }} 错误率超过 1%"
+
+      # 饱和度告警
+      - alert: HighCPUSaturation
+        expr: |
+          100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance))
+          > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "服务器 {{ $labels.instance }} CPU 使用率超过 80%"
+
+      - alert: HighMemorySaturation
+        expr: |
+          100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+          > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "服务器 {{ $labels.instance }} 内存使用率超过 85%"
+```
+
+## 黄金指标的局限性
+
+黄金指标是**服务级别的监控框架**，但它不够全面。以下场景需要补充：
+
+- **数据库健康**：连接池使用率、查询延迟、慢查询数量
+- **消息队列**：积压消息数、消费延迟、生产速率
+- **缓存**：命中率、内存使用率、驱逐率
+- **业务指标**：下单量、转化率、支付成功率
+
+这些补充指标不是「黄金指标」，但对于特定业务场景同样关键。
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. 为什么说「平均延迟」会说谎？应该用什么指标来正确衡量延迟？
+2. 黄金指标的告警配置中，`for: 2m` 字段的作用是什么？为什么不能去掉？
+3. 在延迟监控中，为什么建议将成功请求和错误请求的延迟分开统计？
+4. 饱和度监控中，为什么说「CPU 80% 不一定是问题」？什么情况下才是真正的问题？
+5. 黄金指标是否足够覆盖所有监控需求？在什么场景下需要补充其他指标？

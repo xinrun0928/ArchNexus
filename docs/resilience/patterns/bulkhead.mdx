@@ -1,0 +1,227 @@
+---
+description: 舱壁隔离模式（Bulkhead）
+---
+
+# 舱壁隔离模式（Bulkhead）
+
+舱壁隔离是保护系统不被局部故障拖垮的关键模式。
+
+船舱设计中有「舱壁」的概念：当一个船舱漏水时，舱壁可以阻止水流入其他船舱，防止整艘船沉没。舱壁隔离模式用同样的思路保护软件系统：当一个依赖服务故障时，隔离它对其他服务的影响。
+
+## 舱壁隔离的核心思想
+
+```mermaid
+flowchart LR
+    subgraph 无隔离（危险）
+        A["服务 A"] --> B["线程池 1（共享）"]
+        B --> C["服务 C"]
+        A --> B
+        D["服务 D"] --> B
+        D --> C
+        Note over B: 一个服务耗尽线程池\n其他服务都受影响
+    end
+
+    subgraph 有隔离（安全）
+        E["服务 A"] --> F["线程池 1（A 专用）"]
+        G["服务 D"] --> H["线程池 2（D 专用）"]
+        F --> I["服务 C"]
+        H --> I
+        Note over F,H: 每个服务独立线程池\n互不影响
+    end
+```
+
+## 舱壁隔离的场景
+
+### 场景一：多个依赖服务
+
+```java title="MultiServiceBulkhead.java"
+@Service
+public class OrderService {
+
+    // 每个依赖服务有独立的线程池
+    private final ExecutorService userServicePool;
+    private final ExecutorService productServicePool;
+    private final ExecutorService paymentServicePool;
+
+    public OrderService() {
+        this.userServicePool = Executors.newFixedThreadPool(10);
+        this.productServicePool = Executors.newFixedThreadPool(10);
+        this.paymentServicePool = Executors.newFixedThreadPool(5);
+    }
+
+    public Order createOrder(Long userId, Long productId) {
+        // 用户服务调用
+        User user = CompletableFuture.supplyAsync(
+            () -> userService.getUser(userId),
+            userServicePool
+        ).join();
+
+        // 商品服务调用
+        Product product = CompletableFuture.supplyAsync(
+            () -> productService.getProduct(productId),
+            productServicePool
+        ).join();
+
+        // 支付服务调用
+        PaymentResult payment = CompletableFuture.supplyAsync(
+            () -> paymentService.process(userId, product.getPrice()),
+            paymentServicePool
+        ).join();
+
+        return new Order(user, product, payment);
+    }
+}
+```
+
+### 场景二：核心和非核心功能隔离
+
+```java title="CoreVsNonCore.java"
+@Service
+public class ProductService {
+
+    // 核心功能线程池：保证资源
+    private final ExecutorService corePool =
+        Executors.newFixedThreadPool(20);
+
+    // 非核心功能线程池：限制资源
+    private final ExecutorService nonCorePool =
+        Executors.newFixedThreadPool(5);
+
+    public ProductDetail getProductDetail(Long productId) {
+        // 核心功能：使用核心线程池
+        Product product = CompletableFuture.supplyAsync(
+            () -> getProduct(productId),
+            corePool
+        ).join();
+
+        // 非核心功能：使用非核心线程池
+        CompletableFuture.supplyAsync(
+            () -> recordView(productId),
+            nonCorePool
+        );
+
+        return new ProductDetail(product);
+    }
+}
+```
+
+## Resilience4j 舱壁隔离
+
+### Semaphore Bulkhead（信号量舱壁）
+
+```java title="SemaphoreBulkhead.java"
+@Service
+public class SemaphoreBulkheadService {
+
+    private final Bulkhead bulkhead;
+
+    public SemaphoreBulkheadService() {
+        this.bulkhead = Bulkhead.of("payment-service",
+            BulkheadConfig.custom()
+                .maxConcurrentCalls(10)     // 最大并发调用数
+                .maxWaitDuration(Duration.ofMillis(100))  // 等待超时
+                .build());
+    }
+
+    public PaymentResult pay(PaymentRequest request) {
+        return Decorators.ofSupplier(() -> paymentClient.process(request))
+            .withBulkhead(bulkhead)
+            .withFallback(List.of(BulkheadFullException.class),
+                e -> PaymentResult.degraded("系统繁忙"))
+            .decorate()
+            .get();
+    }
+}
+```
+
+### ThreadPool Bulkhead（线程池舱壁）
+
+```java title="ThreadPoolBulkhead.java"
+@Service
+public class ThreadPoolBulkheadService {
+
+    private final BulkheadRegistry registry;
+
+    public ThreadPoolBulkheadService() {
+        BulkheadConfig config = BulkheadConfig.custom()
+            .maxConcurrentCalls(10)
+            .maxWaitDuration(Duration.ofMillis(100))
+            .build();
+
+        this.registry = BulkheadRegistry.of(config);
+    }
+
+    public CompletableFuture<PaymentResult> payAsync(PaymentRequest request) {
+        Bulkhead bulkhead = registry.bulkhead("payment-service");
+
+        return Decorators.ofFuture(() ->
+                CompletableFuture.supplyAsync(
+                    () -> paymentClient.process(request)))
+            .withBulkhead(bulkhead)
+            .withFallback(List.of(BulkheadFullException.class),
+                e -> CompletableFuture.completedFuture(
+                    PaymentResult.degraded("系统繁忙")))
+            .decorate()
+            .get();
+    }
+}
+```
+
+## 舱壁隔离配置
+
+### 线程池配置
+
+```yaml title="thread-pool-config.yml"
+# 线程池配置
+executors:
+  # 用户服务：稳定，资源充足
+  user-service:
+    core_pool_size: 10
+    max_pool_size: 20
+    queue_capacity: 100
+
+  # 支付服务：关键，需要快速响应
+  payment-service:
+    core_pool_size: 5
+    max_pool_size: 10
+    queue_capacity: 50
+
+  # 推荐服务：非关键，可限制
+  recommendation-service:
+    core_pool_size: 2
+    max_pool_size: 5
+    queue_capacity: 20
+```
+
+## 舱壁隔离 vs 熔断器
+
+| 模式 | 作用 | 防护对象 |
+| --- | --- | --- |
+| **舱壁隔离** | 限制并发数 | 防止资源耗尽 |
+| **熔断器** | 快速失败 | 防止故障传播 |
+
+两者互补，配合使用效果更好：
+
+```java title="BulkheadAndCircuitBreaker.java"
+public Result callService() {
+    Bulkhead bulkhead = Bulkhead.of("service",
+        BulkheadConfig.custom().maxConcurrentCalls(10).build());
+    CircuitBreaker circuitBreaker = CircuitBreaker.of("service",
+        CircuitBreakerConfig.custom().failureRateThreshold(50).build());
+
+    return Decorators.ofSupplier(() -> service.call())
+        .withBulkhead(bulkhead)          // 第一层：限制并发
+        .withCircuitBreaker(circuitBreaker)  // 第二层：防止故障传播
+        .decorate()
+        .get();
+}
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **舱壁隔离限制每个依赖的并发数**：防止一个依赖耗尽所有资源
+2. **每个依赖服务应该独立线程池**：互不影响
+3. **核心和非核心功能要隔离**：保证核心功能资源
+4. **舱壁隔离和熔断器配合使用**：限制并发 + 防止故障传播

@@ -1,0 +1,312 @@
+---
+description: RED 方法：速率/错误/延迟——面向微服务的指标方法论
+---
+
+# RED 方法（速率 / 错误 / 延迟）
+
+Google 提出了用于基础设施监控的 **USE 方法**，但对于面向用户的**微服务 API**，Netflix 提出了更适合的 **RED 方法**。
+
+两种方法的核心区别在于：**USE 关注资源（CPU/内存/磁盘），RED 关注服务（请求/错误/延迟）**。基础设施团队用 USE 发现资源瓶颈，SRE 团队用 RED 衡量服务对用户的影响。
+
+## RED 方法概述
+
+| 字母 | 全称 | 说明 | 回答的问题 |
+|---|---|---|---|
+| **R** | Rate | 请求速率 | 「服务有多忙？」 |
+| **E** | Errors | 错误率 | 「服务有多可靠？」 |
+| **D** | Duration | 请求延迟 | 「用户体验有多好？」 |
+
+```yaml
+# RED 三指标：基础 PromQL 查询
+
+# Rate：每秒请求数（QPS）
+sum(rate(http_requests_total[5m])) by (service)
+
+# Errors：错误率（5xx）
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+/
+sum(rate(http_requests_total[5m])) by (service)
+
+# Duration：P99 延迟
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+)
+```
+
+## Rate（请求速率）
+
+### 什么是 Rate
+
+Rate 是服务处理的**每秒请求数（QPS）**。它反映了服务的负载水平。
+
+### 监控价值
+
+- **容量规划**：QPS 是扩缩容的核心依据
+- **异常检测**：QPS 突然下降可能意味着服务不可达
+- **AB 测试**：不同版本的 QPS 对比
+
+### 维度分解
+
+```yaml
+# 按服务总 QPS
+sum(rate(http_requests_total[5m])) by (service)
+
+# 按 HTTP 方法分解
+sum(rate(http_requests_total[5m])) by (method, service)
+
+# 按端点分解
+sum(rate(http_requests_total[5m])) by (endpoint, service)
+
+# 按状态码分解
+sum(rate(http_requests_total[5m])) by (status, service)
+
+# 组合：服务 + 方法 + 状态
+sum(rate(http_requests_total[5m])) by (service, method, status)
+```
+
+### 告警规则
+
+```yaml title="prometheus-alerts.yml"
+- alert: ServiceLowQPS
+  expr: |
+    sum(rate(http_requests_total[5m])) by (service)
+    < 10
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "服务 {{ $labels.service }} QPS 异常低"
+    description: "当前 QPS {{ $value }}，可能存在服务不可达或流量异常"
+
+- alert: ServiceHighQPS
+  expr: |
+    sum(rate(http_requests_total[5m])) by (service)
+    > 10000
+  for: 5m
+  labels:
+    severity: info
+  annotations:
+    summary: "服务 {{ $labels.service }} QPS 较高，请关注容量"
+```
+
+## Errors（错误率）
+
+### 什么是 Errors
+
+错误率是**失败请求占总请求的比例**。不同类型错误有不同的含义：
+
+| HTTP 状态码 | 类型 | 含义 |
+|---|---|---|
+| **2xx** | 成功 | 正常处理 |
+| **4xx** | 客户端错误 | 请求本身有问题（参数错误、认证失败等） |
+| **5xx** | 服务端错误 | 服务器处理失败（内部错误、下游超时） |
+| **超时** | 无响应 | 服务无响应（可能是被限流或崩溃） |
+
+### 错误率计算
+
+```yaml
+# HTTP 5xx 错误率（最关键）
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+/
+sum(rate(http_requests_total[5m])) by (service)
+
+# 按错误类型细分
+sum(rate(http_requests_total{status="500"}[5m])) by (service)   # 内部错误
+sum(rate(http_requests_total{status="502"}[5m])) by (service)   # 网关错误
+sum(rate(http_requests_total{status="503"}[5m])) by (service)   # 服务不可用
+sum(rate(http_requests_total{status="504"}[5m])) by (service)   # 网关超时
+
+# 4xx 错误率（可能表示客户端问题）
+sum(rate(http_requests_total{status=~"4.."}[5m])) by (service)
+/
+sum(rate(http_requests_total[5m])) by (service)
+```
+
+### 告警规则
+
+```yaml title="prometheus-alerts.yml"
+- alert: HighErrorRate
+  expr: |
+    sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+    /
+    sum(rate(http_requests_total[5m])) by (service)
+    > 0.01
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: "服务 {{ $labels.service }} 错误率超过 1%"
+
+- alert: CriticalErrorRate
+  expr: |
+    sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+    /
+    sum(rate(http_requests_total[5m])) by (service)
+    > 0.05
+  for: 1m
+  labels:
+    severity: page
+  annotations:
+    summary: "服务 {{ $labels.service }} 错误率超过 5%，请立即处理"
+```
+
+### 错误率 vs 错误数量
+
+```yaml
+# ❌ 错误：用绝对数量做告警
+# 不同服务的流量差异巨大，阈值无法统一
+http_errors_total > 100
+
+# ✅ 正确：用错误率做告警
+# 1% 错误率在 100 QPS 和 10000 QPS 下代表不同含义
+# 但两者都是 1%，都需要关注
+error_rate > 0.01
+```
+
+## Duration（请求延迟）
+
+### 什么是 Duration
+
+Duration 是**单个请求的响应时间**。和 Rate/Errors 不同，延迟不是单一数值，而是**分布**。
+
+### 分位数选择
+
+| 分位数 | 含义 | 适用场景 |
+|---|---|---|
+| **P50（中位数）** | 一半请求在此时间内完成 | 了解基准延迟 |
+| **P90** | 90% 请求在此时间内完成 | 设置合理的 SLO |
+| **P95** | 95% 请求在此时间内完成 | 常见 SLO 标准 |
+| **P99** | 99% 请求在此时间内完成 | 严格 SLO，追求用户体验 |
+| **P99.9** | 99.9% 请求在此时间内完成 | 极其严格的 SLO |
+
+```yaml
+# 多分位数查询
+histogram_quantile(0.50,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+histogram_quantile(0.95,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+histogram_quantile(0.999,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+```
+
+### 延迟监控的关键点
+
+**一、区分成功和失败**。错误请求往往返回很快（立即失败），如果把快错和慢对混在一起统计，会掩盖真实的慢请求：
+
+```yaml
+# ✅ 正确：分开统计成功和失败的延迟
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket{status=~"2.."}[5m])) by (le))
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket{status=~"5.."}[5m])) by (le))
+```
+
+**二、按接口分解**。不同接口的延迟基线不同，混在一起统计无法看出问题：
+
+```yaml
+# 按端点分解 P99
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))
+```
+
+**三、考虑尾延迟**。P99 正常不代表所有用户都正常。P99.9 可能更能反映问题：
+
+```yaml
+# 如果 P99 正常但 P99.9 很高，说明有少量请求特别慢
+# 这可能是慢查询、连接池耗尽等问题的信号
+histogram_quantile(0.999,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+  > 2
+and
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+  < 0.5
+```
+
+### 告警规则
+
+```yaml title="prometheus-alerts.yml"
+- alert: HighLatencyP99
+  expr: |
+    histogram_quantile(0.99,
+      sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+    ) > 1
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "服务 {{ $labels.service }} P99 延迟超过 1 秒"
+
+- alert: LatencyRegression
+  expr: |
+    # P99 延迟相比 1 小时前上升超过 50%
+    histogram_quantile(0.99,
+      sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+    )
+    /
+    histogram_quantile(0.99,
+      sum(rate(http_request_duration_seconds_bucket[5m] offset 1h)) by (le, service)
+    )
+    > 1.5
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "服务 {{ $labels.service }} P99 延迟相比 1 小时前上升超过 50%"
+```
+
+## RED 方法的完整仪表盘
+
+```json title="Grafana RED 仪表盘 JSON"
+{
+  "title": "RED 方法仪表盘",
+  "panels": [
+    {
+      "title": "QPS（Rate）",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m])) by (service)",
+          "legendFormat": "&#123;&#123;service&#125;&#125;"
+        }
+      ]
+    },
+    {
+      "title": "错误率（Errors）",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "100 * sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (service) / sum(rate(http_requests_total[5m])) by (service)",
+          "legendFormat": "&#123;&#123;service&#125;&#125; 5xx 错误率"
+        }
+      ]
+    },
+    {
+      "title": "延迟分布（Duration）",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))",
+          "legendFormat": "&#123;&#123;service&#125;&#125; P50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))",
+          "legendFormat": "&#123;&#123;service&#125;&#125; P99"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. RED 方法和 USE 方法的核心区别是什么？为什么说 RED 更适合微服务 API 监控？
+2. 在错误率监控中，为什么 4xx 和 5xx 需要分开监控？它们分别反映什么问题？
+3. 在延迟监控中，为什么建议将成功请求和错误请求的延迟分开统计？
+4. 为什么说「P99 正常不代表所有用户都正常」？P99.9 在什么场景下更重要？
+5. RED 方法的三个指标（Rate/Errors/Duration）分别对应用户感知到的什么体验？

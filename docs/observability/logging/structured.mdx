@@ -1,0 +1,418 @@
+---
+description: 结构化日志（Structured Logging）：Logback JSON 配置与最佳实践
+---
+
+# 结构化日志（Structured Logging）
+
+非结构化日志就像一本没有目录的书——你知道内容在里面，但找起来像大海捞针。结构化日志则是为这本书加上了索引和目录——你可以按「章节」「关键词」「时间」精确找到任何内容。
+
+结构化日志不是简单地把日志改成 JSON 格式，它是**一套日志规范**，包括：字段命名约定、日志内容设计、关联机制建立、以及配套的采集和查询工具链。
+
+## 结构化日志的设计原则
+
+### 原则一：字段命名标准化
+
+如果每个服务的日志字段名各不相同，查询就变成了一场「字段名猜谜游戏」：
+
+```
+service="order-service" → orderId
+service="payment-service" → Order_ID
+service="inventory-service" → order_id
+```
+
+统一字段命名约定至关重要。推荐参考 OpenTelemetry Semantic Conventions：
+
+| 字段 | 说明 | 示例 |
+|---|---|---|
+| `timestamp` | ISO 8601 格式的时间戳 | `2026-04-08T10:23:45.123Z` |
+| `level` | 日志级别 | `INFO`、`WARN`、`ERROR` |
+| `service` | 服务名称 | `order-service` |
+| `traceId` | 链路追踪 ID | `d3f8a2c1e4b74f92` |
+| `spanId` | 当前 Span ID | `b7ad6b7169203331` |
+| `message` | 日志消息 | `Order placed` |
+| `error` | 错误信息 | `Connection timeout` |
+| `exception` | 异常堆栈（JSON 格式） | `{...}` |
+
+### 原则二：消息内容结构化
+
+错误的做法：
+
+```java
+log.info("User {} placed order {} with amount {} using payment method {}",
+    userId, orderId, amount, paymentMethod);
+```
+
+输出的日志是：`User 10086 placed order 884321 with amount 299.00 using payment method credit_card`
+
+这种日志**不可查询、不可过滤、不可聚合**。
+
+正确的做法：
+
+```java
+log.info("Order placed");
+```
+
+同时通过 MDC 或直接调用 Logger 的重载方法传递结构化数据：
+
+```java
+log.info("Order placed",
+    Attributes.of(
+        AttributeKey.stringKey("userId"), userId,
+        AttributeKey.stringKey("orderId"), orderId,
+        AttributeKey.doubleKey("amount"), amount,
+        AttributeKey.stringKey("paymentMethod"), paymentMethod
+    ));
+```
+
+输出的日志是：
+
+```json
+{
+  "message": "Order placed",
+  "userId": "10086",
+  "orderId": "884321",
+  "amount": 299.00,
+  "paymentMethod": "credit_card"
+}
+```
+
+### 原则三：上下文链路化
+
+所有日志必须包含 TraceID 和 SpanID，这是关联分析的基础。如果日志中没有 TraceID，同一个请求在不同服务中的日志就是孤立的数据点。
+
+## Logback JSON 配置实战
+
+### 完整配置示例
+
+```xml title="logback-spring.xml"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Spring Boot 默认配置 -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <property name="LOG_FILE" value="${LOG_FILE:-${LOG_PATH:-${LOG_TEMP:-${java.io.tmpdir:-/tmp}}}/spring.log}"/>
+
+    <!-- ==================== 自定义字段 ==================== -->
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="unknown"/>
+    <springProperty scope="context" name="HOSTNAME" source="HOSTNAME" defaultValue="unknown"/>
+    <springProperty scope="context" name="ENV" source="spring.profiles.active" defaultValue="unknown"/>
+
+    <!-- ==================== JSON 日志编码器 ==================== -->
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+        <!-- 时间戳格式 -->
+        <timeZone>UTC</timeZone>
+
+        <!-- 自定义字段（静态） -->
+        <customFields>{"service":"${APP_NAME}","environment":"${ENV}","hostname":"${HOSTNAME}"}</customFields>
+
+        <!-- MDC 中需要包含的字段 -->
+        <includeMdcKeyName>traceId</includeMdcKeyName>
+        <includeMdcKeyName>spanId</includeMdcKeyName>
+        <includeMdcKeyName>userId</includeMdcKeyName>
+        <includeMdcKeyName>orderId</includeMdcKeyName>
+        <includeMdcKeyName>requestId</includeMdcKeyName>
+
+        <!-- 字段重命名（驼峰转蛇形） -->
+        <fieldNames>
+            <timestamp>@timestamp</timestamp>
+            <version>[ignore]</version>
+            <levelValue>[ignore]</levelValue>
+        </fieldNames>
+
+        <!-- 异常堆栈格式化 -->
+        <throwableConverter class="net.logstash.logback.stacktrace.ShortenedThrowableConverter">
+            <maxDepthPerThrowable>30</maxDepthPerThrowable>
+            <maxLength>2048</maxLength>
+            <shortenedClassNameLength>20</shortenedClassNameLength>
+            <exclude>sun\..*</exclude>
+            <exclude>java\.lang\.Thread</exclude>
+            <rootCauseFirst>true</rootCauseFirst>
+        </throwableConverter>
+    </encoder>
+</configuration>
+```
+
+### 分环境配置
+
+生产环境需要更高的吞吐量和更低的资源消耗。异步日志 + JSON 输出是标准配置：
+
+```xml title="logback-spring.xml（完整配置）"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="unknown"/>
+    <springProperty scope="context" name="ENV" source="spring.profiles.active" defaultValue="unknown"/>
+
+    <!-- ==================== Console Appender（开发环境）==================== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service":"${APP_NAME}"}</customFields>
+            <includeMdcKeyName>traceId</includeMdcKeyName>
+            <includeMdcKeyName>spanId</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <!-- ==================== Async Appender（生产环境）==================== -->
+    <appender name="ASYNC_CONSOLE" class="ch.qos.logback.classic.AsyncAppender">
+        <queueSize>4096</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <includeCallerData>false</includeCallerData>
+        <appender-ref ref="CONSOLE"/>
+    </appender>
+
+    <!-- ==================== File Appender（日志文件）==================== -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_FILE}</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_FILE}.%d{yyyy-MM-dd}.%i.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service":"${APP_NAME}"}</customFields>
+            <includeMdcKeyName>traceId</includeMdcKeyName>
+            <includeMdcKeyName>spanId</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 环境分配置 ==================== -->
+    <springProfile name="dev">
+        <root level="DEBUG">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+        <logger name="org.springframework" level="INFO"/>
+        <logger name="org.hibernate" level="INFO"/>
+    </springProfile>
+
+    <springProfile name="prod">
+        <root level="INFO">
+            <appender-ref ref="ASYNC_CONSOLE"/>
+            <appender-ref ref="FILE"/>
+        </root>
+        <!-- 生产环境减少框架日志 -->
+        <logger name="org.springframework" level="WARN"/>
+        <logger name="org.hibernate" level="WARN"/>
+        <logger name="org.apache.catalina" level="WARN"/>
+        <logger name="org.apache.tomcat" level="WARN"/>
+    </springProfile>
+</configuration>
+```
+
+## 业务日志的设计规范
+
+### 场景一：HTTP 请求日志
+
+```java title="HttpRequestLoggingFilter.java"
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class HttpRequestLoggingFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain)
+            throws ServletException, IOException {
+
+        // 提取或生成 TraceID
+        String traceId = request.getHeader("traceparent");
+        if (traceId == null) {
+            traceId = UUID.randomUUID().toString().replace("-", "");
+        }
+
+        // 放入 MDC
+        MDC.put("traceId", traceId);
+        MDC.put("requestUri", request.getRequestURI());
+        MDC.put("httpMethod", request.getMethod());
+        MDC.put("clientIp", getClientIp(request));
+
+        long startTime = System.currentTimeMillis();
+
+        try {
+            filterChain.doFilter(request, response);
+
+            // 记录请求完成
+            int status = response.getStatus();
+            long duration = System.currentTimeMillis() - startTime;
+
+            if (status >= 500) {
+                log.error("HTTP request completed: status={}, duration={}ms",
+                    status, duration);
+            } else if (status >= 400) {
+                log.warn("HTTP request completed: status={}, duration={}ms",
+                    status, duration);
+            } else {
+                log.info("HTTP request completed: status={}, duration={}ms",
+                    status, duration);
+            }
+        } finally {
+            MDC.clear();
+        }
+    }
+}
+```
+
+### 场景二：数据库操作日志
+
+```java title="DatabaseLoggingAspect.java"
+@Aspect
+@Component
+@Slf4j
+public class DatabaseLoggingAspect {
+
+    @Around("execution(* org.springframework.jdbc.core.JdbcTemplate.*(..))")
+    public Object logQuery(ProceedingJoinPoint joinPoint) throws Throwable {
+        long start = System.currentTimeMillis();
+
+        String methodName = joinPoint.getSignature().getName();
+        Object[] args = joinPoint.getArgs();
+
+        log.debug("SQL query started: method={}, args={}", methodName, args);
+
+        try {
+            Object result = joinPoint.proceed();
+            long duration = System.currentTimeMillis() - start;
+
+            if (duration > 1000) {
+                log.warn("Slow query detected: method={}, duration={}ms",
+                    methodName, duration);
+            } else {
+                log.debug("SQL query completed: method={}, duration={}ms",
+                    methodName, duration);
+            }
+
+            return result;
+        } catch (Exception e) {
+            log.error("SQL query failed: method={}", methodName, e);
+            throw e;
+        }
+    }
+}
+```
+
+### 场景三：异常日志记录
+
+```java title="GlobalExceptionHandler.java"
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<?> handleBusinessException(BusinessException ex) {
+        // 业务异常：记录为 WARN（业务层面的预期外情况）
+        log.warn("Business exception: code={}, message={}, traceId={}",
+            ex.getCode(), ex.getMessage(), MDC.get("traceId"));
+
+        return ResponseEntity
+            .status(HttpStatus.BAD_REQUEST)
+            .body(Map.of(
+                "code", ex.getCode(),
+                "message", ex.getMessage(),
+                "traceId", MDC.get("traceId")
+            ));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<?> handleGenericException(Exception ex) {
+        // 系统异常：记录为 ERROR（需要关注）
+        String traceId = MDC.get("traceId");
+        log.error("System exception: message={}, traceId={}",
+            ex.getMessage(), traceId, ex);
+
+        return ResponseEntity
+            .status(HttpStatus.INTERNAL_SERVER_ERROR)
+            .body(Map.of(
+                "code", "SYSTEM_ERROR",
+                "message", "An unexpected error occurred",
+                "traceId", traceId
+            ));
+    }
+}
+```
+
+## 结构化日志的查询（LogQL / KQL）
+
+### Loki LogQL 示例
+
+```yaml
+# 基础查询：按服务过滤
+{service="order-service"}
+
+# 按级别过滤
+{service="order-service", level="error"}
+
+# 全文搜索
+{service="order-service"} |= "Payment failed"
+
+# 按 TraceID 关联
+{service=~"order-service|payment-service"} | json | traceId="d3f8a2c1"
+
+# 统计错误分布
+{service="order-service", level="error"}
+  | json
+  | line_format "&#123;&#123;.message&#125;&#125; &#123;&#123;.error&#125;&#125;"
+  | stats count_over_time() by (error)
+
+# 分析慢请求日志
+{service="order-service"}
+  | json
+  | duration_ms > 5000
+  | line_format "TRACE: &#123;&#123;.traceId&#125;&#125; | DURATION: &#123;&#123;.duration_ms&#125;&#125;ms | &#123;&#123;.message&#125;&#125;"
+```
+
+### Elasticsearch KQL 示例
+
+```kql
+# 按服务过滤
+service: "order-service"
+
+# 复合查询
+service: "order-service" AND level: "error" AND traceId: "d3f8a2c1"
+
+# 错误信息搜索
+message: "Payment failed" AND amount: [100 TO 1000]
+
+# 聚合分析
+terms aggregation on error field
+```
+
+## 常见反模式
+
+**反模式一：日志变成参数表**。不要把日志当成调试参数打印：
+
+```java
+// 错误：日志变成了参数表
+log.info("method={}, param1={}, param2={}, param3={}", a, b, c, d);
+
+// 正确：只记录关键业务信息
+log.info("Order created: orderId={}, amount={}", orderId, amount);
+```
+
+**反模式二：敏感信息不脱敏**。日志中的密码、Token、手机号等敏感信息必须脱敏：
+
+```java
+// 错误：敏感信息未脱敏
+log.info("User login: userId={}, password={}", userId, password);
+
+// 正确：脱敏处理
+log.info("User login: userId={}, hasPassword=true", userId);
+```
+
+**反模式三：异常日志只记录 Message**。异常堆栈是排查问题的关键，不能省略：
+
+```java
+// 错误：只记录消息，丢失堆栈
+log.error("Payment failed: " + e.getMessage());
+
+// 正确：记录完整异常
+log.error("Payment failed", e);
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. 结构化日志的三个核心设计原则是什么？每个原则解决了什么问题？
+2. Logback AsyncAppender 在生产环境中为什么必须使用？它的核心参数有哪些？
+3. MDC（Mapped Diagnostic Context）在结构化日志中扮演什么角色？为什么 finally 块中要调用 `MDC.clear()`？
+4. 结构化日志的查询场景有哪些？LogQL 和 KQL 的查询语法有什么区别？
+5. 日志脱敏的正确做法是什么？有哪些常见的脱敏场景？

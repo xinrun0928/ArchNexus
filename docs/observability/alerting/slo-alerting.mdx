@@ -1,0 +1,301 @@
+---
+description: SLO 报警设计：基于服务等级目标的现代告警方法论
+---
+
+# SLO 报警设计
+
+SLO（Service Level Objective）定义了用户对服务的期望质量。当实际质量低于 SLO 时，会消耗错误预算。SLO 报警的核心目标是：**在错误预算耗尽之前发出告警，让团队有足够时间响应**。
+
+但 SLO 报警不是简单地把「错误率 > SLO」配置成告警——那样的话，预算已经快耗尽时才会告警，错过了最佳干预时机。
+
+## SLO 的基础概念
+
+### SLO / SLA / SLI 的关系
+
+| 概念 | 定义 | 谁定义 | 示例 |
+|---|---|---|---|
+| **SLI** | 服务等级指标（实际测量值） | 系统测量 | 实际可用性 99.95% |
+| **SLO** | 服务等级目标（目标值） | 团队设定 | 目标可用性 99.9% |
+| **SLA** | 服务等级协议（承诺值） | 业务合同 | 合同承诺 99.5% |
+
+关系：**SLI `<=` SLO `<=` SLA**。SLO 是团队自己定的目标，比 SLA 更严格，给自己留安全余量。
+
+### 错误预算
+
+```
+SLO: 99.9%（每月）
+允许不可用时间 = 43.8 分钟/月
+
+错误预算 = 1 - SLO
+          = 1 - 0.999
+          = 0.001
+
+每月分钟数 = 30 × 24 × 60 = 43,200 分钟
+允许不可用分钟 = 43,200 × 0.001 = 43.2 分钟 ≈ 43.8 分钟
+```
+
+## SLO 报警的两类方法
+
+### 方法一：SLI 指标告警
+
+直接告警 SLI 低于 SLO：
+
+```yaml
+- alert: SLIBelowSLO
+  expr: |
+    1 - (
+      sum(rate(http_requests_total{status=~"2.."}[1h]))
+      /
+      sum(rate(http_requests_total[1h]))
+    ) < 0.999
+  for: 5m
+```
+
+**问题**：这种告警是「事后诸葛亮」——当 SLI 已经低于 SLO 时，预算已经在消耗了。
+
+### 方法二：燃烧率报警（推荐）
+
+燃烧率报警在预算消耗速度过快时触发，提供了更早的干预机会。
+
+**SLO 报警 = 燃烧率报警 + SLI 指标告警**
+
+```yaml
+groups:
+  - name: slo-alerting
+    rules:
+      # 第一道防线：燃烧率报警（提前告警）
+      - alert: SLOBurnRateCritical
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total[1h]))
+          )
+          > 0.001 * 14.4  # 超过 SLO × 14.4 倍燃烧率
+        for: 5m
+
+      # 第二道防线：SLI 已经低于 SLO
+      - alert: SLIBelowSLO
+        expr: |
+          1 - (
+            sum(rate(http_requests_total{status=~"2.."}[1h]))
+            /
+            sum(rate(http_requests_total[1h]))
+          ) > 0.001
+        for: 5m
+
+      # 第三道防线：错误预算耗尽（立即行动）
+      - alert: ErrorBudgetExhausted
+        expr: |
+          # 当前消耗的预算占总预算的比例
+          sum(increase(http_requests_total{status=~"5.."}[30d]))
+          /
+          (sum(increase(http_requests_total[30d])) * 0.001)
+          > 1
+        for: 0m  # 立即触发
+```
+
+## SLO 定义与测量
+
+### 常见的 SLI 定义
+
+| SLI | 定义方式 | 适用场景 |
+|---|---|---|
+| **可用性** | `good / total` | 大部分服务 |
+| **延迟** | `fast / total`（P99 < 阈值） | 用户体验敏感的服务 |
+| **质量** | `(total - errors) / total` | API 服务 |
+
+### 可用性 SLI
+
+```yaml
+# 可用性 = 成功请求 / 总请求
+# 成功 = HTTP 2xx
+# 错误 = HTTP 5xx
+
+# 过去 5 分钟的可用性
+sum(rate(http_requests_total{status=~"2.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+
+# 过去 1 小时的可用性
+sum(increase(http_requests_total{status=~"2.."}[1h]))
+/
+sum(increase(http_requests_total[1h]))
+```
+
+### 延迟 SLI
+
+```yaml
+# 延迟 SLI = P99 < 1s 的请求 / 总请求
+# 这是一个「请求成功率」的变体
+
+sum(rate(http_request_duration_seconds_bucket{le="1"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count[5m]))
+```
+
+## 多层级 SLO
+
+### 按服务层级配置
+
+```yaml
+groups:
+  - name: multi-tier-slo
+    rules:
+      # 核心服务：最严格
+      - alert: CoreServiceBurnRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              service=~"gateway|order|payment"}[1h]))
+            /
+            sum(rate(http_requests_total{
+              service=~"gateway|order|payment"}[1h]))
+          )
+          > 0.0001 * 14.4  # 99.99% SLO
+        for: 5m
+
+      # 一般服务：标准
+      - alert: GeneralServiceBurnRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              service!~"gateway|order|payment"}[1h]))
+            /
+            sum(rate(http_requests_total{
+              service!~"gateway|order|payment"}[1h]))
+          )
+          > 0.001 * 14.4  # 99.9% SLO
+        for: 5m
+```
+
+### 按接口配置
+
+```yaml
+groups:
+  - name: endpoint-slo
+    rules:
+      # 写操作：更严格（数据一致性）
+      - alert: WriteEndpointBurnRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              endpoint=~"/api/.*(create|update|delete)"}[1h]))
+            /
+            sum(rate(http_requests_total{
+              endpoint=~"/api/.*(create|update|delete)"}[1h]))
+          )
+          > 0.0001 * 14.4
+        for: 5m
+
+      # 读操作：标准
+      - alert: ReadEndpointBurnRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              endpoint=~"/api/.*(get|list|search)"}[1h]))
+            /
+            sum(rate(http_requests_total{
+              endpoint=~"/api/.*(get|list|search)"}[1h]))
+          )
+          > 0.001 * 14.4
+        for: 5m
+```
+
+## SLO Dashboard
+
+### 核心面板
+
+```json
+{
+  "title": "SLO Dashboard",
+  "panels": [
+    {
+      "title": "当前可用性 vs SLO",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "100 * (1 - error_rate) / 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 99.9 },
+              { "color": "green", "value": 99.99 }
+            ]
+          },
+          "min": 99,
+          "max": 100
+        }
+      }
+    },
+    {
+      "title": "错误预算消耗进度",
+      "type": "bargauge",
+      "targets": [
+        {
+          "expr": "100 * error_budget_consumed_ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "max": 100,
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "orange", "value": 80 },
+              { "color": "red", "value": 95 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "燃烧率趋势",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "burn_rate_1h",
+          "legendFormat": "1h 窗口"
+        },
+        {
+          "expr": "burn_rate_6h",
+          "legendFormat": "6h 窗口"
+        },
+        {
+          "expr": "burn_rate_1d",
+          "legendFormat": "1d 窗口"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. SLI / SLO / SLA 三者的关系是什么？为什么 SLO 应该比 SLA 更严格？
+2. 为什么说「错误率 > SLO」的阈值告警是「事后诸葛亮」？燃烧率报警如何解决这个问题？
+3. SLO 报警的三道防线（燃烧率 / SLI 低于 SLO / 错误预算耗尽）分别扮演什么角色？
+4. 如何根据服务的重要性和业务影响，为不同服务配置不同级别的 SLO？
+5. SLO Dashboard 中，哪些面板是必须的？请列举并说明每个面板的价值。

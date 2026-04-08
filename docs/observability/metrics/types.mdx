@@ -1,0 +1,302 @@
+---
+description: 指标类型详解：Counter/Gauge/Histogram/Summary 的深度解析与选型指南
+---
+
+# 指标类型（Counter / Gauge / Histogram / Summary）
+
+一个工程师在排查延迟问题时，发现两种不同的指标：Histogram 显示 P99 是 80ms，但用户反馈接口很慢。反复检查后发现：Histogram 的 Bucket 边界设置不当，真实的 P99 其实是 3 秒，但被错误地归入了 `le="1"` 这个 Bucket。
+
+这个案例说明：**理解指标类型的本质，才能正确配置和使用它们**。Counter/Gauge/Histogram/Summary 不是功能名称，而是**数学模型**——选择错误的模型，数据就会说谎。
+
+## 四种指标类型速览
+
+| 类型 | 数学模型 | 数据特征 | 适用场景 |
+|---|---|---|---|
+| **Counter** | 只增不减的累计值 | Monotonically increasing | 请求总数、错误总数 |
+| **Gauge** | 可增可减的瞬时值 | Point-in-time value | 当前连接数、CPU 使用率 |
+| **Histogram** | 分布统计（桶聚合） | Buckets with counts | 请求延迟、响应大小 |
+| **Summary** | 分位数（服务端计算） | Quantiles (pre-calculated) | 请求延迟 P99（无聚合需求时） |
+
+## Counter（计数器）
+
+### 什么是 Counter
+
+Counter 是一个**只增不减**的累计值。它的数学特性是：`t2 时刻的值 >= t1 时刻的值`（单调递增）。Counter 不记录「当前是多少」，而是记录「从开始到现在一共发生了多少次」。
+
+### 使用场景
+
+Counter 适合描述「发生次数」类指标：
+
+```
+# 正确的 Counter 用法
+http_requests_total                    # HTTP 请求总数
+order_placed_total                     # 下单总次数
+payment_failed_total                   # 支付失败总次数
+db_queries_total                      # 数据库查询总次数
+bytes_sent_total                       # 发送字节总数
+```
+
+### 错误用法
+
+```java
+// ❌ 错误：Counter 用于记录「当前状态」
+// 当前活跃连接数会增也会减，不适合 Counter
+active_connections_total  // 应该是 Gauge
+
+// ❌ 错误：用 Counter 计算「瞬时速率」
+// Counter 只能算变化率，不能直接当瞬时值用
+current_error_count  // 应该是 Gauge
+```
+
+### 代码示例
+
+```java title="Counter 使用"
+Meter meter = openTelemetry.getMeter("order-service");
+
+// 创建 Counter
+LongCounter orderCounter = meter.counterBuilder("orders_placed_total")
+    .setDescription("下单总次数")
+    .setUnit("1")
+    .build();
+
+// 每次下单时 +1
+public void placeOrder(Order order) {
+    // ... 业务逻辑
+
+    orderCounter.add(1,
+        Attributes.of(
+            AttributeKey.stringKey("payment_method"), order.getPaymentMethod(),
+            AttributeKey.stringKey("channel"), order.getChannel()
+        )
+    );
+}
+
+// 使用 rate() 计算 QPS
+// rate(orders_placed_total[5m]) 计算过去 5 分钟的下单速率
+```
+
+## Gauge（仪表）
+
+### 什么是 Gauge
+
+Gauge 是一个**可增可减**的瞬时值。它代表某个指标在测量时刻的状态，不具有累积性。
+
+### 使用场景
+
+Gauge 适合描述「当前状态」类指标：
+
+```
+# 正确的 Gauge 用法
+http_server_active_requests              # 当前活跃请求数（会增会减）
+jvm_memory_used_bytes                   # 已使用内存（会增会减）
+system_cpu_usage                        # CPU 使用率（0-100%）
+queue_size                              # 当前队列长度（会增会减）
+```
+
+### Gauge 的陷阱
+
+Gauge 的数值**不代表增量**，只代表当前值。如果你想知道「变化了多少」，需要自己计算差值：
+
+```yaml
+# ❌ 错误理解：Gauge 的 increase() 是没有意义的
+increase(gauge_metric[5m])  // 这会算出奇怪的结果
+
+# ✅ 正确理解：Gauge 直接就是当前值
+# 当前 CPU 使用率
+system_cpu_usage{instance="server-1"}
+# 返回 85.3，表示当前 CPU 使用率 85.3%
+```
+
+### 代码示例
+
+```java title="Gauge 使用"
+Meter meter = openTelemetry.getMeter("order-service");
+
+// Gauge：当前活跃请求数
+AtomicInteger activeRequests = new AtomicInteger(0);
+
+meter.gaugeBuilder("http_active_requests")
+    .setDescription("当前活跃的 HTTP 请求数")
+    .setUnit("1")
+    .ofLongs()
+    .buildWithCallback(measurement ->
+        measurement.record(activeRequests.get())
+    );
+
+// 监控线程池状态
+meter.gaugeBuilder("thread_pool_active_count")
+    .setDescription("线程池活跃线程数")
+    .setUnit("1")
+    .ofLongs()
+    .buildWithCallback(measurement -> {
+        ThreadPoolExecutor executor = getThreadPool();
+        measurement.record(executor.getActiveCount());
+    });
+```
+
+## Histogram（直方图）
+
+### 什么是 Histogram
+
+Histogram 将测量的值分布到多个 Bucket（桶）中，每个桶记录落入该区间的样本数量。Histogram 是**可聚合的**——多个实例的 Histogram 可以合并计算。
+
+### Bucket 边界设计
+
+Histogram 的核心在于 Bucket 边界设计。边界决定了你能精确计算哪些分位数：
+
+```yaml
+# 错误：边界跳跃太大
+buckets: [0.1, 1, 10, 100]  # 只能精确到 P99 在哪个区间
+
+# 正确：细粒度边界（适合 Web 服务）
+buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+
+# 正确：粗粒度边界（适合 DB 查询）
+buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
+```
+
+### Bucket 边界与分位数精度
+
+Bucket 边界决定了你能否精确计算特定分位数：
+
+```
+# 假设 buckets = [0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
+# 某个请求的延迟 = 0.08 秒
+
+# 它落入 le=0.1 这个桶
+# P99.9 的计算方式：
+# count(le <= 0.1) / count(total) = ?
+# 如果有 10000 个请求，其中 9999 个在 le=0.1 内
+# P99.9 = (9999/10000) = 0.9999，刚好 OK
+
+# 但如果 P99.9 的边界不是 0.1 的倍数呢？
+# 比如实际 P99.9 = 0.08，因为没有精确的 Bucket，你无法精确得到
+```
+
+**结论**：Bucket 边界应该覆盖你的目标分位数，并且边界之间的间隔要足够细。
+
+### 计算分位数
+
+```yaml
+# 计算 P99 延迟
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# 按服务分解的 P99
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+)
+
+# 注意：必须用 sum() 先聚合，再按 le 分组
+# ❌ 错误写法（缺少 by le）
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (service)
+)
+
+# ✅ 正确写法
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+)
+```
+
+### 代码示例
+
+```java title="Histogram 使用"
+Meter meter = openTelemetry.getMeter("order-service");
+
+DoubleHistogram requestLatency = meter.histogramBuilder("http_request_duration_seconds")
+    .setDescription("HTTP 请求延迟分布")
+    .setUnit("s")
+    .ofLongs()  // 使用毫秒作为单位，避免浮点数精度问题
+    .setExplicitBucketBoundariesAdvice(
+        List.of(5L, 10L, 25L, 50L, 100L, 250L, 500L, 1000L, 2500L, 5000L, 10000L))
+    .build();
+
+// 记录延迟（毫秒）
+public void recordRequestLatency(long durationMs) {
+    requestLatency.record(durationMs,
+        Attributes.of(
+            AttributeKey.stringKey("http.method"), method,
+            AttributeKey.stringKey("http.route"), route
+        )
+    );
+}
+```
+
+## Summary（摘要）
+
+### 什么是 Summary
+
+Summary 在**服务端直接计算分位数**，输出预计算好的 `quantile` 值。相比 Histogram，Summary 不需要你配置 Bucket，精度更高。
+
+### Summary vs Histogram 的关键区别
+
+| 维度 | Histogram | Summary |
+|---|---|---|
+| **分位数计算** | 查询端计算（PromQL） | 服务端计算（SDK） |
+| **多实例聚合** | ✅ 可聚合 | ❌ 不可聚合 |
+| **精度** | 依赖 Bucket 精度 | ✅ 精确分位数 |
+| **存储** | 多个 Bucket 时间序列 | 多个 quantile 时间序列 |
+| **典型输出** | `_bucket{le="0.1"}`, `_sum`, `_count` | `{quantile="0.99"}`, `{quantile="0.999"}` |
+
+### Summary 的不可聚合问题
+
+Summary 的致命弱点：**服务端计算的分位数无法跨实例聚合**。
+
+```
+# 实例 A 的 P99 = 50ms（延迟很低的请求）
+# 实例 B 的 P99 = 500ms（延迟很高的请求）
+
+# 如果你查询 sum Summary P99：
+sum(http_request_duration_seconds{quantile="0.99"})  // = 550ms
+
+# 这个 550ms 有意义吗？—— 完全没有！
+# 因为 P99 不可加，混在一起的结果无法解释
+```
+
+**生产环境强烈建议使用 Histogram**。
+
+### 代码示例
+
+```java title="Summary 使用（不推荐，仅作对比）"
+Meter meter = openTelemetry.getMeter("order-service");
+
+// Summary（不推荐生产环境使用）
+DoubleSummaryServer serverLatency = meter.summaryBuilder("http_request_latency_seconds")
+    .setDescription("HTTP 请求延迟 P99")
+    .setUnit("s")
+    .setAdvice(advice -> {
+        // 定义要计算的分位数
+        advice.setQuantile(0.5, 0.01);  // P50，误差 1%
+        advice.setQuantile(0.9, 0.01);  // P90，误差 1%
+        advice.setQuantile(0.99, 0.01); // P99，误差 1%
+    })
+    .build();
+```
+
+## 选型决策树
+
+```
+这个指标描述的是「发生了多少次」吗？
+    └── 是 → Counter
+    └── 否 → 继续
+
+这个指标描述的是「当前是多少」吗？（会增会减）
+    └── 是 → Gauge
+    └── 否 → 继续
+
+你需要在多个实例间聚合计算吗？
+    └── 是 → Histogram
+    └── 否（只有一个实例，或不需要聚合）→ Histogram 或 Summary 均可
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. Counter 为什么只能增不能减？如果一个指标「当前活跃的请求数」，用 Counter 会产生什么问题？
+2. Histogram 的 Bucket 边界设计为什么如此重要？如果 Bucket 边界是 `[0.1, 1, 10]`，你能否精确计算 P99？
+3. 为什么说 Summary 的 P99 是「不可聚合的」？这在多实例部署场景下意味着什么？
+4. 如果你有 10 个服务实例，每个实例的 P99 延迟都是 100ms，但用户反馈「有时很慢」，最可能的原因是什么？
+5. 在选择 Histogram 的 Bucket 边界时，应该考虑哪些因素？为什么说「边界要覆盖目标分位数」？

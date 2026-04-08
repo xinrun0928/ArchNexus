@@ -1,0 +1,298 @@
+---
+description: PromQL 深度语法：从基础查询到复杂聚合的完全指南
+---
+
+# PromQL 深度语法
+
+PromQL（Prometheus Query Language）是 Prometheus 的核心能力，也是整个可观测性生态中最常用的指标查询语言。掌握 PromQL，是做指标分析、仪表盘配置和告警规则编写的基础。
+
+但 PromQL 的学习曲线比较陡：语法简洁但含义丰富，容易写错但不易发现，查询结果可能和预期不一致。本文从实际使用场景出发，系统讲解 PromQL 的核心语法和常见模式。
+
+## 基础概念
+
+### 时间序列的表示
+
+PromQL 的基本查询单位是**时间序列**（Time Series），每条时间序列由**指标名称**和**标签**（Label）唯一标识：
+
+```
+http_requests_total{service="order-api", method="GET", status="200"}
+              ↑           ↑                              ↑
+          指标名称       标签（多组）                      标签值
+```
+
+标签决定了你如何「切片」指标。`http_requests_total` 是总量，加了 `status="200"` 就是成功请求数，加了 `method="GET"` 就是 GET 请求数。
+
+### 四种 PromQL 表达式类型
+
+| 类型 | 说明 | 示例 |
+|---|---|---|
+| **即时向量（Instant Vector）** | 每个时间序列返回当前时刻的一个值 | `http_requests_total` |
+| **区间向量（Range Vector）** | 每个时间序列返回一段时间内的所有值 | `http_requests_total[5m]` |
+| **标量（Scalar）** | 单独的数值 | `100` |
+| **字符串（String）** | 字符串常量（很少用） | `"hello"` |
+
+即时向量用于告警和当前状态查询，区间向量用于计算变化率（`rate`）。
+
+## 核心函数
+
+### rate() 和 irate()
+
+`rate()` 是最常用的函数之一，用于计算**每秒平均变化率**。它假设在指定时间窗口内变化是线性的，适用于告警和仪表盘。
+
+```yaml
+# 计算过去 5 分钟的平均请求速率（QPS）
+rate(http_requests_total[5m])
+
+# 按服务维度分解
+sum(rate(http_requests_total[5m])) by (service)
+```
+
+`irate()` 用于计算**瞬时变化率**，适用于快速变化的数据（比如 CPU 使用率的尖峰）。但因为它是瞬时的，容易被噪声干扰，一般只用于绑图，不用于告警。
+
+```yaml
+# 瞬时变化率，用于查看峰值
+irate(http_requests_total{service="order-api"}[1m])
+```
+
+### histogram_quantile()
+
+计算分位数。这是指标分析中最核心的函数之一：
+
+```yaml
+# P99 延迟（假设指标是 Histogram 类型）
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# 按服务分解的 P99
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+)
+```
+
+`histogram_quantile` 的工作原理：Prometheus 先聚合各实例的 Bucket，再计算分位数。关键是要用 `by (le)` 聚合，因为 `le`（less than or equal）是 Histogram Bucket 的边界标签。
+
+### 常见函数速查
+
+| 函数 | 说明 | 典型用法 |
+|---|---|---|
+| `rate()` | 计算平均变化率（用于告警和仪表盘） | `rate(http_requests_total[5m])` |
+| `irate()` | 计算瞬时变化率（用于抓峰值） | `irate(http_requests_total[5m])` |
+| `increase()` | 计算时间窗口内的增长量 | `increase(http_requests_total[1h])` |
+| `histogram_quantile()` | 计算 Histogram 分位数 | `histogram_quantile(0.99, ...)` |
+| `topk()` | 返回最大的 k 个时间序列 | `topk(5, request_duration)` |
+| `bottomk()` | 返回最小的 k 个时间序列 | `bottomk(3, error_rate)` |
+| `count()` | 统计时间序列数量 | `count(http_requests_total) by (service)` |
+| `sum()` | 求和 | `sum(rate(...))` |
+| `avg()` | 求平均 | `avg(rate(...)) by (service)` |
+| `stddev()` | 标准差 | `stddev(cpu_usage)` |
+| `stdvar()` | 方差 | `stdvar(request_duration)` |
+| `label_replace()` | 修改标签值 | `label_replace(up{job="node"}, "env", "prod")` |
+| `absent()` | 检测指标是否存在（用于告警） | `absent(up{job="node"})` |
+
+## 聚合操作符
+
+PromQL 的聚合操作符用于对时间序列进行分组和聚合：
+
+```yaml
+# 按 service 标签聚合，计算 QPS
+sum(rate(http_requests_total[5m])) by (service)
+
+# 按 service 和 status 双重聚合
+sum(rate(http_requests_total[5m])) by (service, status)
+
+# 聚合后重命名标签
+sum(rate(http_requests_total[5m])) by (service) keep_common
+```
+
+### 内置聚合函数
+
+聚合操作符有对应的内置函数，行为更一致：
+
+```yaml
+# 内置聚合函数版本（推荐）
+sum by (service) (rate(http_requests_total[5m]))
+min by (service) (http_requests_total)
+max by (service) (http_requests_total)
+avg by (service) (rate(http_requests_total[5m]))
+```
+
+`by` 子句指定按哪些标签分组，不在 `by` 中的标签会被丢弃。
+
+## 过滤与匹配
+
+### 标签匹配器
+
+| 匹配器 | 说明 | 示例 |
+|---|---|---|
+| `=` | 精确匹配 | `service="order-api"` |
+| `!=` | 不等于 | `service!="order-api"` |
+| `=~` | 正则匹配 | `service=~"order-.*"` |
+| `!~` | 正则不匹配 | `service!~"test-.*"` |
+
+```yaml
+# 匹配多个服务
+{service=~"order-api|user-api|payment-api"}
+
+# 排除测试服务
+{service!~"test-.*|dev-.*"}
+```
+
+### 布尔运算符
+
+```yaml
+# 基础布尔运算
+# 注意：布尔运算要求左右两边时间序列的标签完全匹配
+
+# 错误率（需要 / 除法）
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+
+# 使用 > 过滤（只看 CPU > 80% 的实例）
+node_cpu_usage > 0.8
+```
+
+## 常见查询模式
+
+### 模式一：QPS 计算
+
+```yaml
+# 单服务 QPS
+sum(rate(http_requests_total{service="order-api"}[5m]))
+
+# 按 HTTP 方法分解 QPS
+sum(rate(http_requests_total{service="order-api"}[5m])) by (method)
+
+# 按状态码分解
+sum(rate(http_requests_total{service="order-api"}[5m])) by (status)
+```
+
+### 模式二：延迟分位数
+
+```yaml
+# P50 延迟
+histogram_quantile(0.50,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# P99 延迟（按服务分解）
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+)
+
+# P99.9 延迟
+histogram_quantile(0.999,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+### 模式三：错误率
+
+```yaml
+# HTTP 5xx 错误率（百分比）
+100
+* sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+/ sum(rate(http_requests_total[5m])) by (service)
+
+# 5 分钟窗口内的错误数
+increase(http_requests_total{status=~"5.."}[5m])
+```
+
+### 模式四：资源使用率
+
+```yaml
+# CPU 使用率（所有核心平均）
+100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance))
+
+# 内存使用率
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# 磁盘使用率
+100 * (1 - node_filesystem_avail_bytes / node_filesystem_size_bytes)
+  {mountpoint="/"}
+```
+
+### 模式五：对比增长率
+
+```yaml
+# 当前 QPS 与 7 天前的 QPS 对比
+sum(rate(http_requests_total[5m])) by (service)
+/
+sum(rate(http_requests_total[5m] offset 7d)) by (service)
+```
+
+### 模式六：滑动窗口聚合
+
+```yaml
+# 过去 1 小时的平均 QPS（而非过去 5 分钟）
+avg_over_time(sum(rate(http_requests_total[1m]))[1h:5m])
+
+# 过去 10 分钟的最大 CPU
+max_over_time(node_cpu_usage[10m])
+```
+
+## 常见错误与调试
+
+### 错误一：标签不一致导致除法结果为空
+
+```yaml
+# 错误：左边有 (service) 标签，右边没有，结果为空
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+/
+rate(http_requests_total[5m])
+```
+
+```yaml
+# 正确：两边都按 service 聚合
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+/
+sum(rate(http_requests_total[5m])) by (service)
+```
+
+### 错误二：histogram_quantile 中缺少 by (le)
+
+```yaml
+# 错误：没有按 le 聚合
+histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])))
+
+# 正确：按 le 聚合
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+### 错误三：offset 导致时区混淆
+
+```yaml
+# 当前时间的 QPS
+sum(rate(http_requests_total[5m]))
+
+# 7 天前的 QPS（注意：7d 是日历周，不是固定 168 小时）
+sum(rate(http_requests_total[5m] offset 7d))
+```
+
+## 子查询与嵌套查询
+
+PromQL 支持子查询，用于更复杂的分析：
+
+```yaml
+# 计算过去 1 小时的 P99 延迟的变化趋势
+# 外层查询：1 小时窗口，每 5 分钟一个点
+# 内层查询：5 分钟窗口的 P99
+histogram_quantile(0.99,
+    sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)[1h:5m]
+```
+
+子查询的语法是 `[outer_range:resolution]`。上面的例子：外层是 1 小时范围，每 5 分钟一个数据点。
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. `rate()` 和 `irate()` 的核心区别是什么？分别适用于什么场景？
+2. `histogram_quantile` 函数中 `by (le)` 为什么是必须的？省略会怎样？
+3. 当 PromQL 除法结果为空时，最可能的原因是什么？如何调试？
+4. 如何用 PromQL 计算一个服务的错误率（HTTP 5xx 的百分比）？
+5. offset 查询的作用是什么？在 SLO 告警中 offset 有什么特殊用途？

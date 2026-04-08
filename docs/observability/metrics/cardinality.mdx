@@ -1,0 +1,301 @@
+---
+description: 指标基数问题与解决：高基数如何压垮 Prometheus
+---
+
+# 指标基数问题与解决
+
+一个团队的 Prometheus 在运行 6 个月后开始变慢，查询延迟从毫秒级上升到分钟级。工程师检查了数据量和存储空间，都没有问题。最后定位到根因：某个服务在标签中使用了 `user_id`，而有 200 万用户，导致这个指标产生了 200 万条时间序列。
+
+这就是 **Cardinality（基数）问题**——Prometheus 的克星。基数爆炸会让查询变慢、内存耗尽、写入阻塞，严重时会导致 Prometheus OOM。
+
+## 什么是基数
+
+**基数（Cardinality）** 是一个标签组合能产生的不同值的数量。
+
+```
+# 低基数
+service="order-api"          # 只有 1 个值
+status="200","404","500"     # 最多 3 个值
+method="GET","POST","PUT"     # 最多 3 个值
+
+# 低基数组合：1 * 3 * 3 = 9 个时间序列
+
+# 高基数
+user_id="10001","10002"...   # 有 200 万个值
+
+# 高基数组合：200 万 * 3 * 3 = 1800 万个时间序列
+```
+
+时间序列数量 = 指标数量 × 所有标签基数的乘积。
+
+## 为什么高基数是问题
+
+### 内存爆炸
+
+Prometheus 的内存使用与时间序列数量成正比。每个时间序列需要在内存中维护：
+
+- 索引数据（标签组合 → 序列 ID）
+- Head Block 数据（最新样本）
+- 查询结果缓存
+
+```
+# 一个高基数指标对内存的影响
+# user_id 标签，200 万用户
+
+# 每个时间序列需要约 1-2 KB 索引内存
+# 200 万序列 × 1.5 KB = 3 GB
+
+# Prometheus 默认内存限制可能只有 4-8 GB
+# 单一指标就占用了 40-75% 的内存
+```
+
+### 查询性能退化
+
+```yaml
+# 查询一个高基数指标
+sum(http_requests_total{user_id=~".*"})
+
+# Prometheus 需要：
+# 1. 从索引中找到所有 200 万个时间序列
+# 2. 加载所有序列的数据点
+# 3. 聚合计算
+# 结果：查询超时或 OOM
+```
+
+### 写入压力
+
+每个新的标签组合都需要在内存中创建新的时间序列对象：
+
+```bash
+# 新用户注册后，产生新的 user_id
+# Prometheus 立即在内存中创建新的时间序列
+
+# 如果 QPS = 10000，新用户注册率 = 1%
+# 每秒产生 100 个新时间序列
+# 内存中积累的时间序列越来越多
+```
+
+## 常见的高基数场景
+
+### 场景一：用户级标签
+
+```java
+// ❌ 错误：把 user_id 作为标签
+@GET("/api/orders")
+public List<Order> getOrders(@HeaderParam("X-User-Id") String userId) {
+    // 这个 userId 有几百万个值，不应该作为标签
+    orderCounter.add(1, Attributes.of(
+        AttributeKey.stringKey("user_id"), userId
+    ));
+}
+
+// ✅ 正确：user_id 只放在日志中
+// 指标层面：按接口、状态码、服务等低基数字段分组
+orderCounter.add(1, Attributes.of(
+    AttributeKey.stringKey("service"), "order-api",
+    AttributeKey.stringKey("endpoint"), "/api/orders"
+));
+```
+
+### 场景二：动态 URL 路径
+
+```java
+// ❌ 错误：把具体 ID 作为标签
+// /api/orders/884321 → 标签 endpoint="/api/orders/884321"
+// /api/orders/884322 → 标签 endpoint="/api/orders/884322"
+// 有多少订单，就有多少时间序列
+
+// ✅ 正确：用路径参数模板
+// /api/orders/{orderId} → 标签 endpoint="/api/orders/:orderId"
+// 只有 1 个时间序列
+
+@RestController
+public class OrderController {
+
+    // Spring MVC 路由模板化
+    @GetMapping("/api/orders/{orderId}")
+    public Order getOrder(@PathVariable String orderId) {
+        // OTel 自动将 /api/orders/{orderId} 模板化
+        return orderService.findById(orderId);
+    }
+}
+```
+
+### 场景三：IP 地址和会话 ID
+
+```yaml
+# ❌ 错误：IP 地址、session_id、request_id 作为标签
+# client_ip="192.168.1.100" → 有多少 IP 就有多少序列
+# session_id="abc123" → 每个会话一条序列
+
+# ✅ 正确：这些信息只在日志中记录
+# 指标层面：按地区、运营商、浏览器类型等聚合维度分组
+```
+
+## 诊断高基数
+
+### 检查高基数指标
+
+```yaml
+# 按指标名称和标签基数排序
+count by (__name__) (
+  {__name__=~".+"}
+)
+
+# 查看某个指标有多少时间序列
+count(
+  {__name__="http_requests_total"}
+)
+
+# 查看某个标签有多少不同值
+count by (user_id) (
+  {__name__="http_requests_total"}
+)
+```
+
+### Prometheus 诊断端点
+
+```bash
+# 访问 Prometheus 的诊断端点
+curl http://prometheus:9090/api/v1/status/tsdb
+
+# 返回示例：
+{
+  "headStats": {
+    "numSeries": 1250000,     # 当前时间序列数量
+    "numLabelPairs": 45000,   # 标签对数量
+    "seriesCountByMetricName": [...]  # 每个指标的时间序列数
+  }
+}
+```
+
+## 解决方案
+
+### 方案一：使用 relabel_configs 丢弃高基数字段
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: 'order-service'
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['order-service:8080']
+
+    # 丢弃高基数的标签
+    metric_relabel_configs:
+      # 丢弃所有 user_id 标签
+      - source_labels: [user_id]
+        regex: '.*'
+        action: labeldrop
+
+      # 丢弃 request_id 标签
+      - source_labels: [request_id]
+        regex: '.*'
+        action: labeldrop
+```
+
+### 方案二：用 Histogram 的 buckets 替代精确标签
+
+```java
+// ❌ 错误：用 user_id 标签区分用户
+counter.add(1, Attributes.of("user_id", userId, "action", "login"));
+
+// ✅ 正确：用 buckets 统计分布
+// 假设需要知道不同用户群体的行为差异
+// 用预定义的 user_tier 标签（低基数）
+counter.add(1, Attributes.of("user_tier", "premium", "action", "login"));
+counter.add(1, Attributes.of("user_tier", "free", "action", "login"));
+```
+
+### 方案三：OTel SDK 层面的基数控制
+
+```java title="OtelConfig.java"
+OpenTelemetry openTelemetry = OpenTelemetrySdk.builder()
+    .setMeterProvider(
+        SdkMeterProvider.builder()
+            .registerView(
+                // 全局限制 Histogram 的标签数量
+                InstrumentSelector.builder()
+                    .setType(InstrumentType.HISTOGRAM)
+                    .build(),
+                View.builder()
+                    .setAggregation(
+                        // 只保留显式声明的标签
+                        Aggregation.defaultViewAggregation(
+                            /* maxLabelPairs = */ 8
+                        ))
+                    .build())
+            .build())
+    .build();
+```
+
+### 方案四：数据分层存储
+
+```yaml title="thanos-sidecar.yml"
+sidecar:
+  # 分层存储：短期数据用本地 SSD，长期数据用对象存储
+  tsdb:
+    retention: 15d    # 本地保留 15 天
+
+objectStorage:
+  type: S3
+  config:
+    bucket: prometheus-data
+    endpoint: s3.amazonaws.com
+    # 超过 15 天的数据自动上传到 S3
+```
+
+## 预防措施
+
+### 建立基线
+
+```yaml title="prometheus-baseline.yml"
+# 在测试环境建立基数基线
+scrape_configs:
+  - job_name: 'baseline-check'
+    static_configs:
+      - targets: ['test-service:8080']
+
+# 告警：超过基线 50% 则触发
+- alert: HighCardinalityIncrease
+  expr: |
+    (
+      count by (__name__) ({__name__=~"order-.*"})
+    )
+    /
+    (
+      baseline_metric_count{__name__=~"order-.*"}
+    )
+    > 1.5
+  annotations:
+    summary: "指标基数超过基线 50%"
+```
+
+### 命名规范
+
+```yaml
+# 标签命名规范检查
+# 在 CI 中运行：
+# promtool check config prometheus.yml
+
+# 禁止的模式（会被检测）：
+# ❌ 包含 UUID
+# ❌ 包含长随机字符串
+# ❌ 包含超过 100 个不同值
+
+# 推荐的模式：
+# ✅ service_name
+# ✅ region
+# ✅ environment
+# ✅ user_tier (premium/free/trial)
+# ✅ device_type (mobile/desktop/tablet)
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. 什么是基数（Cardinality）？为什么高基数会导致 Prometheus OOM 和查询超时？
+2. 哪些场景是常见的高基数陷阱？请列举至少 3 个，每个场景给出正确和错误的做法。
+3. 如何诊断 Prometheus 中的高基数问题？有哪些具体的 PromQL 查询和诊断端点可以使用？
+4. 在 OTel SDK 层面，如何通过 View API 控制 Histogram 的标签数量？
+5. 如何在团队中建立基线检查机制，防止新引入的代码导致基数爆炸？

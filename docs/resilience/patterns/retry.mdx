@@ -1,0 +1,258 @@
+---
+description: 重试模式（Retry）
+---
+
+# 重试模式（Retry）
+
+重试是处理瞬时故障最简单有效的方式。
+
+网络抖动、服务偶尔超时、数据库连接短暂不可用——这些瞬时故障往往持续几秒钟就会自动恢复。重试机制让系统在遇到这些瞬时故障时，自动尝试重新请求，而不是直接返回失败。
+
+但重试也是一把双刃剑：用好了能提高系统的容错能力，用不好会放大故障、压垮系统。
+
+## 什么时候应该重试
+
+```mermaid
+flowchart TD
+    A["故障发生"] --> B{"是瞬时故障？"}
+    B -->|"可能是| C["应该重试"]
+    B -->|"确定性的| D["不应重试"]
+    B -->|"未知| E["谨慎重试"]
+
+    C --> F["幂等操作"]
+    F --> |"是| G["重试"]
+    F --> |"否| H["不重试"]
+```
+
+| 应该重试 | 不应该重试 |
+| --- | --- |
+| 网络超时 | 业务逻辑错误（如余额不足） |
+| 连接失败 | 非幂等操作（如扣款） |
+| 服务暂时不可用 | 幂等性未保证的操作 |
+| 数据库连接超时 | 超时时间过长的操作 |
+
+## 重试的关键要素
+
+### 重试次数
+
+```java title="RetryConfig.java"
+public class RetryConfig {
+
+    // 重试次数配置
+    private final int maxAttempts;
+
+    public RetryConfig(int maxAttempts) {
+        this.maxAttempts = maxAttempts;
+    }
+
+    // 根据异常类型决定是否重试
+    public boolean shouldRetry(Exception e) {
+        // 网络异常：重试
+        if (e instanceof SocketTimeoutException ||
+            e instanceof ConnectException ||
+            e instanceof ReadTimeoutException) {
+            return true;
+        }
+
+        // 业务异常：不重试
+        if (e instanceof BusinessException) {
+            return false;
+        }
+
+        // 默认不重试
+        return false;
+    }
+}
+```
+
+### 退避策略
+
+连续重试会短时间内对系统造成压力，退避策略让重试间隔逐渐增加：
+
+```mermaid
+flowchart LR
+    A["第一次重试"] --> |"立即| B["第二次重试"]
+    B --> |"1 秒| C["第三次重试"]
+    C --> |"2 秒| D["第四次重试"]
+    D --> |"4 秒| E["第五次重试"]
+```
+
+## Resilience4j 重试
+
+```java title="Resilience4jRetry.java"
+@Service
+public class Resilience4jRetry {
+
+    private final Retry retry;
+
+    public Resilience4jRetry() {
+        this.retry = Retry.of("payment-service", RetryConfig.custom()
+            // 最大重试次数
+            .maxAttempts(3)
+            // 重试间隔
+            .waitDuration(Duration.ofMillis(500))
+            // 可重试的异常
+            .retryExceptions(
+                SocketTimeoutException.class,
+                ConnectException.class,
+                ReadTimeoutException.class
+            )
+            // 忽略的异常（不重试）
+            .ignoreExceptions(
+                BusinessException.class,
+                ValidationException.class
+            )
+            // 退避策略：指数退避
+            .intervalFunction(IntervalFunction.ofExponentialBackoff(500, 2))
+            // 重试监听器
+            .retryListeners(new RetryListener() {
+                @Override
+                public <T> void onSuccess(RetryContext<T> context) {
+                    log.info("重试成功: attempt={}", context.getNumberOfRetryAttempts());
+                }
+
+                @Override
+                public <T> void onError(RetryContext<T> context) {
+                    log.warn("重试失败: attempt={}, error={}",
+                        context.getNumberOfRetryAttempts(),
+                        context.getLastThrowable().getMessage());
+                }
+            })
+            .build());
+    }
+
+    public PaymentResult pay(PaymentRequest request) {
+        Supplier<PaymentResult> supplier = () -> paymentClient.process(request);
+
+        return Decorators.ofSupplier(supplier)
+            .withRetry(retry)
+            .decorate()
+            .get();
+    }
+}
+```
+
+## Spring Retry
+
+```java title="SpringRetry.java"
+@Service
+@Slf4j
+public class SpringRetryService {
+
+    @Retryable(
+        value = {RemoteServiceException.class},
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2)
+    )
+    public Result callRemoteService(Request request) {
+        return remoteService.call(request);
+    }
+
+    @Recover
+    public Result recover(RemoteServiceException e, Request request) {
+        log.error("重试全部失败，返回降级结果: {}", e.getMessage());
+        return Result.fallback();
+    }
+}
+```
+
+## 重试的注意事项
+
+### 幂等性保证
+
+重试的前提是操作必须幂等：
+
+```java title="IdempotentRetry.java"
+@Service
+public class IdempotentRetry {
+
+    private final RedisTemplate<String, String> redisTemplate;
+
+    public PaymentResult payWithRetry(String orderId, BigDecimal amount) {
+        String retryKey = "payment:retry:" + orderId;
+
+        // 检查是否已经处理过
+        String existingResult = redisTemplate.opsForValue().get(retryKey);
+        if (existingResult != null) {
+            log.info("订单 {} 已处理过，返回缓存结果", orderId);
+            return parseResult(existingResult);
+        }
+
+        try {
+            PaymentResult result = doPay(orderId, amount);
+
+            // 缓存结果，用于幂等重试
+            redisTemplate.opsForValue().set(retryKey,
+                serializeResult(result),
+                Duration.ofHours(24));
+
+            return result;
+        } catch (Exception e) {
+            // 重试时会再次检查幂等 key
+            throw e;
+        }
+    }
+
+    private PaymentResult doPay(String orderId, BigDecimal amount) {
+        // 实际支付逻辑
+        return paymentClient.process(orderId, amount);
+    }
+}
+```
+
+### 重试风暴
+
+大量请求同时失败、同时重试，会造成流量放大：
+
+```java title="RetryStormPrevention.java"
+public class RetryStormPrevention {
+
+    private final CircuitBreaker circuitBreaker;
+
+    public Result callWithRetry(String requestId) {
+        // 检查熔断器状态
+        if (circuitBreaker.getState() == State.OPEN) {
+            log.warn("熔断器打开，拒绝重试: {}", requestId);
+            throw new RetryRejectedException("Circuit breaker is open");
+        }
+
+        // 重试逻辑
+        int attempts = 0;
+        while (attempts < MAX_ATTEMPTS) {
+            try {
+                return doCall();
+            } catch (Exception e) {
+                attempts++;
+
+                if (attempts >= MAX_ATTEMPTS) {
+                    throw e;
+                }
+
+                // 添加随机抖动
+                long delay = calculateDelayWithJitter(attempts);
+                Thread.sleep(delay);
+            }
+        }
+
+        throw new RuntimeException("Should not reach here");
+    }
+
+    // 添加随机抖动，避免重试风暴
+    private long calculateDelayWithJitter(int attempt) {
+        long baseDelay = (long) (BASE_DELAY_MS * Math.pow(2, attempt - 1));
+        // 抖动范围：0.5 ~ 1.5 倍
+        double jitter = 0.5 + Math.random();
+        return (long) (baseDelay * jitter);
+    }
+}
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **重试只适合瞬时故障**：网络超时、连接失败等
+2. **幂等性是重试的前提**：不幂等的操作不能重试
+3. **指数退避避免重试风暴**：重试间隔逐渐增加
+4. **随机抖动进一步优化**：避免大量请求同时重试
+5. **配合熔断器使用**：连续失败时停止重试

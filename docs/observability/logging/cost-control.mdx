@@ -1,0 +1,235 @@
+---
+description: 日志成本控制：从采集到存储的全链路成本优化策略
+---
+
+# 日志成本控制
+
+Stripe 在 2020 年透露：他们每年在可观测性数据上的支出超过 2000 万美元，其中日志占了大头。这不是个例——随着微服务数量增长，日志量往往以超线性速度增长：服务多了，日志量不只是线性增加，还因为服务间调用日志的交叉记录而指数增长。
+
+日志成本控制不是「少打日志」，而是**用正确的成本获取正确的数据**。
+
+## 成本来源分析
+
+### 日志全链路成本分解
+
+```
+日志成本 = 采集成本 + 传输成本 + 处理成本 + 存储成本
+
+采集成本：Agent/C Sidecar 的 CPU 和内存占用
+传输成本：日志从服务器到存储系统的网络带宽
+处理成本：Logstash/Vector 等处理管道的 CPU
+存储成本：Elasticsearch/Loki 的磁盘和云存储费用
+```
+
+### 各环节成本占比（典型）
+
+| 环节 | 占比 | 说明 |
+|---|---|---|
+| **存储** | 50-70% | 最大成本来源 |
+| **传输** | 15-25% | 网络带宽 |
+| **采集** | 5-15% | Agent 资源 |
+| **处理** | 5-10% | 处理管道 |
+
+**结论：控制存储成本是性价比最高的选择。**
+
+## 存储成本优化
+
+### 1. 合理的日志保留策略
+
+```yaml title="Loki 保留策略"
+limits_config:
+  # 拒绝超过 7 天的日志
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+# 分层存储（热/冷）
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: boltdb-shipper
+      object_store: aws-s3
+      schema: v11
+      index:
+        prefix: loki_index_
+        period: 24h
+```
+
+```json title="Elasticsearch ILM"
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_primary_shard_size": "50gb"
+          }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "allocate": { "require": { "data": "cold" } }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": { "delete": {} }
+      }
+    }
+  }
+}
+```
+
+### 2. 选择合适的存储引擎
+
+| 引擎 | 存储成本 | 查询灵活性 | 适用场景 |
+|---|---|---|---|
+| **Elasticsearch** | 高 | 极高（全文搜索） | 需要精确关键词搜索 |
+| **Loki** | **极低** | 中（标签过滤） | 大部分日志查询 |
+| **S3 + 查询引擎** | 最低 | 低 | 合规保留、归档 |
+
+**对于大多数团队：Loki + S3 是最优性价比方案。**
+
+```yaml title="Loki + S3 成本配置"
+storage_config:
+  aws:
+    bucketnames: logs-storage
+    region: us-east-1
+    s3forcehttp2: true
+
+  boltdb_shipper:
+    active_index_directory: /var/loki/index
+    cache_location: /var/loki/cache
+    shared_store: aws
+
+compactor:
+  working_directory: /var/loki/compactor
+  shared_store: aws
+
+# 压缩
+ingester:
+  chunk_encoding: zstd   # ZSTD 压缩，压缩比更高
+```
+
+## 采集成本优化
+
+### 1. 客户端采样
+
+```xml title="Logback 条件日志"
+<!-- 只在特定级别开启 -->
+<springProfile name="high-load">
+    <!-- DEBUG 日志发送到本地文件，不发送到 ELK -->
+    <logger name="com.example" level="DEBUG" additivity="true">
+        <appender-ref ref="LOCAL_FILE"/>
+        <appender-ref ref="REMOTE" level="INFO"/>  <!-- 只发 INFO 及以上 -->
+    </logger>
+</springProfile>
+```
+
+### 2. 结构化字段精简
+
+```java
+// ❌ 过度冗余的字段
+log.info("Processing order: order={}, user={}, items={}, address={}, payment={}",
+    order.toString(), user.toString(), items.toString(), address.toString(), payment.toString());
+
+// ✅ 只记录必要字段（ID 和金额）
+log.info("Order processed: orderId={}, userId={}, amount={}, itemCount={}, status={}",
+    order.getId(), order.getUserId(), order.getAmount(),
+    order.getItems().size(), order.getStatus());
+```
+
+## 传输成本优化
+
+### 压缩传输
+
+```yaml title="Filebeat 压缩"
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+  compression_level: 5  # gzip 压缩
+
+output.logstash:
+  hosts: ["logstash:5044"]
+  compression_enabled: true
+```
+
+### 批量发送
+
+```yaml title="Vector 批量配置"
+[sinks.elasticsearch]
+type = "elasticsearch"
+batch:
+  max_bytes: 5242880    # 5MB
+  timeout_secs: 20
+compression = "gzip"
+```
+
+## 日志量估算与控制
+
+### 估算公式
+
+```
+日均日志量 = QPS × 平均每请求日志数 × 日志平均大小 × 保留天数 × 压缩比
+
+示例：
+QPS = 10,000
+平均每请求日志数 = 5 条
+日志平均大小 = 500 bytes（JSON）
+保留天数 = 30 天
+压缩比 = 0.2（gzip）
+
+日均日志量 = 10,000 × 5 × 500 × 30 × 0.2 = 1.5 GB/天
+月均日志量 = 45 GB/月
+```
+
+### 控制阈值
+
+```yaml
+# Prometheus 告警：日志量异常
+- alert: LogVolumeAnomaly
+  expr: |
+    sum(rate(logs_total[5m])) by (service)
+    > 2 * avg_over_time(sum(rate(logs_total[5m])) by (service)[7d:5m])
+  annotations:
+    summary: "服务 {{ $labels.service }} 日志量异常，当前是基线的 2 倍"
+```
+
+## 成本监控
+
+### 仪表盘设计
+
+```yaml
+# 日志量（按服务）
+sum(rate(log_lines_total[5m])) by (service)
+
+# 日志量趋势（与上周对比）
+sum(rate(log_lines_total[5m]))
+/
+sum(rate(log_lines_total[5m] offset 7d)) - 1
+
+# 存储使用量
+elasticsearch_indices_store_size_bytes
+loki_chunk_store_size_bytes
+
+# 丢弃率
+sum(rate(logs_dropped_total[5m])) by (service)
+```
+
+## 质量判断标准
+
+读完本节后，你应该能够回答：
+
+1. 日志全链路成本中，哪个环节占比最大？控制成本性价比最高的方向是什么？
+2. Loki + S3 的方案相比 Elasticsearch，在成本和查询灵活性上各有什么优势和局限？
+3. Elasticsearch 的 ILM（索引生命周期管理）中，热/温/冷/删四阶段分别解决了什么问题？为什么需要这种分层设计？
+4. 日志量估算的公式是什么？如何通过估算公式评估一个服务的日志成本？
+5. 日志成本监控仪表盘应该包含哪些核心指标？如何发现日志量异常？
