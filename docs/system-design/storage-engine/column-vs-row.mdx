@@ -1,0 +1,250 @@
+# 列式存储 vs 行式存储
+
+同样的数据，行式存储和列式存储的查询性能可以相差 100 倍。
+
+这不是夸大，而是分析型数据库（OLAP）选择列式存储的原因。
+
+## 行式存储
+
+行式存储按行组织数据，每行数据连续存储：
+
+```java
+// 行式存储: 一行数据的所有列连续存放
+// Row 1: [id=1, name=Alice, age=30, city=Beijing]
+// Row 2: [id=2, name=Bob, age=25, city=Shanghai]
+
+// 磁盘布局:
+// [1, Alice, 30, Beijing, 2, Bob, 25, Shanghai, ...]
+//  ↑ Row 1 (连续)                           ↑ Row 2 (连续)
+```
+
+### 行式存储的读取
+
+```java
+// 读取所有用户（列式存储也很高效）
+public List<User> scanAll() {
+    List<User> users = new ArrayList<>();
+    for (int offset = 0; offset < fileSize; offset += ROW_SIZE) {
+        byte[] row = readRow(offset);
+        users.add(parseRow(row));
+    }
+    return users;
+}
+
+// 查询 SELECT name FROM users WHERE age > 25
+// 行式存储: 读取所有行，丢弃不需要的列
+public List<String> queryAgeOver25() {
+    List<String> names = new ArrayList<>();
+    for (int offset = 0; offset < fileSize; offset += ROW_SIZE) {
+        byte[] row = readRow(offset);
+        int age = extractInt(row, 16);  // age 在第 16 字节
+        if (age > 25) {
+            String name = extractString(row, 4);  // name 从第 4 字节开始
+            names.add(name);
+        }
+    }
+    return names;
+}
+```
+
+### 行式存储特点
+
+**优点**：
+
+- 写入效率高（一行数据一次写入）
+- 点查效率高（一次 I/O 读取整行）
+- 适合 OLTP 场景
+
+**缺点**：
+
+- 读取部分列时，读取大量无用数据
+- 列压缩效率低（不同类型数据混在一起）
+
+## 列式存储
+
+列式存储按列组织数据，每列数据连续存储：
+
+```java
+// 列式存储: 一列数据连续存放
+// ID 列:    [1, 2, 3, 4, 5, ...]
+// Name 列:  [Alice, Bob, Carol, Dave, ...]
+// Age 列:   [30, 25, 35, 28, ...]
+
+// 磁盘布局:
+// [1, 2, 3, 4, 5, ...]        ← ID 列（连续）
+// [Alice, Bob, Carol, Dave]   ← Name 列（连续）
+// [30, 25, 35, 28, ...]       ← Age 列（连续）
+```
+
+### 列式存储的读取
+
+```java
+// 查询 SELECT name FROM users WHERE age > 25
+public List<String> queryAgeOver25() {
+    // 1. 只读取 Age 列
+    byte[] ageData = readColumn("age");
+    List<Integer> ages = decodeIntegers(ageData);
+    
+    // 2. 找出满足条件的行号
+    List<Integer> rowIds = new ArrayList<>();
+    for (int i = 0; i < ages.size(); i++) {
+        if (ages.get(i) > 25) {
+            rowIds.add(i);
+        }
+    }
+    
+    // 3. 只读取 Name 列
+    byte[] nameData = readColumn("name");
+    List<String> names = decodeStrings(nameData);
+    
+    // 4. 根据行号提取结果
+    return rowIds.stream()
+        .map(names::get)
+        .collect(Collectors.toList());
+}
+```
+
+### 列式存储的写入
+
+```java
+// 列式存储写入: 需要分别写入每列
+public void writeRow(User user) {
+    idColumn.append(user.id);
+    nameColumn.append(user.name);
+    ageColumn.append(user.age);
+    cityColumn.append(user.city);
+}
+
+// 批量写入: 累积后统一刷盘
+public void flush() {
+    idColumn.flush();
+    nameColumn.flush();
+    ageColumn.flush();
+    cityColumn.flush();
+}
+```
+
+## 压缩效率对比
+
+列式存储的相邻数据是同类型数据，压缩效率远高于行式存储：
+
+### 行式存储压缩
+
+```
+数据: [1, "Alice", 30], [2, "Bob", 25], [3, "Carol", 35]
+行式存储: 逐行存储，无法跨行压缩
+```
+
+### 列式存储压缩
+
+```java
+// ID 列: [1, 2, 3, 4, 5, ...] → RLE 压缩
+// 1,1,1,1,1,1,1,1... (连续递增) → 存储: 1, +1, count=10
+
+// Age 列: [30, 30, 30, 31, 31, 31, 31, 32, 32, 32]
+// 30,30,30,31,31,31,31,32,32,32 → RLE 压缩
+// 30x3, 31x4, 32x3 → 存储: 30,3, 31,4, 32,3
+
+// 相同值压缩 (Dictionary Encoding)
+// ["Beijing", "Shanghai", "Beijing", "Guangzhou", "Shanghai"]
+// 字典: [Beijing=0, Shanghai=1, Guangzhou=2]
+// 编码: [0, 1, 0, 2, 1] → 比原始字符串小得多
+```
+
+### 常见列式压缩算法
+
+| 算法 | 适用场景 | 压缩比 |
+|---|---|---|
+| RLE | 重复值多、连续值 | 高 |
+| Dictionary | 低基数离散值 | 中~高 |
+| Delta | 有序/递增数据 | 高 |
+| Bit Packing | 小整数 | 高 |
+| LZ4 | 通用 | 中 |
+
+## Parquet 与 ORC
+
+### Parquet
+
+Parquet 是 Apache Parquet 项目的列式存储格式，被 Hive、Spark、Flink 等广泛使用。
+
+```java
+// Parquet 文件结构
+public class ParquetFormat {
+    // Row Group: 一批行的数据
+    // ├─ Column Chunk: 每个列在该 Row Group 中的数据
+    // │  └─ Page: 进一步分页
+    // └─ Metadata: 列元数据、统计信息
+}
+```
+
+### ORC
+
+ORC (Optimized Row Columnar) 是 Hive 的列式存储格式，优化了 Hive 的查询性能。
+
+```java
+// ORC Stripe 结构
+public class ORCFormat {
+    // Stripe: ~250MB 的行数据
+    // ├─ Index Data: 行级索引（快速跳过）
+    // ├─ Row Data: 行数据
+    // └─ Stripe Footer: 元数据
+    
+    // Footer 包含:
+    // - 列统计信息（min, max, null count）
+    // - Bloom Filter
+}
+```
+
+## 选型建议
+
+| 场景 | 推荐存储 |
+|---|---|
+| OLTP 事务系统 | 行式存储 (MySQL, PostgreSQL) |
+| 实时分析 (BI) | 列式存储 (ClickHouse, Druid) |
+| 数据仓库 | 列式存储 (Hive, SparkSQL) |
+| 日志分析 | 列式存储 (Elasticsearch) |
+| 流式计算状态 | LSM Tree (RocksDB) |
+
+## 混合存储
+
+现代数据库往往采用混合策略：
+
+### ClickHouse 的 MergeTree
+
+ClickHouse 使用 MergeTree 引擎，融合行列存储：
+
+```sql
+CREATE TABLE events (
+    event_date Date,
+    event_type String,
+    user_id UInt32,
+    payload String
+) ENGINE = MergeTree()
+PARTITION BY event_date
+ORDER BY (event_type, user_id)
+```
+
+- **主键排序**：按主键排序存储，支持点查
+- **分区**：按日期分区，便于删除和扫描
+- **稀疏索引**：每 8192 行一个索引，快速定位
+
+### 数据加载策略
+
+```java
+// 写入时行式 → 压缩时列式
+public class HybridStorage {
+    // 写入缓冲（行式，写入友好）
+    List<Row> writeBuffer = new ArrayList<>();
+    
+    // 定期压缩（列式，读取友好）
+    public void compact() {
+        for (String column : columns) {
+            ColumnData data = collectColumn(writeBuffer, column);
+            data.compress().write(output);
+        }
+        writeBuffer.clear();
+    }
+}
+```
+
+> **核心结论**：OLTP 选行式，OLAP 选列式。理解数据的访问模式，是做出正确选择的前提。

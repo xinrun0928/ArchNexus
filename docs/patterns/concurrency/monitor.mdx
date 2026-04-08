@@ -1,0 +1,292 @@
+---
+description: 深入解析 Monitor Object 监视器模式 — synchronized 与条件等待机制
+---
+
+# Monitor Object 监视器模式
+
+想象你去医院挂号看病。挂号大厅（监视器）有个取号机，但只有拿到号的人才允许进入诊室候诊区。如果号被叫到了，你就进入诊室；没叫到，你就得在候诊区等着。医生（线程）依次叫号、看诊，叫完一个再叫下一个。
+
+这就是 **Monitor（监视器）模式**的核心：**一个对象拥有自己的私有状态和线程访问控制，只有获得「锁」的线程才能操作对象状态**。
+
+## Java 内置的 Monitor
+
+在 Java 中，**每个对象都是监视器**，每个对象头里都有关锁的标记。
+
+```mermaid
+graph LR
+    subgraph Object Header
+        M[Mark Word<br/>存储锁信息]
+    end
+
+    subgraph Monitor
+        O[Owner<br/>当前持有锁的线程]
+        E[EntryList<br/>等待获取锁的线程]
+        W[WaitSet<br/>调用 wait() 后等待的线程]
+    end
+
+    M --> Monitor
+```
+
+当线程进入 `synchronized` 方法/块时：
+
+1. 检查对象的 Mark Word 是否已加锁
+2. 如果未加锁，线程获取锁，Mark Word 指向自己的栈帧
+3. 如果已加锁，线程进入 EntryList 阻塞等待
+4. 持有锁的线程执行完 `synchronized` 块后，唤醒 EntryList 中的线程
+
+## synchronized 的 Monitorenter/Monitorexit
+
+`ynchronized` 关键字的背后，是 JVM 的 `monitorenter` 和 `monitorexit` 字节码指令：
+
+```java
+public class SafeCounter {
+    private int count = 0;
+
+    public synchronized void increment() {
+        count++; // 原子操作
+    }
+
+    public synchronized int get() {
+        return count;
+    }
+}
+```
+
+编译后的字节码：
+
+```java
+public synchronized void increment();
+  descriptor: ()V
+  flags: ACC_SYNCHRONIZED
+  Code:
+    stack=3, locals=1, args_size=1
+    0: aload_0
+    1: dup
+    2: astore_1
+    3: monitorenter    // 进入监视器
+    4: aload_0
+    5: getfield      #2
+    8: iconst_1
+    9: iadd
+    10: putfield     #2
+    13: aload_1
+    14: monitorexit   // 退出监视器
+    15: goto 25
+    18: aload_1
+    19: monitorexit   // 异常时也要释放锁
+    20: athrow
+```
+
+:::warning
+`synchronized` 块中有 return 语句时，JVM 会自动在 return 之前插入 `monitorexit`。如果 `synchronized` 块中抛出异常，JVM 会执行 `monitorexit` 释放锁，所以 synchronized 不会像 Lock 那样忘记释放。
+:::
+
+## wait()/notify()/notifyAll() 条件等待
+
+`synchronized` 只是互斥访问，但实际场景中，线程经常需要**等待某个条件满足**才能继续执行。
+
+```java
+public class Storage {
+    private final int capacity;
+    private int current = 0;
+
+    public Storage(int capacity) {
+        this.capacity = capacity;
+    }
+
+    // 生产者调用：满时等待
+    public synchronized void produce(int n) throws InterruptedException {
+        while (current + n > capacity) {
+            wait(); // 条件不满足，等待
+        }
+        current += n;
+        notifyAll(); // 通知消费者
+    }
+
+    // 消费者调用：空时等待
+    public synchronized void consume(int n) throws InterruptedException {
+        while (current < n) {
+            wait(); // 条件不满足，等待
+        }
+        current -= n;
+        notifyAll(); // 通知生产者
+    }
+}
+```
+
+**三个方法的作用**：
+
+| 方法 | 说明 |
+| --- | --- |
+| `wait()` | 释放锁，进入 WaitSet 等待，直到被其他线程唤醒 |
+| `notify()` | 从 WaitSet 中随机唤醒一个线程 |
+| `notifyAll()` | 唤醒 WaitSet 中所有线程 |
+
+**为什么用 while 而不是 if？**
+
+```java
+// 错误写法
+if (current < n) {
+    wait();
+}
+
+// 正确写法
+while (current < n) { // [!code highlight]
+    wait();
+}
+```
+
+因为 `notifyAll()` 会唤醒所有等待线程。假设容量为 10，两个消费者分别要取 8 个和 5 个。生产者放入 10 个后 `notifyAll()`，两个消费者都被唤醒：
+
+- 消费者 A 取走 8 个，剩余 2 个
+- 消费者 B 检查条件，发现 2 `<` 5，继续等待
+
+如果用 `if`，消费者 B 会继续执行，导致取负数。
+
+## wait() vs sleep()
+
+初学者经常混淆 `wait()` 和 `sleep()`：
+
+| 特性 | wait() | sleep() |
+| --- | --- | --- |
+| 所属 | Object | Thread |
+| 释放锁 | 是 | 否 |
+| 响应中断 | 是（抛出 InterruptedException） | 是（设置中断标志） |
+| 唤醒方式 | notify/notifyAll/interrupt 超时 | 超时/interrupt |
+| 适用场景 | 条件等待 | 简单延时 |
+
+```java
+// sleep 不释放锁
+synchronized (lock) {
+    Thread.sleep(1000); // 锁仍然被持有
+}
+
+// wait 释放锁
+synchronized (lock) {
+    while (conditionNotMet) {
+        lock.wait(); // 释放锁
+    }
+}
+```
+
+## 生产者-消费者条件同步
+
+用 Monitor 实现完整的生产者-消费者：
+
+```java
+public class ProducerConsumerMonitor<E> {
+    private final int capacity;
+    private final LinkedList<E> queue = new LinkedList<>();
+
+    public ProducerConsumerMonitor(int capacity) {
+        this.capacity = capacity;
+    }
+
+    // 生产
+    public synchronized void put(E e) throws InterruptedException {
+        while (queue.size() >= capacity) {
+            wait(); // 队列满，等待消费
+        }
+        queue.add(e);
+        System.out.println("生产: " + e);
+        notifyAll(); // 唤醒等待的消费者
+    }
+
+    // 消费
+    public synchronized E take() throws InterruptedException {
+        while (queue.isEmpty()) {
+            wait(); // 队列空，等待生产
+        }
+        E e = queue.remove();
+        System.out.println("消费: " + e);
+        notifyAll(); // 唤醒等待的生产者
+        return e;
+    }
+}
+```
+
+**测试**：
+
+```java
+public static void main(String[] args) {
+    ProducerConsumerMonitor<Integer> monitor = new ProducerConsumerMonitor<>(5);
+
+    // 生产者线程
+    Thread producer = new Thread(() -> {
+        for (int i = 0; i < 10; i++) {
+            try {
+                monitor.put(i);
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    });
+
+    // 消费者线程
+    Thread consumer = new Thread(() -> {
+        for (int i = 0; i < 10; i++) {
+            try {
+                monitor.take();
+                Thread.sleep(150);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    });
+
+    producer.start();
+    consumer.start();
+}
+```
+
+## 虚假唤醒问题
+
+**虚假唤醒（Spurious Wakeup）**是指 `wait()` 可能没有原因地被唤醒。虽然现代 JVM 已经很少发生，但代码必须能应对。
+
+**根本原因**：`wait()` 底层依赖 `pthread_cond_wait()`，这个函数在某些操作系统上可能虚假唤醒。
+
+**解决方案**：始终用 `while` 而不是 `if` 检查条件：
+
+```java
+// 标准写法：while + wait
+synchronized (obj) {
+    while (conditionIsFalse) { // [!code highlight]
+        obj.wait();
+    }
+    // 执行操作
+}
+```
+
+**为什么 notifyAll 比 notify 更安全**：
+
+- `notify()` 只唤醒一个等待线程，但如果唤醒的线程无法满足条件，它会再次 `wait()`
+- 如果只有部分线程被唤醒，可能导致死锁
+- `notifyAll()` 唤醒所有等待线程，正确的那个会执行，其他会继续等待
+
+## 总结与延伸
+
+Monitor 模式是 Java 并发的基础：
+
+**核心要素**：
+
+1. **互斥**：通过 synchronized 实现
+2. **等待/通知**：通过 wait/notify 实现
+3. **原子性**：整个操作在同一个锁保护下
+
+**使用场景**：
+
+- 条件等待：队列空/满、缓冲区满/空
+- 状态同步：状态机转换
+- 资源保护：计数器、库存
+
+**注意事项**：
+
+1. 始终用 `while` 而不是 `if` 检查条件
+2. `notify()` 可能导致信号丢失，优先使用 `notifyAll()`
+3. `wait()` 必须放在循环中，防止虚假唤醒
+4. 始终在 finally 中确保锁释放（虽然 synchronized 会自动处理）
+
+现代 Java 并发编程中，`java.util.concurrent` 提供了更高级的工具（如 `Condition`、`Semaphore`、`CountDownLatch`），但在理解这些高级工具之前，必须先理解 Monitor 的底层原理——它们不过是 Monitor 模式的不同封装形式。
+
+那么问题来了：`wait()` 释放锁后，线程进入 WaitSet。此时如果有新线程进入 `synchronized` 块修改了状态，WaitSet 中的线程被唤醒后能立即获取到锁吗？锁的获取顺序是怎样的？

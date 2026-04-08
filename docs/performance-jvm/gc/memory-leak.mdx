@@ -1,0 +1,287 @@
+# 内存泄漏排查实战
+
+内存泄漏是 Java 应用最常见的问题之一。当对象无法被 GC 回收且持续占用内存时，最终会导致 OutOfMemoryError。
+
+理解内存泄漏的成因、掌握排查方法，是每个 Java 开发者的必备技能。
+
+## 内存泄漏 vs 内存溢出
+
+这两个概念经常被混淆：
+
+| 概念 | 说明 | 区别 |
+| --- | --- | --- |
+| 内存泄漏（Memory Leak） | 对象无法被 GC 回收，持续占用内存 | 原因 |
+| 内存溢出（OutOfMemoryError） | 没有足够的内存分配给新对象 | 结果 |
+
+内存泄漏会导致内存溢出，但内存溢出不一定是内存泄漏引起的——也可能只是配置不当。
+
+## 常见泄漏原因
+
+### 原因一：集合未清理
+
+```java
+// 错误示例：集合只添加不删除
+public class CacheWithoutEviction {
+    private Map<String, Object> cache = new HashMap<>();
+    
+    public void add(String key, Object value) {
+        cache.put(key, value);  // 永远不删除
+    }
+}
+
+// 正确示例：使用带 TTL 的缓存
+public class CacheWithTTL {
+    private LoadingCache<String, Object> cache = Caffeine.newBuilder()
+        .maximumSize(10000)           // 最大容量
+        .expireAfterWrite(1, TimeUnit.HOURS)  // 写入后过期
+        .build(k -> loadFromDB(k));
+}
+```
+
+### 原因二：静态集合持有引用
+
+```java
+// 错误示例：静态集合持有大量对象引用
+public class StaticCache {
+    // 静态集合的生命周期与应用相同
+    private static final Map<String, Object> CACHE = new HashMap<>();
+    
+    public void add(String key, Object value) {
+        CACHE.put(key, value);  // 永不释放
+    }
+}
+
+// 正确示例：使用弱引用或定期清理
+public class WeakCache {
+    private static final Map<String, WeakReference<Object>> CACHE = 
+        new WeakHashMap<>();
+}
+```
+
+### 原因三：单例模式泄漏
+
+```java
+// 错误示例：单例持有外部引用
+public class LeakingSingleton {
+    private static LeakingSingleton instance;
+    private Object context;  // 持有 Activity 或 Context 引用
+    
+    public void setContext(Object context) {
+        this.context = context;  // Activity 销毁后无法回收
+    }
+}
+```
+
+### 原因四：监听器未注销
+
+```java
+// 错误示例：添加监听器但从未移除
+public class EventBusLeak {
+    private EventBus eventBus;
+    
+    public void register(Object listener) {
+        eventBus.register(listener);  // 注册后从未注销
+    }
+}
+
+// 正确示例：实现注销逻辑
+public class EventBusSafe {
+    private EventBus eventBus;
+    private Set<Object> listeners = new CopyOnWriteArraySet<>();
+    
+    public void register(Object listener) {
+        eventBus.register(listener);
+        listeners.add(listener);
+    }
+    
+    public void unregister() {
+        for (Object listener : listeners) {
+            eventBus.unregister(listener);
+        }
+        listeners.clear();
+    }
+}
+```
+
+### 原因五：ThreadLocal 未清理
+
+```java
+// 错误示例：ThreadLocal 使用后未清理
+public class ThreadLocalLeak {
+    private static final ThreadLocal<Connection> connThreadLocal = 
+        new ThreadLocal<>();
+    
+    public void process() {
+        connThreadLocal.set(getConnection());
+        // 使用后未清理
+    }
+}
+
+// 正确示例：使用后清理
+public class ThreadLocalSafe {
+    private static final ThreadLocal<Connection> connThreadLocal = 
+        new ThreadLocal<>();
+    
+    public void process() {
+        try {
+            connThreadLocal.set(getConnection());
+            // 使用连接
+        } finally {
+            connThreadLocal.remove();  // 使用后清理
+        }
+    }
+}
+```
+
+## 排查工具
+
+### 1. JConsole / JVisualVM
+
+```bash
+# 启动 JConsole
+jconsole
+
+# 启动 VisualVM
+jvisualvm
+```
+
+### 2. Arthas
+
+```bash
+# 安装 Arthas
+curl -O https://arthas.aliyun.com/arthas-boot.jar
+java -jar arthas-boot.jar
+
+# Arthas 命令
+dashboard                     # 查看内存使用
+heapdump /tmp/heap.hprof    # 导出堆转储
+memory                      # 查看内存详情
+```
+
+### 3. MAT（Memory Analyzer Tool）
+
+Eclipse MAT 是专业的堆转储分析工具。
+
+## 排查步骤
+
+### 第一步：观察监控
+
+```bash
+# 使用 jstat 观察内存增长趋势
+jstat -gcutil <pid> 1000
+
+# 输出示例
+S0C    S1C    S0U    S1U     EC     EU      OC     OU      MC    MU    YGC    YGCT    FGC    FGCT    GCT   
+0.0    0.0    0.0    0.0    2048.0  1024.0  65536.0  65536.0 131072.0 118000.0   123   12.345   67   234.567  246.912
+// 老年代 OU = 65536.0（100%），说明老年代持续增长
+```
+
+### 第二步：获取堆转储
+
+```bash
+# 方式一：jmap 导出
+jmap -dump:format=b,file=heap.hprof <pid>
+
+# 方式二：OOM 时自动导出
+java -XX:+UseG1GC \
+    -XX:+HeapDumpOnOutOfMemoryError \
+    -XX:HeapDumpPath=/path/to/dumps \
+    -jar application.jar
+
+# 方式三：Arthas heapdump
+heapdump --live /tmp/heap_live.hprof
+```
+
+### 第三步：分析堆转储
+
+```bash
+# 使用 MAT 分析
+# 1. 打开 MAT
+mat.sh heap.hprof
+
+# 2. 使用 Leak Suspects 报告
+# MAT 会自动分析可能的内存泄漏点
+
+# 3. 使用 Dominator Tree
+# 查看占用内存最多的对象
+```
+
+### 第四步：定位泄漏源
+
+```java
+// 在 MAT 中分析 Dominator Tree
+// 找到 Retained Heap 最大的对象
+// 查看 GC Roots 到该对象的引用路径
+
+// 典型泄漏模式：
+// 1. HashMap 持有大量对象
+// 2. 静态集合持续增长
+// 3. 监听器未注销
+// 4. ThreadLocal 未清理
+```
+
+## OOM 分析
+
+### 常见 OOM 类型
+
+| OOM 类型 | 说明 | 常见原因 |
+| --- | --- | --- |
+| `java.lang.OutOfMemoryError: Java heap space` | 堆内存不足 | 内存泄漏 / 配置不当 |
+| `java.lang.OutOfMemoryError: GC overhead limit exceeded` | GC 开销过大 | 堆太小 / 内存泄漏 |
+| `java.lang.OutOfMemoryError: Metaspace` | 元空间不足 | 类加载器泄漏 |
+| `java.lang.OutOfMemoryError: Unable to allocate new Java thread` | 线程数过多 | 线程泄漏 |
+
+### OOM 日志分析
+
+```java
+// OOM 时的堆转储信息
+java.lang.OutOfMemoryError: Java heap space
+Dumping heap to java_pid12345.hprof ...
+
+Heap
+ garbage-first heap   total 8388608KB, used 8388608KB  // 堆已满
+ region size 4096KB, 0 regions remaining
+```
+
+## 预防措施
+
+1. **使用自动管理的数据结构**：如 `WeakHashMap`、`WeakReference`
+2. **设置合理的缓存策略**：容量限制 + TTL
+3. **及时注销监听器**：注册和注销配对
+4. **ThreadLocal 用完清理**：`remove()` 方法
+5. **监控内存使用**：设置告警阈值
+6. **定期压测**：发现潜在问题
+
+## 真实案例
+
+### 案例：Spring Boot 应用的 ThreadLocal 泄漏
+
+某 Spring Boot 应用在重新部署后出现内存泄漏。
+
+分析：
+
+1. 使用 ThreadLocal 存储用户信息
+2. 在 Filter 中设置 ThreadLocal
+3. Filter 正常执行完毕
+4. 但某些异步任务持有线程引用
+
+解决方案：
+
+```java
+// 在 finally 中清理 ThreadLocal
+public class UserContextFilter extends OncePerRequestFilter {
+    private static final ThreadLocal<UserContext> USER_CONTEXT = 
+        new ThreadLocal<>();
+    
+    @Override
+    protected void doFilterInternal(...) throws ServletException {
+        try {
+            // 设置上下文
+            USER_CONTEXT.set(parseToken(request));
+            filterChain.doFilter(...);
+        } finally {
+            USER_CONTEXT.remove();  // 清理
+        }
+    }
+}
+```

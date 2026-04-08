@@ -1,0 +1,297 @@
+# 读写锁（ReentrantReadWriteLock）
+
+读写锁是针对读多写少场景的优化。多个线程可以同时读取，但写操作需要独占访问。ReentrantReadWriteLock 实现了读锁和写锁的分离，能显著提升读密集型系统的吞吐量。
+
+## 为什么需要读写锁
+
+### 场景分析
+
+```mermaid
+flowchart LR
+    subgraph synchronized 模式
+        A["读线程 1"] --> |"独占| B["锁"]
+        C["读线程 2"] --> |"等待| B
+        D["读线程 3"] --> |"等待| B
+    end
+
+    subgraph 读写锁模式
+        E["读线程 1"] --> |"共享| F["读锁"]
+        G["读线程 2"] --> |"共享| F
+        H["读线程 3"] --> |"共享| F
+        I["写线程 1"] --> |"独占| J["写锁"]
+    end
+```
+
+### 性能对比
+
+| 场景 | synchronized | ReentrantReadWriteLock |
+| --- | --- | --- |
+| 100% 读 | 串行 | 并行 |
+| 100% 写 | 串行 | 串行 |
+| 读 99% 写 1% | 串行 | 接近并行 |
+
+## 锁的互斥规则
+
+### 基本规则
+
+| 组合 | 是否允许 | 说明 |
+| --- | --- | --- |
+| 读 + 读 | 是 | 多个线程同时读取 |
+| 读 + 写 | 否 | 写时不能读 |
+| 写 + 读 | 否 | 读时不能写 |
+| 写 + 写 | 否 | 写操作互斥 |
+
+### 状态表示
+
+ReentrantReadWriteLock 使用 AQS 的 state 高低位分离表示锁计数：
+
+```mermaid
+flowchart LR
+    subgraph state (32 位 int)
+        A["高 16 位\n读锁计数"] --> B["低 16 位\n写锁计数"]
+    end
+```
+
+```java
+static final int SHARED_SHIFT   = 16;
+static final int SHARED_UNIT    = (1 << SHARED_SHIFT);  // 0x00010000
+static final int MAX_COUNT      = (1 << SHARED_SHIFT) - 1;  // 最大重入数
+static final int EXCLUSIVE_MASK = (1 << SHARED_SHIFT) - 1;  // 0x0000FFFF
+
+// 读锁计数
+static int sharedCount(int c) { return c >>> SHARED_SHIFT; }
+// 写锁计数
+static int exclusiveCount(int c) { return c & EXCLUSIVE_MASK; }
+```
+
+## 基本用法
+
+### 创建和获取
+
+```java
+ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+Lock readLock = rwLock.readLock();
+Lock writeLock = rwLock.writeLock();
+
+// 读操作：获取读锁
+readLock.lock();
+try {
+    T data = cache.get(key);
+    return data;
+} finally {
+    readLock.unlock();
+}
+
+// 写操作：获取写锁
+writeLock.lock();
+try {
+    cache.put(key, value);
+} finally {
+    writeLock.unlock();
+}
+```
+
+### 读写锁的升级
+
+```java
+// 读锁 -> 写锁：需要释放读锁后再获取写锁
+readLock.lock();
+try {
+    // ...
+    readLock.unlock();  // 释放读锁
+    writeLock.lock();   // 获取写锁
+    try {
+        // 写操作
+    } finally {
+        writeLock.unlock();
+    }
+    // 如果需要继续持有读锁，需要重新获取
+    readLock.lock();
+} finally {
+    readLock.unlock();
+}
+```
+
+**注意**：ReentrantReadWriteLock 不支持从读锁直接升级到写锁，这会导致死锁。
+
+### 写锁 -> 读锁：锁降级
+
+```java
+writeLock.lock();
+try {
+    // 持有写锁
+    T data = computeData();
+    cache.put(key, data);
+
+    // 锁降级：获取读锁后释放写锁
+    readLock.lock();
+} finally {
+    writeLock.unlock();  // 释放写锁
+}
+
+try {
+    // 继续使用数据
+    return data;
+} finally {
+    readLock.unlock();
+}
+```
+
+## 公平性
+
+### 公平锁
+
+```java
+ReentrantReadWriteLock fairLock = new ReentrantReadWriteLock(true);
+```
+
+公平模式下，等待时间最长的线程优先获取锁。
+
+### 非公平锁
+
+```java
+ReentrantReadWriteLock unfairLock = new ReentrantReadWriteLock(false);  // 默认
+```
+
+非公平模式下，新线程可能插队。但读锁是共享的，所以非公平读写锁的读性能通常比公平版本好。
+
+## 锁状态监控
+
+```java
+ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+// 获取写锁持有的线程
+Thread writer = rwLock.getOwner();
+
+// 获取等待队列长度
+int waiting = rwLock.getWriteQueueLength();
+
+// 查询读锁是否被持有
+boolean readHeld = rwLock.isReadLocked();
+
+// 查询当前线程持有的读锁数
+int readHoldCount = rwLock.getReadHoldCount();
+
+// 获取所有等待的线程
+Collection<Thread> waitingThreads = rwLock.getQueuedThreads();
+```
+
+## 应用场景
+
+### 缓存
+
+```java
+public class ReadWriteCache<K, V> {
+
+    private final Map<K, V> cache = new HashMap<>();
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public V get(K key) {
+        rwLock.readLock().lock();
+        try {
+            return cache.get(key);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public void put(K key, V value) {
+        rwLock.writeLock().lock();
+        try {
+            cache.put(key, value);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    public void clear() {
+        rwLock.writeLock().lock();
+        try {
+            cache.clear();
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+}
+```
+
+### 读写分离的数据结构
+
+```java
+public class ReadWriteList<T> {
+
+    private final List<T> list = new ArrayList<>();
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public T get(int index) {
+        rwLock.readLock().lock();
+        try {
+            return list.get(index);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public void add(T element) {
+        rwLock.writeLock().lock();
+        try {
+            list.add(element);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    public int size() {
+        rwLock.readLock().lock();
+        try {
+            return list.size();
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+}
+```
+
+## StampedLock 简介
+
+JDK 8 引入了 StampedLock，提供乐观读锁，比 ReentrantReadWriteLock 的读锁更轻量。
+
+### 特点
+
+- **乐观读锁**：假设没有写操作，直接读取；如果发现被修改则升级为读锁
+- **更高效**：读操作不需要 CAS
+- **支持写锁升级**：可以从乐观读升级为写锁
+
+### 示例
+
+```java
+StampedLock sl = new StampedLock();
+
+// 乐观读
+long stamp = sl.tryOptimisticRead();
+T data = cache.get(key);
+
+// 验证
+if (!sl.validate(stamp)) {
+    // 被修改，需要升级为读锁
+    stamp = sl.readLock();
+    try {
+        data = cache.get(key);
+    } finally {
+        sl.unlockRead(stamp);
+    }
+}
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **读写锁分离**：读锁共享，写锁独占
+2. **适用场景**：读多写少的数据访问
+3. **锁升级**：不支持读锁升级为写锁（会死锁）
+4. **锁降级**：支持写锁降级为读锁
+5. **StampedLock**：更轻量的读写锁，支持乐观读
+6. **注意**：读写锁的获取和释放必须配对
+
+读写锁是读多写少场景的利器。下一节我们将讲解 StampedLock 的更多细节。

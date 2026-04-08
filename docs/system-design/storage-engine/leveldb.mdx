@@ -1,0 +1,296 @@
+# LevelDB 架构解析
+
+2007 年，Google BigTable 论文发表，描述了一种名为 SSTable + MemTable 的存储结构。2009 年，两位 Google 工程师基于这个设计实现了 LevelDB——一个轻量级的嵌入式 KV 存储。
+
+LevelDB 是 LSM Tree 的经典实现，理解它是理解 RocksDB 的基础。
+
+## LevelDB 架构
+
+```mermaid
+flowchart TB
+    subgraph Memory["内存"]
+        MemTable["MemTable (SkipList)"]
+        Immutable["Immutable MemTable"]
+    end
+    
+    subgraph Disk["磁盘"]
+        WAL["WAL"]
+        L0["L0: 4 个 SSTable"]
+        L1["L1: ~10 个 SSTable"]
+        L2["L2: ~100 个 SSTable"]
+        L3["L3: ~1000 个 SSTable"]
+    end
+    
+    subgraph Manifest["元数据"]
+        Current["CURRENT"]
+        Manifest["MANIFEST"]
+    end
+    
+    MemTable --> |写满| Immutable
+    Immutable --> |刷盘| L0
+    L0 --> |合并| L1
+    L1 --> |合并| L2
+    L2 --> |合并| L3
+```
+
+## 核心组件
+
+### MemTable
+
+内存中的有序数据结构，使用跳表（SkipList）实现：
+
+```cpp
+// LevelDB MemTable 伪代码
+class MemTable {
+ private:
+  SkipList<const Key&, KeyComparator> table_;
+  
+ public:
+  void Add(SequenceNumber seq, ValueType type,
+           const Slice& key, const Slice& value) {
+    // 将操作编码为指定格式
+    std::string encoded;
+    AppendInternalKey(&encoded, ParsedKey{key, seq, type});
+    table_.Insert(encoded);
+  }
+  
+  Iterator* NewIterator() {
+    return new MemTableIterator(table_);
+  }
+};
+```
+
+### Immutable MemTable
+
+MemTable 写满后，变为只读的 Immutable MemTable，同时后台线程开始刷盘：
+
+```cpp
+void DBImpl::MaybeScheduleFlush() {
+  if (bg_flush_scheduled_) return;
+  
+  bg_flush_scheduled_ = true;
+  env_->Schedule(&DBImpl::BGWork, this);
+}
+
+void DBImpl::BGWork(void* db) {
+  static_cast<DBImpl*>(db)->FlushMemTable();
+}
+
+Status DBImpl::FlushMemTable() {
+  // 1. 构建 TableBuilder
+  TableBuilder builder(output_file);
+  
+  // 2. 遍历 Immutable MemTable
+  Iterator* iter = imm_->NewIterator();
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    builder.Add(iter->key(), iter->value());
+  }
+  
+  // 3. 写入 SSTable
+  builder.Finish();
+}
+```
+
+### WAL（预写日志）
+
+每次写入 MemTable 前，先写入 WAL：
+
+```cpp
+void LogWriter::AddRecord(const Slice& slice) {
+  // 追加写入日志文件
+  // 日志格式: [Checksum | Length | Data]
+  // 确保数据持久化后再写 MemTable
+}
+```
+
+## SSTable 结构
+
+LevelDB 的 SSTable 结构：
+
+```
+┌─────────────────────────────────────┐
+│ Data Block 1 (64KB)                 │
+│ ┌─────────────────────────────────┐ │
+│ │ key1 → value1                   │ │
+│ │ key2 → value2                   │ │
+│ │ ...                             │ │
+│ └─────────────────────────────────┘ │
+├─────────────────────────────────────┤
+│ Data Block 2                        │
+├─────────────────────────────────────┤
+│ ...                                  │
+├─────────────────────────────────────┤
+│ Meta Index Block (Bloom Filter)     │
+├─────────────────────────────────────┤
+│ Index Block                         │
+│   key_last_in_block → offset, size   │
+├─────────────────────────────────────┤
+│ Footer                              │
+│   Meta Index Handle                  │
+│   Index Handle                       │
+└─────────────────────────────────────┘
+```
+
+## Manifest 文件
+
+Manifest 记录每个 Level 的 SSTable 信息：
+
+```
+Manifest:
+  Version 1:
+    L0: [SSTable-A, SSTable-B]
+    L1: [SSTable-C]
+  Version 2:
+    L0: [SSTable-A, SSTable-B, SSTable-C]
+    L1: []
+```
+
+每次 Compaction 后生成新版本 Manifest：
+
+```cpp
+void VersionSet::Finalize() {
+  // 计算每个 Level 的文件数量限制
+  // L0: 由刷盘触发，无固定上限
+  // L1+: 由公式计算: TargetSize(Lk) = 10^(k) * 10MB
+  // 例如: L1 = 100MB, L2 = 1GB, L3 = 10GB
+}
+```
+
+## Compaction 流程
+
+### 触发条件
+
+- L0 文件数达到 4 个
+- L1+ 的总大小超过限制
+
+### Compaction 策略
+
+```cpp
+void DBImpl::BackgroundCompaction() {
+  // 1. 选择需要合并的文件
+  Compaction* c = versions_->PickCompaction();
+  
+  // 2. 合并选中的 SSTable 和下一层的 SSTable
+  Iterator* input = NewCompactionIterator(c);
+  
+  // 3. 创建新的 SSTable
+  TableBuilder builder(output_file);
+  
+  while (input->Valid()) {
+    builder.Add(input->key(), input->value());
+    input->Next();
+  }
+  
+  // 4. 写入新 SSTable
+  builder.Finish();
+  
+  // 5. 删除旧 SSTable
+  DeleteObsoleteFiles();
+}
+```
+
+## Snapshots
+
+LevelDB 支持创建只读快照，读取快照时看到的是创建时的数据状态：
+
+```cpp
+// 创建快照
+const ReadOptions options;
+options.snapshot = db->GetSnapshot();
+
+// 读取（基于快照）
+Iterator* iter = db->NewIterator(options);
+for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+  // 读取快照中的数据
+}
+
+db->ReleaseSnapshot(options.snapshot);
+```
+
+### 快照实现
+
+```cpp
+class Version {
+ public:
+  // 每个 Version 持有当前所有 SSTable 的引用
+  std::vector<FileMetaData*> files_[config::kNumLevels];
+};
+
+class VersionSet {
+  std::vector<Version*> versions_;  // 所有历史版本
+  Version* current_;                // 当前版本
+};
+
+// 快照只是指向某个 Version 的指针
+// 该 Version 不会被 Compaction 回收
+```
+
+## 错误处理与恢复
+
+### 崩溃恢复
+
+```cpp
+void DBImpl::RecoverLogFile(uint64_t log_number) {
+  // 1. 读取 WAL
+  SequentialFile* log_file;
+  env_->NewSequentialFile(LogFileName(...), &log_file);
+  LogReader reader(log_file);
+  
+  // 2. 重放每条日志
+  while (reader.ReadRecord(&record)) {
+    // 应用到 MemTable
+    memtable_->Add(record.seq, record.type, 
+                   record.key, record.value);
+  }
+  
+  // 3. 刷盘并清理日志
+  FlushMemTable();
+  DeleteFile(log_number);
+}
+```
+
+## LevelDB vs RocksDB
+
+| 特性 | LevelDB | RocksDB |
+|---|---|---|
+| 线程安全 | 否（需要外部锁） | 是（内置锁） |
+| 并发 Compaction | 否 | 是（多线程） |
+| Column Family | 不支持 | 支持 |
+| Compaction Filter | 不支持 | 支持 |
+| Iterator Bounds | 不支持 | 支持 |
+| 统计信息 | 有限 | 完整 |
+| 适用场景 | 单线程、简单场景 | 生产环境 |
+
+## 使用示例
+
+```cpp
+#include <leveldb/db.h>
+
+leveldb::DB* db;
+leveldb::Options options;
+options.create_if_missing = true;
+
+leveldb::Status status = leveldb::DB::Open(options, "/tmp/testdb", &db);
+if (!status.ok()) {
+  // 处理错误
+}
+
+// 写入
+db->Put(leveldb::WriteOptions(), "key1", "value1");
+
+// 读取
+std::string value;
+status = db->Get(leveldb::ReadOptions(), "key1", &value);
+
+// 遍历
+leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+for (it->SeekToFirst(); it->Valid(); it->Next()) {
+  std::cout << it->key().ToString() << ": " 
+            << it->value().ToString() << std::endl;
+}
+delete it;
+
+delete db;
+```
+
+> **设计哲学**：LevelDB 的设计理念是「简单而正确」。它只做一件事：提供一个高效的嵌入式 KV 存储。它没有分布式、没有副本、没有复杂的事务——这些都在上层实现。如果你需要这些功能，可以基于 LevelDB 构建（如 RocksDB），或者使用其他系统。

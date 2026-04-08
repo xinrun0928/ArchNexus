@@ -1,0 +1,283 @@
+---
+description: 服务注册中心
+---
+
+# 服务注册中心
+
+2020 年，Netflix 宣布 Eureka 2.x 停止开源维护。消息一出，整个 Spring Cloud 社区炸锅了。很多公司的微服务架构都是基于 Eureka 构建的，Eureka 停更意味着什么？以后怎么选型？
+
+这是技术选型的残酷真相：**你依赖的开源组件，可能有一天就不再维护了。** Eureka 停更不是个案，类似的还有 Spring Cloud Config 的衰退、Feign 的缓慢迭代。微服务架构的组件选择，需要有前瞻性。
+
+**服务注册中心是微服务架构的核心组件，负责服务实例的注册、发现、健康检查。** 选择哪个注册中心，不只是技术问题，更关乎项目的长期稳定性。
+
+## Eureka：AP 模型，自我保护
+
+Eureka 是 Netflix 开源的服务注册中心，Spring Cloud Netflix 对其做了深度集成，是早期 Spring Cloud 项目的主流选择。
+
+### 核心特性
+
+**AP 模型**：Eureka 保证可用性（Availability）和分区容错性（Partition tolerance），但不保证强一致性（Consistency）。当网络分区发生时，Eureka 各节点之间无法同步信息，但每个节点仍然可以响应服务查询请求。
+
+**去中心化**：Eureka 不需要主节点，各节点平等对等。这意味着 Eureka 没有单点故障，但也意味着各节点之间的数据可能短暂不一致。
+
+**自我保护模式**：当 Eureka Server 在 15 分钟内收到的续约次数低于期望值的 85% 时，会进入自我保护模式，不剔除服务实例。自我保护是为了应对网络分区，但也会导致已宕机的实例仍在列表中。
+
+### Eureka Server 配置
+
+```yaml title="application.yml"
+eureka:
+  instance:
+    hostname: ${HOSTNAME}
+  client:
+    # Eureka Server 不需要注册自己
+    register-with-eureka: false
+    fetch-registry: false
+    service-url:
+      defaultZone: http://peer1:8761/eureka/,http://peer2:8762/eureka/,http://peer3:8763/eureka/
+  server:
+    # 关闭自我保护（可选）
+    enable-self-preservation: true
+    eviction-interval-timer-in-ms: 5000
+    renewal-percent-threshold: 0.85
+```
+
+### Eureka 高可用部署
+
+Eureka 通过互相注册实现高可用：
+
+```yaml title="eureka-server-1.yml"
+eureka:
+  instance:
+    hostname: eureka-1
+  client:
+    service-url:
+      defaultZone: http://eureka-2:8762/eureka/,http://eureka-3:8763/eureka/
+```
+
+```yaml title="eureka-server-2.yml"
+eureka:
+  instance:
+    hostname: eureka-2
+  client:
+    service-url:
+      defaultZone: http://eureka-1:8761/eureka/,http://eureka-3:8763/eureka/
+```
+
+### Eureka 的局限
+
+- Eureka 2.x 停止开源，Spring Cloud 只支持到 2020.0 版本
+- 不支持跨数据中心的服务发现
+- 没有管理界面，需要额外安装 Dashboard
+- 健康检查功能相对简单
+
+## Consul：CP 模型，KV 存储
+
+Consul 是 HashiCorp 开源的服务网格解决方案，包含服务发现、健康检查、K/V 存储、多数据中心支持。相比 Eureka，Consul 更适合生产环境。
+
+### 核心特性
+
+**CP 模型**：Consul 使用 Raft 协议保证一致性。当网络分区时，Consul 牺牲可用性，保证一致性。不支持过期的节点响应查询。
+
+**多数据中心**：Consul 原生支持多数据中心，每个数据中心独立运行，通过 WAN Gossip 协议互联。这对于需要跨地域部署的系统很有价值。
+
+**服务健康检查**：Consul 支持多种健康检查方式：HTTP、TCP、Docker、Script，更灵活。
+
+**K/V 存储**：Consul 内置 K/V 存储，可以用于动态配置、服务元数据存储。
+
+### Consul Agent 配置
+
+```json title="consul-agent.json"
+{
+  "datacenter": "dc1",
+  "data_dir": "/var/consul",
+  "ui_config": {
+    "enabled": true
+  },
+  "ports": {
+    "dns": 8600,
+    "http": 8500,
+    "https": -1,
+    "grpc": 8502
+  },
+  "recursors": ["8.8.8.8"],
+  "start_join": ["consul-1", "consul-2", "consul-3"],
+  "enable_script_checks": false,
+  "disable_update_check": true
+}
+```
+
+### Consul 服务注册
+
+```java title="ConsulServiceRegistration.java"
+@Configuration
+public class ConsulServiceRegistration {
+    
+    @Bean
+    public ConsulRegistration consulRegistration(
+            ConsulProperties consulProperties,
+            ApplicationContext context) {
+        
+        SpringContextService springContextService = new SpringContextService(context);
+        
+        return ConsulRegistration.builder()
+            .serviceId(springContextService.getId())
+            .address(springContextService.getAddress())
+            .port(springContextService.getPort())
+            .tags(Arrays.asList("v1", "zone=a"))
+            .check(Registration.builder()
+                .tcp(springContextService.getAddress() + ":" + springContextService.getPort())
+                .interval("10s")
+                .deregisterCriticalServiceAfter("1m")
+                .build())
+            .build();
+    }
+}
+```
+
+### Consul 与 Spring Cloud 集成
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    consul:
+      host: consul-server
+      port: 8500
+      discovery:
+        instance-id: ${spring.application.name}:${spring.cloud.client.ip-address}:${server.port}
+        prefer-ip-address: true
+        health-check-path: /actuator/health
+        health-check-interval: 10s
+        tags:
+          version: v1
+```
+
+## Nacos：AP + CP 双模式
+
+Nacos 是阿里巴巴开源的动态服务发现和配置管理平台，同时支持服务注册发现和配置管理。相比 Consul，Nacos 更轻量，集成度更高。
+
+### 核心特性
+
+**双模式切换**：Nacos 支持 AP 和 CP 两种一致性模式，可以在控制台动态切换：
+
+- AP 模式：适用于注册中心场景，保证可用性
+- CP 模式：适用于配置管理场景，保证一致性
+
+**统一平台**：同时支持服务发现和配置管理，不需要部署两套系统。
+
+**管理界面**：开箱即用的管理界面，支持配置管理、服务管理、权限管理。
+
+**多语言支持**：提供 OpenAPI，可以被任何语言调用。
+
+### Nacos 配置
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    nacos:
+      discovery:
+        server-addr: nacos-server:8848
+        namespace: ${NACOS_NAMESPACE:public}
+        group: DEFAULT_GROUP
+        cluster-name: DEFAULT
+      config:
+        server-addr: nacos-server:8848
+        file-extension: yaml
+        namespace: ${NACOS_NAMESPACE:public}
+        group: DEFAULT_GROUP
+```
+
+### Nacos 服务注册
+
+```java title="NacosService.java"
+@SpringBootApplication
+@EnableDiscoveryClient
+public class NacosServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(NacosServiceApplication.class, args);
+    }
+}
+```
+
+```yaml title="application.yml"
+spring:
+  application:
+    name: user-service
+  cloud:
+    nacos:
+      discovery:
+        enabled: true
+        register-enabled: true
+        heart-beat-interval: 5000
+        heart-beat-timeout: 15000
+        ip-delete-timeout: 30000
+```
+
+## Zookeeper：CP，强一致
+
+Zookeeper 是 Apache 开源的分布式协调服务，传统的服务注册中心选择之一。相比 Eureka 和 Consul，Zookeeper 更老牌，但也更重。
+
+### 核心特性
+
+**CP 模型**：Zookeeper 使用 Zab 协议保证强一致性。当 Leader 节点宕机时，会重新选举，在选举期间服务不可用。对于需要强一致性的场景，Zookeeper 是合适的选择。
+
+**临时节点**：服务实例注册为临时节点，实例宕机或断开连接时，节点自动删除。这实现了健康检查的效果。
+
+**Watch 机制**：客户端可以监听节点变化，当服务实例变化时，Zookeeper 通知所有订阅的客户端。
+
+### Zookeeper 连接配置
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    zookeeper:
+      connect-string: zk-server:2181
+      discovery:
+        root: /services
+        enabled: true
+        instance-selector: ${spring.application.name}
+```
+
+### Zookeeper 的局限
+
+- 写入性能较差，不适合大量实例频繁上线下线的场景
+- 不支持健康检查，需要自行实现
+- 学习曲线陡峭，运维复杂
+- 需要额外部署 Curator 库
+
+## 选型对比
+
+| 维度 | Eureka | Consul | Nacos | Zookeeper |
+| --- | --- | --- | --- | --- |
+| **一致性模型** | AP | CP | AP + CP | CP |
+| **多数据中心** | 不支持 | 原生支持 | 支持 | 不支持 |
+| **健康检查** | 心跳续约 | 多方式 | 多方式 | 临时节点 |
+| **配置管理** | 不支持 | K/V 存储 | 原生支持 | K/V 存储 |
+| **管理界面** | Dashboard | 原生 UI | 原生 UI | 不支持 |
+| **多语言支持** | Java 为主 | 完善 | 完善 | 完善 |
+| **运维复杂度** | 低 | 中 | 低 | 高 |
+| **社区活跃度** | 低（已停更） | 高 | 高 | 中 |
+| **适用规模** | 中小型 | 中大型 | 中大型 | 中型 |
+
+### 选型建议
+
+**选 Eureka**：项目规模小，技术栈单一（Java），团队熟悉 Spring Cloud。**但要注意 Eureka 停更的风险。**
+
+**选 Consul**：需要多数据中心支持，对一致性有要求，需要健康检查、K/V 存储等丰富功能。
+
+**选 Nacos**：需要同时管理服务发现和配置中心，不想维护两套系统，团队在国内。**Nacos 是目前国内最推荐的方案。**
+
+**选 Zookeeper**：需要强一致性，对分布式锁、选主有需求，但不建议单独作为服务注册中心使用。
+
+## 运维考量
+
+无论选择哪个注册中心，以下运维实践都是必须的：
+
+**高可用部署**：至少 3 个节点，避免单点故障。Eureka 多节点互相注册，Consul 3-5 节点 Raft 集群，Nacos 集群模式。
+
+**容量规划**：评估服务实例数量、变更频率、心跳开销。Zookeeper 对大量实例变更不友好，需要提前评估。
+
+**监控告警**：监控注册中心的健康状态、节点数量、注册实例数量。设置告警阈值，及时发现异常。
+
+**灾难恢复**：制定注册中心不可用的应急预案。当注册中心全部宕机时，服务还能不能正常调用？
+
+注册中心是微服务架构的「大脑」。选型时不能只看功能，更要考虑长期维护成本和社区支持情况。

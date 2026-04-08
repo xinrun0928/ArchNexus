@@ -1,0 +1,458 @@
+# JMH 实战：Java 微基准测试
+
+JMH（Java Microbenchmark Harness）是 OpenJDK 提供的微基准测试工具，专门解决 Java 微基准测试的各种坑。JIT 预热、死代码消除、内存缓存效应——这些在普通测试中容易被忽略的因素，在微基准测试中可能导致完全错误的结论。
+
+## JMH 快速入门
+
+### Maven 配置
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>jmh-demo</artifactId>
+    <version>1.0</version>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <jmh.version>1.37</jmh.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>${jmh.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>${jmh.version}</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <finalName>benchmarks</finalName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>org.openjdk.jmh.Main</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+### 第一个 JMH 测试
+
+```java
+package com.example;
+
+import org.openjdk.jmh.annotations.*;
+import org.openjdk.jmh.runner.Runner;
+import org.openjdk.jmh.runner.RunnerException;
+import org.openjdk.jmh.runner.options.Options;
+import org.openjdk.jmh.runner.options.OptionsBuilder;
+
+@BenchmarkMode(Mode.Throughput)
+@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@State(Scope.Thread)
+public class FirstBenchmark {
+
+    @Benchmark
+    public String stringConcat() {
+        return "Hello" + " " + "World";
+    }
+
+    public static void main(String[] args) throws RunnerException {
+        Options opt = new OptionsBuilder()
+            .include(FirstBenchmark.class.getSimpleName())
+            .forks(1)
+            .build();
+        new Runner(opt).run();
+    }
+}
+```
+
+运行结果：
+
+```bash
+$ java -jar target/benchmarks.jar
+
+Benchmark                       Mode  Cnt    Score    Error  Units
+FirstBenchmark.stringConcat   thrpt       50000.000  ~      ops/ms
+```
+
+## @Benchmark 注解详解
+
+### 测试模式
+
+```java
+@BenchmarkMode(Mode.Throughput)     // 吞吐量：每秒操作数
+@BenchmarkMode(Mode.AverageTime)   // 平均时间：每次操作耗时
+@BenchmarkMode(Mode.SampleTime)    // 采样时间：百分位数
+@BenchmarkMode(Mode.SingleShotTime) // 单次运行：冷启动测试
+@BenchmarkMode(Mode.All)            // 运行所有模式
+```
+
+### 测量配置
+
+```java
+@Measurement(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
+// 5 次迭代，每次 1 秒
+
+@Warmup(iterations = 3, time = 500, timeUnit = TimeUnit.MILLISECONDS)
+// 3 次预热迭代，每次 500ms
+```
+
+### Fork 配置
+
+```java
+@Fork(value = 3, warmups = 2)
+// 运行 3 次独立的 JVM 进程
+// 每次进程前预热 2 次
+
+@Fork(0)
+// 在当前 JVM 中运行（不推荐，可能受其他因素干扰）
+```
+
+### 线程配置
+
+```java
+@Threads(1)     // 单线程
+@Threads(4)     // 4 线程
+@Threads.MAX)   // 最大可用线程
+```
+
+## JMH 常见陷阱
+
+### 陷阱一：死代码消除
+
+JMH 优化器会消除「没有副作用」的代码，导致测试结果不准确。
+
+**错误示例**：
+
+```java
+@Benchmark
+public int deadCodeTrap() {
+    int sum = 0;
+    for (int i = 0; i < 1000; i++) {
+        sum += i; // 这个计算可能被消除
+    }
+    return sum; // 只返回结果，没有其他副作用
+}
+```
+
+**正确示例**：
+
+```java
+@Benchmark
+public Blackhole blackholeUsage(Blackhole bh) {
+    int sum = 0;
+    for (int i = 0; i < 1000; i++) {
+        sum += i;
+    }
+    bh.consume(sum); // 使用 Blackhole 消费结果
+}
+```
+
+### 陷阱二：常量折叠
+
+编译器会提前计算常量表达式，导致测试不准确。
+
+**错误示例**：
+
+```java
+@Benchmark
+public double constantFolding() {
+    // JIT 会优化为 return 0.5，因为 Math.PI 是常量
+    return Math.PI * 0.5;
+}
+```
+
+**正确示例**：
+
+```java
+private double factor;
+
+@Setup
+public void setup() {
+    factor = Math.random(); // 使用非 final 的变量
+}
+
+@Benchmark
+public double noFolding() {
+    return Math.PI * factor;
+}
+```
+
+### 陷阱三：缓存效应
+
+测试方法调用的顺序会影响缓存命中率。
+
+```java
+@Benchmark
+public void testCacheEffect(Blackhole bh) {
+    // 循环访问，缓存友好
+    for (int i = 0; i < array.length; i++) {
+        bh.consume(array[i]);
+    }
+}
+```
+
+### 陷阱四：内存布局
+
+对象在内存中的布局会影响缓存命中率和 GC 行为。
+
+```java
+// 错误：每次创建新对象
+@Benchmark
+public List<String> objectCreationTrap() {
+    List<String> list = new ArrayList<>();
+    for (int i = 0; i < 100; i++) {
+        list.add("item" + i);
+    }
+    return list;
+}
+
+// 正确：复用对象
+@State(Scope.Thread)
+public static class MyState {
+    List<String> list = new ArrayList<>();
+}
+
+@Benchmark
+public void objectReuse(MyState state, Blackhole bh) {
+    state.list.clear();
+    for (int i = 0; i < 100; i++) {
+        state.list.add("item" + i);
+    }
+    bh.consume(state.list);
+}
+```
+
+### 陷阱五：分支预测
+
+分支预测会影响性能，但 JIT 可能会优化掉分支。
+
+```java
+@Benchmark
+public int branchPrediction(Random random) {
+    int sum = 0;
+    for (int i = 0; i < 1000; i++) {
+        // 随机分支，CPU 分支预测失败率高
+        if (random.nextBoolean()) {
+            sum += i;
+        } else {
+            sum -= i;
+        }
+    }
+    return sum;
+}
+```
+
+## JMH 进阶用法
+
+### 参数化测试
+
+```java
+@State(Scope.Thread)
+public static class ParamState {
+    @Param({"10", "100", "1000", "10000"})
+    public int size;
+
+    public int[] array;
+    public List<Integer> list;
+
+    @Setup
+    public void setup() {
+        array = new int[size];
+        list = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            array[i] = i;
+            list.add(i);
+        }
+    }
+}
+
+@Benchmark
+public int arrayLoop(ParamState state) {
+    int sum = 0;
+    for (int i = 0; i < state.size; i++) {
+        sum += state.array[i];
+    }
+    return sum;
+}
+
+@Benchmark
+public int listLoop(ParamState state) {
+    int sum = 0;
+    for (int i = 0; i < state.size; i++) {
+        sum += state.list.get(i);
+    }
+    return sum;
+}
+```
+
+### 自定义计数器
+
+```java
+@State
+public static class CounterState {
+    public long operations = 0;
+}
+
+@Benchmark
+public void customCounter(CounterState state, Blackhole bh) {
+    for (int i = 0; i < 1000; i++) {
+        state.operations++;
+        bh.consume(i);
+    }
+}
+
+@TearDown
+public void printCounter(CounterState state) {
+    System.out.println("Total operations: " + state.operations);
+}
+```
+
+### JMH 基准测试项目结构
+
+```
+jmh-demo/
+├── pom.xml
+└── src/
+    └── main/
+        └── java/
+            └── com/
+                └── example/
+                    ├── StringBenchmark.java
+                    ├── CollectionBenchmark.java
+                    └── ParallelBenchmark.java
+```
+
+### 运行多个基准测试
+
+```bash
+# 运行所有基准测试
+java -jar target/benchmarks.jar
+
+# 运行指定的基准测试
+java -jar target/benchmarks.jar -i 5 -f 3 StringBenchmark
+
+# 输出为 JSON 格式
+java -jar target/benchmarks.jar -rf json -rff result.json
+
+# 指定线程数
+java -jar target/benchmarks.jar -t 8
+```
+
+## 实际应用场景
+
+### 场景一：StringBuilder vs StringBuffer
+
+```java
+@BenchmarkMode(Mode.Throughput)
+@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@State(Scope.Thread)
+public class StringBuilderBenchmark {
+
+    @Param({"10", "100", "1000"})
+    private int length;
+
+    @Benchmark
+    public String stringBuilder() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < length; i++) {
+            sb.append(i);
+        }
+        return sb.toString();
+    }
+
+    @Benchmark
+    public String stringConcat() {
+        String s = "";
+        for (int i = 0; i < length; i++) {
+            s += i;
+        }
+        return s;
+    }
+}
+```
+
+### 场景二：ArrayList vs LinkedList
+
+```java
+@Benchmark
+public int arrayListTraversal(State state, Blackhole bh) {
+    int sum = 0;
+    for (int i = 0; i < state.arrayList.size(); i++) {
+        sum += state.arrayList.get(i);
+    }
+    return sum;
+}
+
+@Benchmark
+public int linkedListTraversal(State state, Blackhole bh) {
+    int sum = 0;
+    for (Integer value : state.linkedList) {
+        sum += value;
+    }
+    return sum;
+}
+```
+
+### 场景三：HashMap 并发性能
+
+```java
+@Benchmark
+@Threads(1)
+public Map<Integer, Integer> singleThread(MapState state) {
+    Map<Integer, Integer> map = new ConcurrentHashMap<>();
+    for (int i = 0; i < state.size; i++) {
+        map.put(i, i);
+    }
+    return map;
+}
+
+@Benchmark
+@Threads(4)
+public Map<Integer, Integer> fourThreads(MapState state) {
+    Map<Integer, Integer> map = new ConcurrentHashMap<>();
+    for (int i = 0; i < state.size; i++) {
+        map.put(i, i);
+    }
+    return map;
+}
+```
+
+## 本章总结
+
+**核心要点**：
+
+1. **JMH 是 Java 微基准测试的标准工具**：解决 JIT、死代码、缓存等坑
+2. **@BenchmarkMode 选择测试模式**：Throughput/AverageTime/SampleTime
+3. **预热和迭代配置**：@Warmup 和 @Measurement
+4. **四大陷阱**：死代码消除、常量折叠、缓存效应、内存布局
+5. **Blackhole 防止优化**：消费结果，防止死代码消除
+
+JMH 是 Java 性能优化的必备工具。下一节我们将对比主流的性能测试工具。

@@ -1,0 +1,224 @@
+# G1 调优参数与实战
+
+G1 的调优核心是**在停顿时间和吞吐量之间找到平衡**。G1 的设计哲学是「软目标」——尽力满足停顿时间目标，但不会牺牲太多吞吐量。
+
+理解 G1 的关键参数，是进行生产环境调优的基础。
+
+## 核心参数
+
+### 停顿时间控制
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `-XX:MaxGCPauseMillis` | 最大 GC 停顿时间目标（软目标） | 200ms |
+| `-XX:GCPauseTimeInterval` | GC 间隔时间（如果有的话） | 不设置（无间隔限制） |
+
+```bash
+# 设置停顿时间目标
+java -XX:MaxGCPauseMillis=200 -XX:+UseG1GC -jar application.jar
+```
+
+### 堆内存配置
+
+| 参数 | 说明 |
+| --- | --- |
+| `-Xms` | 堆初始大小 |
+| `-Xmx` | 堆最大大小 |
+| `-XX:G1HeapRegionSize` | Region 大小（必须是 2 的幂次） |
+
+### 新生代配置
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `-XX:G1NewSizePercent` | 新生代最小比例 | 5% |
+| `-XX:G1MaxNewSizePercent` | 新生代最大比例 | 60% |
+| `-XX:InitializingHeapOccupancyPercent` | 初始堆占用触发阈值 | 45% |
+
+## GC 日志解读
+
+### 开启 GC 日志
+
+```bash
+# G1 日志配置
+java -Xms8g -Xmx8g \
+    -XX:+UseG1GC \
+    -XX:MaxGCPauseMillis=200 \
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10M \
+    -jar application.jar
+```
+
+### Young GC 日志
+
+```java
+// Young GC 日志示例
+2024-01-15T10:30:45.123+0800: [GC pause (G1 Evacuation Pause) (young), 0.0451234 secs]
+   [Eden: 2048.0M(2048.0M)->0.0B(2048.0M)]
+   [Survivor: 256.0M(256.0M)->256.0M(256.0M)]
+   [Old: 4096.0M->4096.0M(6144.0M)]
+   [Humongous: 0.0B->0.0B]
+   [Metaspace: 128.5M->128.5M(256.0M)]
+   [Heap: 8192.0M->8192.0M(8192.0M)]
+```
+
+### Mixed GC 日志
+
+```java
+// Mixed GC 日志示例
+2024-01-15T10:31:00.123+0800: [GC pause (G1 Evacuation Pause) (mixed), 0.1851234 secs]
+   [Eden: 1024.0M(2048.0M)->0.0B(2048.0M)]
+   [Survivor: 256.0M(256.0M)->256.0M(256.0M)]
+   [Old: 2048.0M->1024.0M(4096.0M)]
+   [Humongous: 0.0B->0.0B]
+   [Metaspace: 128.5M->128.5M(256.0M)]
+   [Heap: 8192.0M->8192.0M(8192.0M)]
+```
+
+### 日志字段说明
+
+| 字段 | 说明 |
+| --- | --- |
+| `GC pause` | GC 暂停类型 |
+| `young/mixed/old` | 暂停的代 |
+| `0.0451234 secs` | 实际停顿时间 |
+| `Eden: X->Y(Z)` | Eden 区：使用前->使用后（总量） |
+| `Survivor: X->Y(Z)` | Survivor 区：使用前->使用后（总量） |
+| `Old: X->Y(Z)` | 老年代：使用前->使用后（总量） |
+
+## 常见问题与解决
+
+### 问题一：停顿时间过长
+
+如果停顿时间超过目标，可能原因：
+
+1. **新生代太大**：新生代占用过多，导致 Young GC 时间长
+2. **Mixed GC 清理的老年代 Region 太多**：老年代垃圾过多
+3. **Humongous 对象过多**：大对象回收代价高
+
+解决方案：
+
+```bash
+# 调整方案
+java -Xms8g -Xmx8g \
+    -XX:+UseG1GC \
+    -XX:MaxGCPauseMillis=200 \
+    -XX:G1NewSizePercent=10 \    # 减小新生代最小比例
+    -XX:G1MaxNewSizePercent=30 \ # 减小新生代最大比例
+    -XX:InitiatingHeapOccupancyPercent=50 \  # 提前触发 GC
+    -XX:G1HeapRegionSize=4m \
+    -jar application.jar
+```
+
+### 问题二：Full GC 频繁
+
+G1 正常情况下不应该频繁 Full GC。如果出现 Full GC，可能原因：
+
+1. **Humongous 对象分配过多**：Humongous 对象只能在 Full GC 时回收
+2. **元空间不足**：类加载器泄漏
+3. **晋升失败**：Minor GC 时 Survivor 区空间不足
+
+解决方案：
+
+```bash
+# 排查 Humongous 对象
+# 使用 jcmd 查看堆使用情况
+jcmd <pid> VM.native_memory summary
+
+# 增加堆大小
+java -Xms12g -Xmx12g \
+    -XX:+UseG1GC \
+    -XX:MaxGCPauseMillis=200 \
+    -XX:G1HeapRegionSize=4m \
+    -jar application.jar
+```
+
+### 问题三：Mixed GC 时间过长
+
+Mixed GC 会同时清理新生代和部分老年代 Region。如果 Mixed GC 时间过长，可能原因：
+
+1. **老年代垃圾过多**：需要清理的 Region 太多
+2. **并发标记阶段失败**：标记未完成就触发了 Mixed GC
+
+解决方案：
+
+```bash
+# 调整方案
+java -Xms8g -Xmx8g \
+    -XX:+UseG1GC \
+    -XX:MaxGCPauseMillis=200 \
+    -XX:InitiatingHeapOccupancyPercent=40 \  # 降低触发阈值
+    -XX:G1MixedGCLiveThresholdPercent=85 \   # 降低混合 GC 阈值
+    -XX:G1HeapRegionSize=4m \
+    -jar application.jar
+```
+
+## 调优步骤
+
+### 第一步：确定目标
+
+明确调优目标：
+
+1. **停顿时间目标**：P99 延迟要求是多少？
+2. **吞吐量目标**：业务对吞吐量要求有多高？
+3. **内存预算**：可用堆内存是多少？
+
+### 第二步：收集数据
+
+```bash
+# 开启详细日志
+java -XX:+UseG1GC \
+    -Xlog:gc*=debug:file=gc_debug.log \
+    -jar application.jar
+
+# 使用 jstat 监控
+jstat -gcutil <pid> 1000
+```
+
+### 第三步：分析瓶颈
+
+分析 GC 日志和监控数据：
+
+1. **停顿时间是否达标？**
+2. **GC 频率是否可接受？**
+3. **是 Young GC 还是 Mixed GC 导致的停顿？**
+
+### 第四步：调整参数
+
+根据分析结果调整参数：
+
+| 症状 | 参数调整 |
+| --- | --- |
+| 停顿时间过长 | 减小 `-XX:MaxGCPauseMillis` 或减小新生代 |
+| 吞吐量低 | 增大新生代比例，减少 GC 频率 |
+| Full GC 频繁 | 增加堆大小，优化对象分配 |
+
+### 第五步：验证
+
+调整参数后重新压测，验证效果。
+
+## 推荐配置模板
+
+```bash
+# G1 通用配置模板
+java -Xms8g -Xmx8g \
+    -XX:+UseG1GC \
+    \
+    # 停顿时间控制
+    -XX:MaxGCPauseMillis=200 \
+    \
+    # 堆配置
+    -XX:G1HeapRegionSize=4m \
+    -XX:InitiatingHeapOccupancyPercent=45 \
+    \
+    # 新生代配置
+    -XX:G1NewSizePercent=5 \
+    -XX:G1MaxNewSizePercent=60 \
+    \
+    # Mixed GC 配置
+    -XX:G1MixedGCLiveThresholdPercent=85 \
+    -XX:G1OldCSetRegionThresholdPercent=10 \
+    \
+    # 日志
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10M \
+    \
+    -jar application.jar
+```

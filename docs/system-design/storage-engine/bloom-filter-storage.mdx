@@ -1,0 +1,260 @@
+# Bloom Filter 在存储引擎中的应用
+
+LSM Tree 的读取需要检查多层，最坏情况要遍历所有 SSTable。有没有办法快速判断某个 key 一定不存在？
+
+Bloom Filter（布隆过滤器）就是这个问题的答案。
+
+## Bloom Filter 原理
+
+Bloom Filter 用一个位数组和多个哈希函数，快速判断一个元素是否可能存在。
+
+### 核心思想
+
+```java
+public class BloomFilter {
+    BitArray bits;          // 位数组
+    int hashCount;          // 哈希函数数量
+    
+    public void add(String key) {
+        for (int i = 0; i < hashCount; i++) {
+            int index = hash(key, i);
+            bits.set(index);
+        }
+    }
+    
+    public boolean mightContain(String key) {
+        for (int i = 0; i < hashCount; i++) {
+            int index = hash(key, i);
+            if (!bits.get(index)) {
+                return false;  // 一定不存在
+            }
+        }
+        return true;  // 可能存在（需要进一步检查）
+    }
+}
+```
+
+### 工作原理图示
+
+```
+原始数据: ["apple", "banana", "orange"]
+
+位数组 (初始全 0):
+[0, 0, 0, 0, 0, 0, 0, 0]
+
+添加 "apple" (使用 3 个哈希函数):
+Hash1: 0 → set
+Hash2: 3 → set
+Hash3: 5 → set
+
+位数组:
+[1, 0, 0, 1, 0, 1, 0, 0]
+   ↑       ↑       ↑
+  H1      H2      H3
+
+查询 "apple": 0,3,5 都是 1 → 可能存在 ✓
+查询 "grape": 2,4,6 有 0 → 一定不存在 ✓
+```
+
+## 误判率
+
+Bloom Filter 不会漏报（不存在的元素一定报告不存在），但会误报（存在的元素可能报告存在）。
+
+### 误判率公式
+
+```
+误判率 P = (1 - e^(-kn/m))^k
+
+k = 哈希函数数量
+n = 已添加元素数量
+m = 位数组大小
+```
+
+### 最优哈希函数数量
+
+```
+k = (m/n) × ln(2)
+```
+
+### 常用参数配置
+
+| 元素数量 (n) | 位数组大小 (m) | 哈希函数 (k) | 误判率 |
+|---|---|---|---|
+| 1,000,000 | 10MB | 7 | ~1% |
+| 1,000,000 | 8MB | 6 | ~1% |
+| 1,000,000 | 5MB | 5 | ~5% |
+
+## Bloom Filter 在 SSTable 中的应用
+
+SSTable 的每个文件都附带一个 Bloom Filter：
+
+```
+SSTable 文件结构:
+├── Data Block 1
+├── Data Block 2
+├── ...
+├── Index Block
+└── Filter Block (Bloom Filter)  ← 每个 SSTable 一个
+```
+
+### 读取流程优化
+
+```java
+public class SSTableReader {
+    BloomFilter bloomFilter;
+    
+    public String get(String key) {
+        // 1. 检查 Bloom Filter
+        if (!bloomFilter.mightContain(key)) {
+            return null;  // 一定不存在，跳过该 SSTable
+        }
+        
+        // 2. Bloom Filter 说可能存在，需要实际检查
+        // 3. 查找 Index Block，定位 Data Block
+        BlockIndex index = findIndex(key);
+        if (index == null) return null;
+        
+        // 4. 读取 Data Block
+        DataBlock block = readBlock(index);
+        return block.get(key);
+    }
+}
+```
+
+### 性能提升
+
+没有 Bloom Filter 时：
+
+```
+查询一个不存在的 key:
+需要检查所有 SSTable 的所有 Block → N 次 I/O
+```
+
+有 Bloom Filter 时：
+
+```
+查询一个不存在的 key:
+Bloom Filter 快速排除 → 大部分 SSTable 不需要读取 → ~1 次 I/O
+```
+
+## 计数布隆过滤器
+
+标准 Bloom Filter 不能删除元素。Counting Bloom Filter 用计数器数组代替位数组，支持删除。
+
+```java
+public class CountingBloomFilter {
+    int[] counters;  // 每个位置一个计数器
+    
+    public void add(String key) {
+        for (int i = 0; i < hashCount; i++) {
+            counters[hash(key, i)]++;
+        }
+    }
+    
+    public void remove(String key) {
+        for (int i = 0; i < hashCount; i++) {
+            counters[hash(key, i)]--;
+        }
+    }
+}
+```
+
+### 代价
+
+- 空间增加（int vs bit）
+- 有上限（计数器溢出风险）
+
+## Cuckoo Filter
+
+Cuckoo Filter 是 Bloom Filter 的替代方案，支持删除且空间效率更高。
+
+### Cuckoo Filter 原理
+
+```java
+public class CuckooFilter {
+    // Cuckoo 哈希：每个元素有两个候选位置
+    public int[] insert(String key) {
+        int fp = fingerprint(key);
+        int i1 = hash1(key);
+        int i2 = hash2(key, i1);
+        
+        // 尝试插入两个位置
+        if (tryInsert(i1, fp) || tryInsert(i2, fp)) {
+            return new int[]{i1, i2};
+        }
+        
+        // 驱逐并重新插入
+        return reinsert(key, fp, i1, i2);
+    }
+    
+    public boolean mightContain(String key) {
+        int fp = fingerprint(key);
+        int i1 = hash1(key);
+        int i2 = hash2(key, i1);
+        
+        return slots[i1].contains(fp) || slots[i2].contains(fp);
+    }
+}
+```
+
+### Cuckoo vs Bloom
+
+| 特性 | Bloom Filter | Cuckoo Filter |
+|---|---|---|
+| 删除支持 | 不支持 | 支持 |
+| 空间效率 | 较低 | 较高 |
+| 查询性能 | O(k) | O(1) |
+| 实现复杂度 | 简单 | 较复杂 |
+
+## 布隆过滤器的应用场景
+
+### 数据库索引
+
+- MySQL InnoDB：每个 Page 一个 Bloom Filter
+- RocksDB：每个 SSTable 一个 Bloom Filter
+- Cassandra：每个 SSTable 一个 Bloom Filter
+
+### 缓存穿透防护
+
+```java
+public class CacheWithBloomFilter {
+    BloomFilter bloomFilter = new BloomFilter(1000000);
+    Cache<String, Object> cache = new CaffeineCache<>();
+    
+    public Object get(String key) {
+        // 1. 检查 Bloom Filter
+        if (!bloomFilter.mightContain(key)) {
+            return null;  // 一定不存在于 DB
+        }
+        
+        // 2. Bloom Filter 可能存在，检查缓存
+        return cache.get(key).orElseGet(() -> {
+            // 3. 查数据库
+            Object value = db.query(key);
+            if (value != null) {
+                cache.put(key, value);
+            }
+            return value;
+        });
+    }
+}
+```
+
+### 去重判断
+
+```java
+public class DeduplicationFilter {
+    BloomFilter seen = new BloomFilter(10000000);
+    
+    public boolean isDuplicate(String id) {
+        if (seen.mightContain(id)) {
+            // 可能重复，需要精确检查
+            return db.exists(id);
+        }
+        seen.add(id);
+        return false;
+    }
+}
+```
+
+> **最佳实践**：Bloom Filter 的误判率取决于空间配置。在 RocksDB 中，默认每个 key 使用 10 位，空间约为数据大小的 1/8。如果空间不足，误判率会上升，读取性能下降。

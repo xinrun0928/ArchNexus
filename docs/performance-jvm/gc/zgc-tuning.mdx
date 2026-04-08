@@ -1,0 +1,244 @@
+# ZGC 调优参数与实战
+
+ZGC 的设计目标是「零调优」——开箱即用。但对于生产环境，适当的调优可以进一步提升性能。
+
+理解 ZGC 的核心参数和日志解读，是进行 ZGC 调优的基础。
+
+## 核心参数
+
+### 基本配置
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `-XX:+UseZGC` | 启用 ZGC | - |
+| `-XX:+UnlockExperimentalVMOptions` | 解锁实验参数（Java 11-14） | - |
+| `-Xmx` | 最大堆大小 | - |
+| `-Xms` | 初始堆大小 | `-Xmx` 值 |
+
+### 停顿时间目标
+
+ZGC 没有显式的停顿时间目标参数，因为 ZGC 的停顿时间本身就很短。但有以下相关参数：
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `-XX:SoftRefLRUPolicyMSPerMB` | 软引用回收策略 | 1000ms |
+
+### 并发线程数
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `-XX:ConcGCThreads` | 并发 GC 线程数 | 自动计算（CPU 核数的 12.5%） |
+
+## GC 日志解读
+
+### 开启 ZGC 日志
+
+```bash
+# ZGC 日志配置
+java -XX:+UseZGC \
+    -Xms64g -Xmx64g \
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10M \
+    -jar application.jar
+```
+
+### 日志格式
+
+```java
+// ZGC 日志示例
+[2024-01-15T10:30:45.123+0800] GC(12345) Garbage Collection Phase: Mark
+[2024-01-15T10:30:45.145+0800] GC(12345) Duration: 12.345ms
+[2024-01-15T10:30:45.145+0800] GC(12345) Heap: 65536M->32768M(65536M)
+[2024-01-15T10:30:45.145+0800] GC(12345) Metaspace: 128M->128M(256M)
+```
+
+### 阶段日志
+
+```java
+// 并发标记阶段
+[2024-01-15T10:30:45.123+0800] GC(12345) Garbage Collection Phase: Mark
+[2024-01-15T10:30:45.135+0800] GC(12345) Runtime Weak Root Processing: 5.123ms
+[2024-01-15T10:30:45.140+0800] GC(12345) Concurrent Mark: 4.567ms
+[2024-01-15T10:30:45.145+0800] GC(12345) Non-Zero Tail Marking: 0.123ms
+
+// 并发转移阶段
+[2024-01-15T10:30:50.000+0800] GC(12346) Garbage Collection Phase: Relocate
+[2024-01-15T10:30:50.012+0800] GC(12346) Duration: 10.234ms
+```
+
+### 字段说明
+
+| 字段 | 说明 |
+| --- | --- |
+| `Phase` | 当前 GC 阶段 |
+| `Duration` | 阶段耗时 |
+| `Heap: X->Y(Z)` | 堆内存：使用前->使用后（总量） |
+| `Runtime Weak Root Processing` | 处理运行时弱根的时间 |
+| `Concurrent Mark` | 并发标记耗时 |
+
+## 常见问题与解决
+
+### 问题一：分配速率过高
+
+如果应用的对象分配速率超过 ZGC 的处理能力，会导致停顿时间增加：
+
+症状：
+
+```
+GC(12345) Duration: 50.123ms  # 停顿时间明显增加
+```
+
+解决：
+
+```bash
+# 增加并发线程数
+java -XX:+UseZGC \
+    -Xms64g -Xmx64g \
+    -XX:ConcGCThreads=16 \  # 增加并发线程
+    -jar application.jar
+```
+
+### 问题二：元空间压力
+
+ZGC 的类元数据管理也会影响性能：
+
+```java
+// 元空间相关日志
+[2024-01-15T10:30:45.123+0800] GC(12345) Metaspace: 128M->130M(256M)
+```
+
+解决：
+
+```bash
+# 增加元空间大小
+java -XX:+UseZGC \
+    -Xms64g -Xmx64g \
+    -XX:MaxMetaspaceSize=512m \
+    -jar application.jar
+```
+
+### 问题三：内存归还不及时
+
+ZGC 默认延迟 5 分钟才将未使用的内存归还给操作系统：
+
+```bash
+# 配置内存归还
+java -XX:+UseZGC \
+    -Xms64g -Xmx64g \
+    -XX:ZUncommitDelayMillis=60000 \  # 1分钟后归还
+    -jar application.jar
+```
+
+### 问题四：容器环境问题
+
+在 Kubernetes 容器环境中，ZGC 可能遇到内存限制问题：
+
+```bash
+# 容器环境配置
+java -XX:+UseZGC \
+    -Xms64g -Xmx64g \
+    -XX:+UseContainerSupport \  # 启用容器支持
+    -XX:InitialRAMPercentage=50 \
+    -XX:MaxRAMPercentage=50 \
+    -jar application.jar
+```
+
+## 监控工具
+
+### JMX 监控
+
+```bash
+# 启用 JMX
+java -XX:+UseZGC \
+    -Dcom.sun.management.jmxremote \
+    -Dcom.sun.management.jmxremote.port=9010 \
+    -jar application.jar
+```
+
+### jstat 监控
+
+```bash
+# 使用 jstat 监控 ZGC
+jstat -gcutil -t <pid> 1000
+
+# 输出
+Timestamp   S0C    S1C    S0U    S1U     EC     EU      OC     OU      MC    MU    CCSC   CCSU   YGC    YGCT    FGC    FGCT    CGC    CGCT     GCT   
+Timestamp: 12345.0  0.0   0.0   0.0    0.0    2048.0  1024.0  65536.0 32768.0 131072.0 118000.0 16384.0 14000.0   123   12.345   0    0.000    5    5.678  18.023
+```
+
+### ZHeap
+
+ZGC 引入了一个新的指标——ZHeap：
+
+```java
+// ZHeap 使用情况
+[2024-01-15T10:30:45.123+0800] GC(12345) ZHeap: 32768M->16384M(65536M)
+```
+
+ZHeap 是 ZGC 管理的堆内存，不包括元空间和直接内存。
+
+## 推荐配置模板
+
+### 小内存配置（`<16GB`）
+
+```bash
+java -XX:+UseZGC \
+    -Xms4g -Xmx4g \
+    -XX:+AlwaysPreTouch \
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags \
+    -jar application.jar
+```
+
+### 中内存配置（16GB~64GB）
+
+```bash
+java -XX:+UseZGC \
+    -Xms32g -Xmx32g \
+    -XX:+AlwaysPreTouch \
+    -XX:ConcGCThreads=8 \
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags \
+    -jar application.jar
+```
+
+### 大内存配置（`>64GB`）
+
+```bash
+java -XX:+UseZGC \
+    -Xms128g -Xmx128g \
+    -XX:+AlwaysPreTouch \
+    -XX:ConcGCThreads=16 \
+    -XX:zAllocationSpikeTolerance=5 \
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags \
+    -jar application.jar
+```
+
+## 调优步骤
+
+### 第一步：观察基线
+
+```bash
+# 观察 GC 日志和 jstat 输出
+jstat -gcutil -t <pid> 1000
+
+# 检查停顿时间
+grep "Duration:" gc.log
+```
+
+### 第二步：识别瓶颈
+
+```java
+// 分析日志中的阶段耗时
+[2024-01-15T10:30:45.123+0800] Concurrent Mark: 50.123ms  # 标记太慢？
+[2024-01-15T10:30:45.123+0800] Concurrent Relocate: 100.234ms  # 转移太慢？
+```
+
+### 第三步：调整参数
+
+| 问题 | 参数调整 |
+| --- | --- |
+| 标记阶段慢 | 增加 `-XX:ConcGCThreads` |
+| 转移阶段慢 | 增加 `-XX:ConcGCThreads` |
+| 停顿时间偶尔增加 | 调整 `-XX:zAllocationSpikeTolerance` |
+
+### 第四步：验证
+
+压测验证调优效果。

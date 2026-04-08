@@ -1,0 +1,300 @@
+---
+description: 深入解析 Balking 模式 — 避免不必要的并发操作
+---
+
+# Balking 模式
+
+想象你在写一个文档编辑器。软件会自动保存，但「保存」这个动作需要满足特定条件才执行：
+
+- 如果文档根本没修改，不需要保存
+- 如果已经在保存中，不需要再次触发保存
+- 只有在文档被修改、且当前没有保存进行中时，才执行保存
+
+这就是 **Balking 模式**的核心：**当状态或条件不满足时，直接放弃操作，而不是等待条件满足**。
+
+## Balking 模式定义
+
+Balking 模式与 Guarded Suspension 模式形成鲜明对比：
+
+| 模式 | 条件不满足时 | 条件满足时 |
+| --- | --- | --- |
+| Guarded Suspension | 等待 | 执行 |
+| Balking | 直接返回 | 执行 |
+
+```java
+public class DocumentEditor {
+    private String content = "";
+    private boolean changed = false;
+    private final ScheduledExecutorService scheduler =
+        Executors.newSingleThreadScheduledExecutor();
+
+    // 自动保存：只有文档被修改、且没有保存进行中时才保存
+    public void autoSave() {
+        synchronized (this) {
+            // 双重检查：Balking 模式的核心
+            if (!changed) {
+                return; // 文档没变化，不需要保存
+            }
+            if (saving) {
+                return; // 正在保存，不需要重复触发
+            }
+            saving = true;
+        }
+
+        // 执行保存操作
+        doSave();
+
+        synchronized (this) {
+            changed = false;
+            saving = false;
+        }
+    }
+
+    // 文档被修改时调用
+    public void edit(String newContent) {
+        synchronized (this) {
+            if (!this.content.equals(newContent)) {
+                this.content = newContent;
+                this.changed = true;
+            }
+        }
+    }
+
+    private boolean saving = false;
+
+    private void doSave() {
+        // 实际保存逻辑
+    }
+}
+```
+
+## 自动保存编辑器案例
+
+完整实现一个带自动保存的文档编辑器：
+
+```java
+public class Document {
+    private String content = "";
+    private boolean modified = false;
+    private final ScheduledExecutorService scheduler =
+        Executors.newSingleThreadScheduledExecutor();
+    private Future<?> autoSaveTask;
+
+    public Document() {
+        startAutoSave();
+    }
+
+    // 启动自动保存线程
+    private void startAutoSave() {
+        autoSaveTask = scheduler.scheduleAtFixedRate(() -> {
+            save();
+        }, 30, 30, TimeUnit.SECONDS);
+    }
+
+    // 编辑文档
+    public void edit(String newContent) {
+        synchronized (this) {
+            if (!content.equals(newContent)) {
+                content = newContent;
+                modified = true;
+            }
+        }
+    }
+
+    // 保存文档（带 Balking）
+    public synchronized void save() {
+        // Balking：条件不满足时直接返回
+        if (!modified) {
+            return; // 没有修改，不需要保存
+        }
+
+        // 执行保存
+        System.out.println("保存文档: " + content.length() + " 字符");
+        modified = false;
+    }
+
+    // 手动保存（用户触发）
+    public synchronized void forceSave() {
+        System.out.println("强制保存文档: " + content.length() + " 字符");
+        modified = false;
+    }
+
+    public void shutdown() {
+        save();
+        autoSaveTask.cancel(false);
+        scheduler.shutdown();
+    }
+}
+```
+
+**Balking 的价值**：
+
+- 避免不必要的操作（无修改时保存）
+- 避免重复操作（已在保存时不再触发）
+- 减少线程竞争（不需要等待）
+
+## Balking vs Guarded Suspension
+
+两者都是处理「条件检查」的模式，但适用场景不同：
+
+| 维度 | Balking | Guarded Suspension |
+| --- | --- | --- |
+| 条件不满足时 | 直接返回 | 等待 |
+| 等待时长 | 零等待 | 可能无限等待 |
+| 适用场景 | 可选操作、状态检查 | 必要的操作、必须等待 |
+| 例子 | 自动保存、配置重载 | 消息队列取消息 |
+
+```java
+// Balking：条件不满足，直接返回
+public void save() {
+    if (!modified) return; // 不需要保存
+    doSave();
+}
+
+// Guarded Suspension：条件不满足，等待
+public String take() {
+    while (queue.isEmpty()) {
+        wait(); // 必须等待消息
+    }
+    return queue.remove();
+}
+```
+
+## double-checked locking 是 Balking 的变体
+
+Double-Checked Locking (DCL) 实际上是 Balking 模式的一个应用：
+
+```java
+public class Singleton {
+    private static volatile Singleton instance;
+
+    public static Singleton getInstance() {
+        // 第一次检查：Balking
+        if (instance == null) {
+            synchronized (Singleton.class) {
+                // 第二次检查：确保只有一个线程创建实例
+                if (instance == null) {
+                    instance = new Singleton();
+                }
+            }
+        }
+        return instance;
+    }
+}
+```
+
+这里的「条件」是 `instance == null`。第一次检查不需要加锁，如果 instance 已经创建，直接返回。只有第一次检查失败时，才加锁进行第二次检查。
+
+**为什么叫 double-checked？**
+
+- **第一次检查**：不加锁，快速判断是否需要创建实例
+- **第二次检查**：加锁，确保只有一个线程创建实例
+
+## Balking 模式的适用场景
+
+**场景一：配置重载**
+
+应用启动时加载配置，后续可以通过 API 重载配置：
+
+```java
+public class Config {
+    private volatile Map<String, String> config;
+    private boolean reloading = false;
+
+    public void reload() {
+        // Balking：正在重载中，不再触发
+        if (reloading) {
+            return;
+        }
+        reloading = true;
+        try {
+            this.config = loadConfig();
+        } finally {
+            reloading = false;
+        }
+    }
+
+    public String get(String key) {
+        return config.get(key);
+    }
+}
+```
+
+**场景二：线程安全初始化**
+
+只初始化一次的资源：
+
+```java
+public class ConnectionPool {
+    private volatile Connection connection;
+
+    public Connection getConnection() {
+        // 快速路径：已初始化
+        if (connection != null) {
+            return connection;
+        }
+
+        // 慢速路径：需要初始化
+        synchronized (this) {
+            if (connection == null) {
+                connection = createConnection();
+            }
+        }
+        return connection;
+    }
+}
+```
+
+**场景三：状态机转换**
+
+只允许在特定状态下转换：
+
+```java
+public class StateMachine {
+    private State currentState = State.INIT;
+
+    public void process() {
+        synchronized (this) {
+            // Balking：只有在 RUNNING 状态才能处理
+            if (currentState != State.RUNNING) {
+                return;
+            }
+        }
+        // 执行处理逻辑
+    }
+
+    public void start() {
+        synchronized (this) {
+            if (currentState != State.INIT) {
+                return;
+            }
+            currentState = State.RUNNING;
+        }
+    }
+}
+```
+
+## 总结与延伸
+
+Balking 模式的核心思想是**「不值得做就不做」**：
+
+**优点**：
+
+- 避免不必要的等待
+- 减少无意义的操作
+- 提高响应速度
+
+**缺点**：
+
+- 可能丢失操作请求（如果操作确实是必须的）
+- 需要考虑操作的幂等性
+
+**使用时机**：
+
+- 操作是可选的，不是强制的
+- 条件检查成本低，等待成本高
+- 允许放弃操作，不会影响系统正确性
+
+在并发编程中，Balking 模式无处不在：单例模式的双重检查锁、配置重载、缓存刷新、状态检查等。理解这个模式，有助于写出更高效、更合理的并发代码。
+
+那么问题来了：Balking 模式中，如果操作被跳过（balk），调用者如何知道？是通过返回值（boolean）、异常、还是什么也不做静默跳过？这涉及到 API 设计的问题。
