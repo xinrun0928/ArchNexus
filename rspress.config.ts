@@ -1,16 +1,31 @@
-// 导入 Node.js 路径处理模块，用于拼接文件绝对路径
 import * as path from 'node:path';
-// 导入 Rspress 核心配置定义函数，提供类型提示和配置校验
 import { defineConfig } from '@rspress/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
 
+// Rspress 插件：mermaid 需要以函数方式调用，返回 Rspress 插件对象
 import mermaid from 'rspress-plugin-mermaid';
+import readingTime from 'rspress-plugin-reading-time';
 
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
 
 // Rspress 文档站点核心配置导出
 export default defineConfig({
+  // ==============================================
+  // 插件配置（Rspress 专属插件，如 mermaid、自定义 remark/unified 插件等）
+  // 注意：@rsbuild/plugin-sass 属于构建工具插件，应放在 builderConfig.plugins 中
+  // ==============================================
+  plugins: [
+    mermaid({
+      mermaidConfig: {
+        theme: 'forest',
+      },
+    }),
+    readingTime({
+      defaultLocale: 'zh-CN',
+    })
+  ],
+
   // ==============================================
   // 基础站点配置（站点根目录、全局资源、基础信息）
   // ==============================================
@@ -72,12 +87,7 @@ export default defineConfig({
   builderConfig: {
     plugins: [
       pluginSass(),
-      mermaid({
-        mermaidConfig: {
-          theme: 'forest',
-        },
-      })
-    ]
+    ],
   },
 
   // ==============================================
