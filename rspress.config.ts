@@ -4,7 +4,6 @@ import { pluginSass } from '@rsbuild/plugin-sass';
 
 // Rspress 插件：mermaid 需要以函数方式调用，返回 Rspress 插件对象
 import mermaid from 'rspress-plugin-mermaid';
-import readingTime from 'rspress-plugin-reading-time';
 
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
@@ -20,9 +19,6 @@ export default defineConfig({
       mermaidConfig: {
         theme: 'forest',
       },
-    }),
-    readingTime({
-      defaultLocale: 'zh-CN',
     })
   ],
 
