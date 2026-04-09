@@ -1,0 +1,36 @@
+---
+title: Loki 架构深度解析
+description: Loki 的架构设计：标签索引、Chunk 存储、分片查询与生态集成
+---
+
+# Loki 架构深度解析
+
+Loki 是 Grafana Labs 于 2018 年开源的日志聚合系统，它的设计哲学是「只索引元数据，不索引日志内容」。这个看似激进的设计选择，解决了 ELK 在日志场景下的核心痛点：资源消耗过高、运维过于复杂。Loki 用更低的成本，提供了 80% 的日志分析能力。
+
+Loki 的架构分为三个层次：**Distributor**（接收日志流）、**Ingester**（写入和存储）、**Querier**（查询）。每个组件都可以独立扩展，通过一致性哈希决定数据的分布。这种架构借鉴了 Prometheus 的水平扩展能力，同时针对日志场景进行了优化。
+
+## 标签索引与 Chunk 存储
+
+Loki 的核心创新是**标签索引**。每个日志流由一组标签唯一定义（如 `{job="nginx", hostname="server1"}`），Loki 只会索引这些标签到日志流的映射关系，而不索引日志内容本身。当查询「找出所有包含 ERROR 的日志」时，Loki 首先通过标签找到匹配的日志流，然后下载这些流的数据块，在内存中进行行过滤。
+
+日志数据以 **Chunk** 为单位存储。每个 Chunk 包含约 1 小时的数据（可配置），采用列式压缩存储。Chunk 的元数据包括：时间范围、标签哈希、数据大小、压缩算法。Ingester 负责将日志写入 Chunk，满Chunk 后固化到对象存储（如 S3、GCS）。
+
+## 分片查询与并行化
+
+Loki 的查询执行器（Querier）支持**分片查询**。当查询时间范围跨越多个 Ingester 时，Querier 会将查询拆分并行发送到多个 Ingester，然后合并结果。分片策略可以是基于时间的（如每个 Ingester 查询 1 小时数据），也可以是基于标签哈希的（每个 Ingester 查询哈希范围的数据）。
+
+这种并行查询机制使 Loki 能够水平扩展：Ingester 数量越多，并行查询能力越强。单个大查询会被分散到多个节点，不会成为瓶颈。但分片查询也带来延迟开销——查询延迟等于最慢分片的响应时间，而不是所有分片的平均值。
+
+## 与 Grafana 的集成
+
+Loki 与 Grafana 的集成是其最大优势之一。在 Grafana Explore 页面中，可以使用 **LogQL**（Loki 的查询语言）进行日志查询。LogQL 支持两种查询模式：**Log Query** 返回日志行，**Metric Query** 对日志进行聚合计算（如统计每分钟 ERROR 日志数量）。
+
+```logql
+# Log Query：查找所有 ERROR 日志
+{job="api"} |= "ERROR"
+
+# Metric Query：统计每分钟错误数量
+sum by (level) (rate({job="api"} |= "ERROR"[5m]))
+```
+
+LogQL 与 PromQL 高度相似，对 Prometheus 用户非常友好。你甚至可以在同一个仪表盘中混合使用 PromQL 和 LogQL，创建「指标 + 日志」的综合视图。

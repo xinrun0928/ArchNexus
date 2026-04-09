@@ -1,0 +1,77 @@
+---
+title: Jaeger 部署与配置
+description: Jaeger 生产环境部署方案：All-in-One、Production、High Availability 三种模式
+---
+
+# Jaeger 部署与配置
+
+Jaeger 是 CNCF 毕业的可观测性项目，专注于链路追踪数据的收集、存储和可视化。Jaeger 支持多种部署模式，从轻量级的 All-in-One 模式到生产级的高可用模式，团队可以根据规模选择合适的部署方案。
+
+部署模式的选择取决于两个因素：**Trace 吞吐量**（每秒产生的 Span 数量）和**查询并发**（同时查询的终端用户数量）。
+
+## 部署模式对比
+
+| 模式 | 适用场景 | 存储 | 扩展性 | 运维复杂度 |
+|---|---|---|---|---|
+| **All-in-One** | 开发/测试、小规模生产 | Elasticsearch（可选） | 差 | 低 |
+| **Production** | 中等规模生产 | Elasticsearch/Cassandra | 中 | 中 |
+| **High Availability** | 大规模生产 | Elasticsearch 多副本集群 | 高 | 高 |
+
+## All-in-One 模式
+
+All-in-One 模式将所有组件（Agent、Collector、Query、UI）打包为一个进程，使用内存存储。适用于本地开发、演示、小规模测试环境。
+
+```bash
+# Docker 快速启动
+docker run -d --name jaeger \
+  -e COLLECTOR_ZIPKIN_HOST_PORT=:9411 \
+  -p 5775:5775/udp \
+  -p 6831:6831/udp \
+  -p 6832:6832/udp \
+  -p 5778:5778 \
+  -p 16686:16686 \
+  -p 14250:14250 \
+  jaegertracing/all-in-one:latest
+```
+
+All-in-One 模式的数据存储在内存中，容器重启后数据丢失，适合对数据持久化没有要求的场景。
+
+## Production 模式部署
+
+Production 模式采用组件分离部署：
+
+**Jaeger Agent**：每台应用服务器部署一个 Agent，通过 UDP 接收应用上报的 Span 数据，转发给 Collector。Agent 采用无状态设计，可以随时重启。
+
+**Jaeger Collector**：部署多个 Collector 实例，前置负载均衡。Collector 负责接收来自 Agent 的数据，验证格式后写入后端存储（Elasticsearch 或 Cassandra）。
+
+**Jaeger Query + UI**：查询层部署 2-3 个实例，通过 Ingress 对外暴露。UI 层是无状态的，可以水平扩展。
+
+```yaml
+# Kubernetes 部署示例
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-collector
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: collector
+        image: jaegertracing/jaeger-collector:latest
+        env:
+        - name: SPAN_STORAGE_TYPE
+          value: elasticsearch
+        - name: ES_SERVER_URLS
+          value: http://elasticsearch:9200
+```
+
+## 高可用配置
+
+大规模生产环境需要关注高可用和数据安全：
+
+**多副本存储**：Elasticsearch 集群至少 3 个节点，配置至少 2 个副本，确保任意单节点故障不影响服务。
+
+**Collector 容错**：部署多个 Collector 实例，Agent 通过 DNS 负载均衡上报数据。Collector 故障时，Agent 会缓存 Span 数据，等待恢复后重传。
+
+**数据保留策略**：配置合理的数据保留周期（如 7-14 天），定期归档历史数据到对象存储，降低存储成本。

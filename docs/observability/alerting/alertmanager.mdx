@@ -1,0 +1,76 @@
+---
+title: Alertmanager 架构
+description: 讲解 Alertmanager 的接收、去重、分组、抑制、静默机制，以及与 Prometheus 的集成方式。
+---
+
+Alertmanager 是 Prometheus 生态系统中的告警处理中枢，负责接收 Prometheus Server 推送的告警，进行去重、分组、抑制、静默等处理后，将告警路由到正确的接收者。理解 Alertmanager 的工作机制是构建可靠告警系统的关键。
+
+## 核心处理流程
+
+Alertmanager 对告警的处理分为四个阶段：
+
+**接收（Receiving）**：Alertmanager 通过 HTTP API 接收来自 Prometheus 的告警。每个告警包含 labels、annotations、以及告警状态（firing/resolved）。Prometheus 通过 `alerting.alertmanager_configs` 配置指向 Alertmanager 实例。
+
+**去重（Deduplication）**：Alertmanager 会将相同的告警合并。如果在去重超时时间内收到相同 label 的告警，会被识别为同一条告警，不会重复发送。去重超时通过 `group_wait` 配置。
+
+**分组（Grouping）**：将相似的告警归为一组，便于批量处理。分组键由告警的 group_by labels 决定。例如，所有 CPU 相关的告警可以分到同一组，通过一条通知发送。
+
+**路由（Routing）**：根据路由树将告警发送到对应的接收器。路由匹配基于告警的 labels，支持复杂的匹配规则和嵌套路由。
+
+## 分组机制详解
+
+分组是 Alertmanager 最强大的功能之一。假设某个微服务集群中有 20 个实例同时宕机，如果没有分组，系统会发送 20 条告警，造成告警风暴。启用分组后，这些告警可以被合并为一条。
+
+```yaml
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s      # 等待多久收集同组告警
+  group_interval: 5m   # 同组告警的发送间隔
+  repeat_interval: 4h   # 重复发送告警的间隔
+```
+
+`group_wait` 的设置需要权衡：太短会导致分组不完全，太长则延迟告警通知时间。对于 critical 级别的告警，建议 `group_wait` 设置在 30s 左右。
+
+## 抑制机制
+
+抑制（Inhibition）用于在某些告警触发时，自动屏蔽相关的其他告警。例如，当整个集群不可用时，不需要再单独通知每个实例的故障。
+
+```yaml
+inhibit_rules:
+  - source_match:
+      alertname: "ClusterDown"
+    target_match_re:
+      alertname: "InstanceDown"
+    equal: ['cluster']
+```
+
+上述配置表示：当 ClusterDown 告警触发时，同一 cluster 下的所有 InstanceDown 告警会被抑制。`equal` 字段指定了需要匹配的 label 名称。
+
+抑制机制需要谨慎使用。过度抑制会导致重要信息被遗漏。建议只在明确的因果关系场景下使用。
+
+## 静默规则
+
+静默（Silence）用于临时屏蔽某些告警，常见于：计划内维护窗口、已知的可忽略告警。静默规则可以通过 Alertmanager Web UI 创建，也可以通过 API 自动化管理。
+
+```bash
+# 通过 API 创建静默规则
+amtool silence create \
+  --alertname="HighMemoryUsage" \
+  --match "instance=~prod-.*" \
+  --duration="2h" \
+  --author="admin@example.com"
+```
+
+## 高可用部署
+
+生产环境中，Alertmanager 应该部署多个实例形成集群。通过 Gossip 协议同步告警状态，任一实例宕机不影响告警分发。HA 配置相对简单：
+
+```yaml
+global:
+  resolve_timeout: 5m
+
+cluster:
+  listen_address: "0.0.0.0:9094"
+```
+
+Prometheus 需要配置所有 Alertmanager 实例地址，发送告警时会同时向所有实例推送。

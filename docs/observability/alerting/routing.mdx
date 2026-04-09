@@ -1,0 +1,98 @@
+---
+title: 报警路由与接收器
+description: 讲解如何根据告警级别、服务、团队将报警路由到不同的接收渠道，包括 Email、Slack、PagerDuty、Webhook 等。
+---
+
+报警路由是告警系统的最后一道关口，决定了每条告警最终到达谁的手中。良好的路由设计应当让正确的人在正确的时间收到正确的告警，既不遗漏，也不骚扰。
+
+## 路由树结构
+
+Alertmanager 的路由配置是一棵以根节点为首的树形结构。每个节点可以指定匹配规则和子路由，告警会从上到下匹配，直到找到最终的接收器。
+
+```yaml
+route:
+  receiver: "default-team"
+  group_by: ['alertname', 'cluster']
+  
+  routes:
+    # Critical 级别路由到 PagerDuty
+    - match:
+        severity: critical
+      receiver: "pagerduty-critical"
+      continue: true  # 继续匹配后续路由
+    
+    # 数据库相关路由到 DBA 团队
+    - match:
+        service: database
+      receiver: "dba-team"
+      group_by: ['alertname', 'instance']
+    
+    # 测试环境告警静默（不发通知）
+    - match:
+        env: testing
+      receiver: "null"
+```
+
+`continue: true` 的设置非常关键。设置为 `true` 时，告警会继续匹配后续路由，适合需要在多个渠道通知的场景；设置为 `false`（默认）时，匹配成功就停止。
+
+## 接收器类型
+
+### PagerDuty
+
+PagerDuty 是企业级告警处理平台，支持 call/SMS/Email 多渠道通知，以及 on-call 轮换和升级机制。
+
+```yaml
+receivers:
+  - name: "pagerduty-critical"
+    pagerduty_configs:
+      - service_key: "${PAGERDUTY_SERVICE_KEY}"
+        severity: critical
+        event_action: "trigger"  # trigger/resolve
+```
+
+PagerDuty 的核心价值在于升级机制：当 on-call 工程师未响应告警超过设定时间，自动升级到值班经理或备用工程师。
+
+### Slack
+
+Slack 通知适合低优先级告警或信息类通知，响应时效要求相对较低。
+
+```yaml
+receivers:
+  - name: "slack-notifications"
+    slack_configs:
+      - channel: "#alerts-prod"
+        send_resolved: true
+        title: "{{ .CommonLabels.alertname }}"
+        text: |
+          {{ range .Alerts }}
+          *{{ .Labels.severity }}* | {{ .Labels.service }}
+          {{ .Annotations.description }}
+          详情: {{ .Annotations.runbook_url }}
+          {{ end }}
+```
+
+Slack 告警消息应当简洁明了，避免大段文字堆砌。如果需要详细信息，使用 `details` 折叠或附件形式。
+
+### Webhook
+
+Webhook 用于将告警发送到自建的工单系统、即时通讯机器人、或数据处理管道。
+
+```yaml
+receivers:
+  - name: "webhook-custom"
+    webhook_configs:
+      - url: "https://internal.example.com/webhook/alerts"
+        send_resolved: true
+```
+
+Webhook 发送的请求体是 JSON 格式，包含告警的完整信息，自建系统可以自行解析和处理。
+
+## 路由设计最佳实践
+
+**按职责分层**：将路由分为「接收层」和「通知层」。接收层决定告警的处理逻辑，通知层负责实际发送。
+
+**保留原始告警**：即使路由到特殊接收器，也要保留发送默认通知的能力，防止配置错误导致告警丢失。
+
+**测试环境隔离**：测试环境的告警应当与生产环境完全隔离，或者静默处理，避免干扰正常开发。
+
+**定期维护路由规则**：随着团队组织变化，路由规则也需要同步更新。建议在团队变更时同步检查告警路由配置。

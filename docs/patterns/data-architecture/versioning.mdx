@@ -1,0 +1,106 @@
+---
+title: 数据版本化模式
+description: 通过版本控制机制管理数据变更，支持历史追溯、并发控制和渐进式 Schema 演进。
+---
+
+# 数据版本化模式
+
+数据并非一成不变的。用户的个人信息会被修改，订单状态会流转，库存数量会增减。系统需要回答一个根本问题：**当数据发生变化时，如何保留变更历史、支持并发控制、同时允许 Schema 随业务演进？** 这三个问题分别对应三种不同的版本化策略，而它们在生产环境中往往需要组合使用。
+
+## 乐观锁：版本号与时间戳
+
+**乐观锁（Optimistic Locking）** 假设大多数情况下数据不会发生并发冲突，因此不直接加锁，而是在更新时检查数据是否被其他事务修改过。
+
+最常见的实现是**版本号（Version Number）**：
+
+```sql
+-- 读取时获取版本号
+SELECT name, balance, version FROM accounts WHERE id = 123;
+
+-- 更新时校验版本号
+UPDATE accounts 
+SET name = 'New Name', balance = balance + 100, version = version + 1
+WHERE id = 123 AND version = 5;
+-- 如果 version != 5，说明数据已被修改，更新失败
+```
+
+当 `version` 字段值不等于读取时的版本时，`WHERE` 条件不匹配，`UPDATE` 影响 0 行。应用层捕获这个信号后，可以选择重试、回滚或返回冲突错误给用户。
+
+**时间戳（Timestamp）** 是另一种乐观锁实现方式，记录数据最后修改的时间点。但时间戳在分布式系统中存在时钟偏差问题，且精度受数据库 timestamp 类型限制。版本号方案更为可靠。
+
+乐观锁的优势在于**无锁读取**——所有读操作都不阻塞，适合读多写少、冲突概率低的场景。但当冲突频繁时，大量更新会失败重试，反而影响吞吐量。这种场景下需要评估是否应该改用悲观锁。
+
+## 变更数据捕获（CDC）
+
+在上一篇文章中我们已经详细讨论了 CDC。CDC 本身就是一种版本化策略——它捕获了数据的完整变更历史（before/after 快照），下游系统可以基于这些变更事件重建任意时间点的数据状态。
+
+CDC 的优势在于它**与业务逻辑解耦**。无论应用层代码是否正确实现了变更日志，数据库的事务日志都会忠实地记录每一次数据变更。这使得 CDC 成为审计日志、数据同步、事件驱动架构的基础设施。
+
+## 事件溯源：完整的变更轨迹
+
+**事件溯源（Event Sourcing）** 将数据变更本身作为一等公民存储，而非只存储数据的最终状态。每次状态变更都被记录为一个不可变的事件（Event），当前状态通过重放（Replay）所有事件计算得出。
+
+```java
+// 事件溯源的典型实现
+public abstract class Event {
+    private final String eventId;
+    private final LocalDateTime occurredAt;
+    private final int version;
+}
+
+public class AccountCreated extends Event {
+    private final String accountId;
+    private final String ownerName;
+    private final BigDecimal initialBalance;
+}
+
+public class MoneyDeposited extends Event {
+    private final String accountId;
+    private final BigDecimal amount;
+    private final String transactionId;
+}
+
+public class Account {
+    private String id;
+    private BigDecimal balance;
+    private int version;
+    private final List<Event> uncommittedEvents = new ArrayList<>();
+    
+    public void deposit(BigDecimal amount) {
+        // 生成事件，而非直接修改状态
+        apply(new MoneyDeposited(id, amount, UUID.randomUUID().toString()));
+    }
+    
+    private void apply(MoneyDeposited event) {
+        this.balance = this.balance.add(event.getAmount());
+        this.uncommittedEvents.add(event);
+    }
+    
+    // 从事件历史重建状态
+    public void rebuildFromEvents(List<Event> events) {
+        for (Event event : events) {
+            if (event instanceof MoneyDeposited) {
+                apply((MoneyDeposited) event);
+            } else if (event instanceof AccountCreated) {
+                apply((AccountCreated) event);
+            }
+        }
+    }
+}
+```
+
+事件溯源提供了完整的审计轨迹，可以随时回溯到任意历史时刻重建状态，支持「撤销」和「重做」等时间旅行功能。但它也有显著的代价：事件数量随时间线性增长，状态重建的耗时可能成为瓶颈；业务逻辑需要适配事件驱动模型，迁移成本高。
+
+## Schema 演进的向后兼容处理
+
+当数据的 Schema（表结构、字段定义）需要变更时，必须保证**向后兼容（Backward Compatible）**——新版本的代码能够读取旧版本的数据，旧版本的代码能够忽略新增的字段。
+
+**加字段**是安全的扩展。添加新字段时，旧版本的代码会忽略它，新版本的代码可以处理有或没有该字段的情况。
+
+**删字段**是危险的操作。删除字段意味着旧版本的数据中该字段仍然存在，如果删除了一个还在被旧代码引用的字段，会导致读取错误。正确的做法是先将字段标记为废弃（Deprecated），在多个版本中保持存在，确认没有代码引用后再删除。
+
+**修改字段类型**需要格外小心。将 `INT` 改为 `BIGINT` 是安全的扩大，但将 `VARCHAR(100)` 缩短为 `VARCHAR(50)` 可能导致数据截断。修改默认值也需要谨慎，新旧默认值不一致可能导致逻辑差异。
+
+**添加索引**有时会阻塞写操作。MySQL 在创建索引时默认会锁表，需要使用 `ALGORITHM=INPLACE, LOCK=NONE` 选项在线创建，或在业务低峰期执行。
+
+Schema 演进没有银弹，关键是建立变更评审流程，确保每次变更都经过向后兼容性评估。对于核心表，建议制定 Schema 变更 Checklist，每次发布前逐项确认。

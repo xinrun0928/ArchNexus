@@ -1,0 +1,91 @@
+---
+title: 手动埋点与自定义 Span
+description: OpenTelemetry 手动埋点指南：创建 Span、添加属性、记录事件与错误处理
+---
+
+# 手动埋点与自定义 Span
+
+自动埋点可以覆盖框架层面的调用（如 HTTP 请求、数据库访问），但业务逻辑中的关键步骤、复杂计算、外部依赖调用等，仍然需要**手动埋点**来提供更精细的观测能力。手动埋点的目标是让开发者在关键业务节点「插入」Span，记录业务语义的执行信息。
+
+OpenTelemetry SDK 提供了完整的 API 用于手动埋点。与自动埋点相比，手手埋点的优势是：可以记录业务相关的标签（如订单号、用户 ID）、可以描述更细粒度的执行步骤、可以在业务逻辑中记录关键事件。
+
+## 基础手动埋点
+
+OpenTelemetry 的手动埋点 API 设计简洁直观：
+
+```java
+// 获取 Tracer 实例
+Tracer tracer = OpenTelemetry.getGlobalTracer("my-service", "1.0.0");
+
+// 创建 Span
+Span span = tracer.spanBuilder("process-order")
+    .setAttribute("order.id", orderId)
+    .setAttribute("customer.tier", customerTier)
+    .startSpan();
+
+try (Scope scope = span.makeCurrent()) {
+    // 业务逻辑
+    processPayment(order);
+    updateInventory(order);
+    sendNotification(order);
+    
+    span.setAttribute("order.status", "success");
+} catch (Exception e) {
+    span.recordException(e);
+    span.setAttribute("order.status", "failed");
+    throw e;
+} finally {
+    span.end();
+}
+```
+
+关键点：`tracer.spanBuilder()` 创建 Span 构建器；`setAttribute()` 添加业务属性；`makeCurrent()` 将 Span 加入当前 Context，确保子调用继承父 Span；`recordException()` 记录异常信息。
+
+## 子 Span 与异步处理
+
+对于并行执行的任务（如同时调用多个下游服务），需要创建**子 Span** 或**独立的 Span**：
+
+```java
+// 创建子 Span（属于同一 Trace）
+Span childSpan = tracer.spanBuilder("parallel-call")
+    .setParent(span)
+    .startSpan();
+
+// 创建独立 Span（新 Trace，用于独立追踪异步任务）
+Span detachedSpan = tracer.spanBuilder("async-task")
+    .setNoParent()
+    .startSpan();
+
+// 在异步线程中启动 Span 时，需要传递 Context
+CompletableFuture.runAsync(() -> {
+    try (Scope scope = detachedSpan.makeCurrent()) {
+        // 异步任务逻辑
+    } finally {
+        detachedSpan.end();
+    }
+});
+```
+
+## 记录业务事件
+
+除了 Span，OpenTelemetry 还支持**Events**（事件）用于记录 Span 执行过程中的关键节点：
+
+```java
+span.addEvent("order.created", 
+    Attributes.of(
+        AttributeKey.stringKey("order.id"), orderId,
+        AttributeKey.longKey("order.amount"), orderAmount
+    ));
+```
+
+Events 是 Span 时间线上的时间点标记，适合记录关键业务动作（如「订单已创建」「支付回调已接收」）。与 Span Attributes 相比，Events 可以包含时间戳，便于分析执行顺序。
+
+## 链接 Span
+
+**Span Links** 用于将当前 Span 与其他 Trace 关联，常见场景是消息队列消费：当消费者处理一条消息时，这条消息可能来自另一个 Trace（生产者）。通过 Links，可以将消费者 Span 与生产者 Trace 关联起来：
+
+```java
+Span consumerSpan = tracer.spanBuilder("consume-message")
+    .setLink(producerContext)  // 关联生产者 Context
+    .startSpan();
+```

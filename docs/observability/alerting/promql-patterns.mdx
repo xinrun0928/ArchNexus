@@ -1,0 +1,104 @@
+---
+title: PromQL 常见查询模式
+description: 讲解 rate、irate、increase、label_filter、聚合操作等常用 PromQL 模式，以及如何构建高效的查询条件。
+---
+
+PromQL 是 Prometheus 的查询语言，掌握常见的查询模式是编写有效报警规则和仪表盘的基础。本篇整理了监控实践中最高频使用的 PromQL 模式。
+
+## 速率计算函数
+
+速率计算是监控中最常用的操作。Prometheus 提供三个核心函数：
+
+| 函数 | 适用场景 | 特点 |
+|---|---|---|
+| `rate()` | 报警规则、趋势分析 | 平滑、适合慢变化指标 |
+| `irate()` | 瞬时峰值检测 | 敏感、适合快速变化的指标 |
+| `increase()` | 计算增量 | 返回时间范围内的增量值 |
+
+```promql
+# rate：计算每秒平均增长率，适合 CPU、流量等持续指标
+rate(http_requests_total{service="api"}[5m])
+
+# irate：计算瞬时增长率，适合瞬时峰值检测（如网络包量）
+irate(network_bytes_total{device="eth0"}[30s])
+
+# increase：计算时间范围内的总增量，适合业务计数
+increase(user_signups_total[1h])
+```
+
+选择 `rate` 还是 `irate` 的经验法则：如果指标用于报警，使用 `rate`；如果用于检测瞬时峰值，使用 `irate`。
+
+## 标签过滤与匹配
+
+Prometheus 的标签过滤支持多种匹配符：
+
+```promql
+# 完全匹配
+{service="order-api"}
+
+# 正则匹配
+{service=~"order-.*"}
+{service!~"test-.*"}
+
+# 组合条件
+{service=~"order.*|payment.*", env="prod", status!="200"}
+```
+
+在报警规则中，标签过滤决定了哪些实例或服务会触发告警。标签过滤的粒度需要根据监控对象确定：太粗会导致漏报，太细会产生大量相似告警。
+
+## 聚合操作
+
+当需要跨实例或跨集群聚合时，使用聚合操作符：
+
+```promql
+# sum：求和（计算总 QPS）
+sum(rate(http_requests_total[5m]))
+
+# avg：平均值
+avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)
+
+# max：最大值
+max(http_request_duration_seconds_histogram{quantile="0.99"}) by (service)
+
+# count：计数
+count(up{job="kubernetes-nodes"})
+```
+
+`by` 子句控制聚合的维度。`avg by (instance)` 表示按实例聚合后求平均，`avg without (instance)` 表示在所有实例上求平均但排除 instance 标签。
+
+## 常见报警规则模板
+
+### 服务不可用
+
+```promql
+# 实例不可达超过 2 分钟
+up{job="order-service"} == 0
+```
+
+### 错误率过高
+
+```promql
+# 5xx 错误率超过 1%，持续 5 分钟
+(
+  sum(rate(http_requests_total{status=~"5.."}[5m]))
+  /
+  sum(rate(http_requests_total[5m]))
+) > 0.01
+```
+
+### P99 延迟过高
+
+```promql
+# P99 延迟超过 1 秒
+histogram_quantile(0.99,
+  sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+) > 1
+```
+
+## 性能优化建议
+
+**避免大范围正则**：正则匹配会增加查询负担，尽量使用精确匹配。
+
+**合理设置时间范围**：时间范围过大会导致查询变慢，但过小又可能漏掉重要数据。报警规则一般使用 5m，仪表盘根据需要调整。
+
+**使用 Recording Rules**：对于复杂计算，创建预计算的 Recording Rules，报警和仪表盘直接查询预计算结果。

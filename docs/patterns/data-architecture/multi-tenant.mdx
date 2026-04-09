@@ -1,0 +1,86 @@
+---
+title: 多租户数据架构
+description: 通过数据库隔离策略的权衡设计，在资源效率和租户安全性之间找到适合业务场景的平衡点。
+---
+
+# 多租户数据架构
+
+SaaS 产品的核心挑战之一是**如何让多个租户（Tenant）共享同一套系统，同时保证彼此之间的数据隔离**。一个租户的数据泄露、性能问题或异常负载，不应该影响其他租户的正常使用。多租户数据架构要解决的根本问题，是在资源效率（成本）和租户隔离（安全/性能）之间找到平衡。
+
+## 三种隔离方案
+
+多租户隔离策略的选择，本质上是在做成本与风险的权衡。
+
+**独立数据库（Database per Tenant）** 提供最高级别的隔离。每个租户拥有完全独立的数据库实例，数据物理分离，故障隔离，升级互不影响。但这种方案的成本也最高——1000 个租户意味着 1000 个数据库实例，运维复杂度急剧上升。这种方案适合对数据安全性要求极高的金融、医疗行业，或者大企业客户愿意为此付费的场景。
+
+**独立 Schema（Schema per Tenant）** 是中间方案。所有租户共享同一个数据库实例，但每个租户有自己独立的 Schema（命名空间），表结构完全相同，数据通过 Schema 名区分。这种方式在 PostgreSQL、MySQL（通过 Database 实现）中都容易实现。它提供了较好的故障隔离，升级时可以通过 Schema 级别的灰度来控制影响范围。但共享同一数据库实例意味着存储资源、连接资源仍然是共享的，一个租户的大量查询可能拖慢其他租户。
+
+**共享 Schema（Shared Schema）** 是成本最低的方案。所有租户的数据存放在同一组表中，通过 `tenant_id` 字段进行逻辑区分。这种方案的挑战在于：应用层必须严格防范跨租户的数据访问（SQL 注入可能绕过 WHERE 条件），批量操作时需要额外处理分租户限流，备份恢复时需要考虑租户级别的粒度控制。
+
+| 隔离级别 | 成本 | 隔离性 | 运维复杂度 | 适用场景 |
+|----------|------|--------|------------|----------|
+| 独立数据库 | 高 | 强 | 高 | 金融、医疗、大客户 |
+| 独立 Schema | 中 | 中 | 中 | 中型企业 |
+| 共享 Schema | 低 | 弱 | 低 | 小客户、免费版 |
+
+## 租户识别与路由
+
+无论采用哪种隔离方案，系统都需要在请求入口处识别当前请求属于哪个租户，然后路由到正确的数据空间。这个过程通常涉及几个环节：
+
+**租户标识的传递**是第一步。在 HTTP 请求中，租户标识可以通过子域名（如 `tenant-a.app.com`）、请求头（如 `X-Tenant-ID`）、JWT Claims（租户 ID 作为 Token 的一部分）或请求路径（如 `/api/tenant-a/resources`）传递。子域名方式最直观，但当租户数量动态变化时 DNS 配置需要动态更新。JWT 方式在 API Gateway 场景下最为常见。
+
+**租户上下文（Tenant Context）** 需要贯穿整个请求生命周期。在请求入口处解析出租户 ID 后，需要将其放入线程局部变量或上下文对象中，后续的业务代码从上下文中获取租户 ID，而不是每个方法都显式传递。这种模式类似于 Java 中的 `SecurityContext`，可以避免接口签名膨胀。
+
+```java
+// 租户上下文的使用示例
+public class TenantContext {
+    private static final ThreadLocal<String> currentTenant = new ThreadLocal<>();
+    
+    public static void setTenantId(String tenantId) {
+        currentTenant.set(tenantId);
+    }
+    
+    public static String getTenantId() {
+        return currentTenant.get();
+    }
+    
+    public static void clear() {
+        currentTenant.remove();
+    }
+}
+
+// 拦截器中设置租户上下文
+@Component
+public class TenantInterceptor implements HandlerInterceptor {
+    @Override
+    public boolean preHandle(HttpServletRequest request, 
+                            HttpServletResponse response, 
+                            Object handler) {
+        String tenantId = request.getHeader("X-Tenant-ID");
+        if (tenantId == null) {
+            throw new UnauthorizedException("Missing tenant identification");
+        }
+        TenantContext.setTenantId(tenantId);
+        return true;
+    }
+    
+    @Override
+    public void afterCompletion(HttpServletRequest request,
+                               HttpServletResponse response,
+                               Object handler, Exception ex) {
+        TenantContext.clear();
+    }
+}
+```
+
+## 资源配额管理
+
+在共享资源的架构中，资源配额管理是防止单个租户「滥用」资源的必要手段。
+
+**连接数配额**是最常见的限制。如果某个租户的查询导致大量连接被占用，会直接耗尽数据库连接池。可以在 ORM 层或数据库代理层实现按租户的连接数限制。
+
+**查询速率配额**可以防止异常流量。某个租户的接口被恶意刷量时，可以通过限流措施保护其他租户的服务质量。
+
+**存储配额**在共享存储的场景下尤为重要。当租户的存储使用量接近配额时，应该触发告警并通知租户清理数据或升级套餐。
+
+这些配额可以在应用层实现（如 Resilience4j 的 RateLimiter），也可以在数据库代理层实现（如 Vitess 的按租户资源组），具体取决于架构的复杂度和成本要求。

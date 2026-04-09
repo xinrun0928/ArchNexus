@@ -1,0 +1,36 @@
+---
+title: Jaeger 架构深度解析
+description: Jaeger 核心组件架构：Agent/Collector/Query/UI 与数据存储层
+---
+
+# Jaeger 架构深度解析
+
+Jaeger 的架构设计遵循「采集-存储-查询」的分层理念，每个组件专注于特定功能，通过标准协议互联。这种分层设计使 Jaeger 可以灵活扩展：存储层可以替换（Elasticsearch/Cassandra），查询层可以独立扩展，采集层可以按需部署。
+
+理解 Jaeger 的架构，有助于你在遇到性能问题或数据丢失时快速定位根因。
+
+## 核心组件
+
+**Jaeger Agent**：部署在每台应用服务器的轻量级守护进程，负责接收应用上报的 Span 数据。Agent 通过 UDP 协议接收数据（默认 6831 端口），这一设计使得应用代码无需直接与后端通信，降低了网络故障的影响范围。Agent 内部实现了自适应采样、批量发送、重试机制等能力。
+
+Agent 的核心职责包括：数据格式化（将 Thrift/Zipkin 格式转换为 Jaeger 原生格式）、采样决策（基于配置的采样率决定是否上报）、批量聚合（将多个 Span 聚合后批量发送给 Collector，减少网络开销）。
+
+**Jaeger Collector**：接收来自 Agent 的 Span 数据，进行验证、索引后写入存储。Collector 是有状态服务，需要高可用部署。它支持两种存储后端：Elasticsearch（推荐，搜索能力强）和 Cassandra（适合超大规模部署，成本低）。
+
+Collector 的数据处理流程：接收 Span → 验证数据格式 → 提取可搜索字段（如服务名、操作名、标签） → 索引到 Elasticsearch → 将完整数据写入大对象存储（ES 或 Cassandra）。
+
+**Jaeger Query + UI**：查询层提供 RESTful API 和 Web UI。Query 组件从存储中检索 Trace 数据，聚合为完整的调用链返回给 UI。UI 是单页应用，通过 Query API 展示 Trace 列表、瀑布图、依赖图等可视化内容。
+
+## 数据存储层
+
+Jaeger 的存储层分为两个部分：
+
+**索引存储**（Elasticsearch/Cassandra）：存储 Span 的索引信息，包括 TraceID、服务名、操作名、时间范围等可搜索字段。Jaeger 只索引必要字段，不索引 Span 的全部标签，以控制索引大小。
+
+**主数据存储**（与索引存储共用）：存储 Span 的完整内容，包括所有标签、事件、引用关系。对于 Elasticsearch，数据以 `_source` 形式存储；对于 Cassandra，数据存储在宽列表中。
+
+## 依赖图与服务拓扑
+
+Jaeger 内置了 **Service Graph** 功能，可以从 Trace 数据自动构建服务拓扑图。依赖图的构建过程：聚合所有 Trace 中出现的 Client → Server 调用关系 → 按服务名聚合统计 → 生成节点（服务）和边（调用量、延迟）的图数据。
+
+Service Graph 依赖 Elasticsearch 的聚合查询能力，生成速度较慢（需要扫描大量数据），因此默认关闭，按需触发。
