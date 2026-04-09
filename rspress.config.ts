@@ -2,24 +2,16 @@ import * as path from 'node:path';
 import { defineConfig } from '@rspress/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
 
-// Rspress 插件：mermaid 需要以函数方式调用，返回 Rspress 插件对象
-import mermaid from 'rspress-plugin-mermaid';
-
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
 
 // Rspress 文档站点核心配置导出
 export default defineConfig({
   // ==============================================
-  // 插件配置（Rspress 专属插件，如 mermaid、自定义 remark/unified 插件等）
   // 注意：@rsbuild/plugin-sass 属于构建工具插件，应放在 builderConfig.plugins 中
   // ==============================================
   plugins: [
-    mermaid({
-      mermaidConfig: {
-        theme: 'forest',
-      },
-    })
+
   ],
 
   // ==============================================
