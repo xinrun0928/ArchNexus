@@ -1,0 +1,531 @@
+---
+title: Dockerfile 高级技巧
+description: 多阶段构建、构建缓存、构建 args、Secret 管理等 Dockerfile 进阶技巧
+---
+
+你的 Dockerfile 有什么问题吗？每次修改一行代码，都要等 5 分钟重新安装依赖？镜像体积从 500MB 膨胀到 2GB？敏感信息不小心写进了镜像层？构建缓存动不动就失效？
+
+这些问题都可以通过 Dockerfile 高级技巧解决。
+
+## 多阶段构建
+
+多阶段构建是减小镜像体积的利器。它的核心思想是：**构建阶段和运行阶段分离**。
+
+### 基础多阶段构建
+
+```dockerfile title="Dockerfile"
+# =============================================================================
+# 第一阶段：构建
+# =============================================================================
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# 先复制依赖文件
+COPY package*.json ./
+
+# 安装依赖（包括 devDependencies）
+RUN npm ci
+
+# 复制源代码并构建
+COPY . .
+RUN npm run build
+
+# =============================================================================
+# 第二阶段：运行
+# =============================================================================
+FROM node:20-alpine AS runtime
+
+WORKDIR /app
+
+# 只复制生产依赖和构建产物
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# 从 builder 阶段复制构建产物
+COPY --from=builder /app/dist ./dist
+
+# 非 root 用户
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodeuser -u 1001
+
+USER nodeuser
+
+CMD ["node", "dist/main.js"]
+```
+
+### Go 应用多阶段构建
+
+```dockerfile title="Go Dockerfile"
+# =============================================================================
+# 第一阶段：构建
+# =============================================================================
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+
+# 安装构建依赖
+RUN apk add --no-cache git ca-certificates
+
+# 先复制 go.mod 和 go.sum
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 复制源代码
+COPY . .
+
+# 编译为单一可执行文件（-ldflags 去除调试信息）
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-w -s" \
+    -o /app/server \
+    ./cmd/server
+
+# =============================================================================
+# 第二阶段：运行
+# =============================================================================
+FROM alpine:3.19 AS runtime
+
+# 只安装运行时依赖
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+# 从 builder 阶段复制可执行文件
+COPY --from=builder /app/server .
+
+# 非 root 用户
+RUN addgroup -g 1001 -S app && \
+    adduser -S app -u 1001 -D -H
+
+USER app
+
+EXPOSE 8080
+
+CMD ["./server"]
+```
+
+### Java 多阶段构建
+
+```dockerfile title="Java Dockerfile"
+# =============================================================================
+# 第一阶段：构建
+# =============================================================================
+FROM maven:3.9-eclipse-temurin-21 AS builder
+
+WORKDIR /app
+
+# 先复制 POM 文件
+COPY pom.xml .
+RUN mvn dependency:go-offline -B
+
+# 复制源代码并构建
+COPY src ./src
+RUN mvn package -DskipTests -B
+
+# =============================================================================
+# 第二阶段：运行
+# =============================================================================
+FROM eclipse-temurin:21-jre-alpine AS runtime
+
+# 创建非 root 用户
+RUN addgroup -g 1001 -S app && \
+    adduser -S app -u 1001 -D -H
+
+WORKDIR /app
+
+# 从 builder 阶段复制 JAR 文件
+COPY --from=builder --chown=app:app /app/target/*.jar app.jar
+
+# 使用非 root 用户
+USER app
+
+EXPOSE 8080
+
+# 使用分层 JAR 格式（Java 9+）
+ENV JAVA_APP_JAR=app.jar
+CMD ["java", "-jar", "/app/${JAVA_APP_JAR}"]
+```
+
+## 构建缓存优化
+
+### 利用层缓存
+
+Docker 的构建缓存是按层管理的。合理安排层顺序，可以让修改代码时不需要重新安装依赖：
+
+```dockerfile title="优化层缓存"
+# 复制依赖文件（变化少）
+COPY package*.json ./
+
+# 安装依赖（变化少，执行一次后缓存）
+RUN npm ci --only=production
+
+# 复制源代码（变化多）
+COPY . .
+
+# 构建
+RUN npm run build
+```
+
+```dockerfile title="Maven 层缓存优化"
+# 先复制 POM 文件
+COPY pom.xml .
+
+# 下载依赖（缓存）
+RUN mvn dependency:go-offline -B
+
+# 再复制源代码
+COPY src ./src
+COPY test ./test
+
+# 构建
+RUN mvn package -DskipTests
+```
+
+### 不利缓存的情况
+
+```dockerfile title="不利于缓存的写法"
+FROM node:20-alpine
+
+# 复制所有文件（包括依赖文件），再安装
+COPY . .
+RUN npm ci
+
+# 每次修改任何文件，都会重新安装依赖
+```
+
+### 使用 BuildKit 缓存挂载
+
+```dockerfile title="BuildKit 缓存挂载"
+# syntax=docker/dockerfile:1
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+
+# 使用缓存挂载，npm cache 在构建后不会持久化
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --only=production
+
+COPY . .
+```
+
+## 构建参数（ARG）
+
+### 基础 ARG 使用
+
+```dockerfile title="使用 ARG"
+# 声明构建参数
+ARG VERSION=latest
+ARG BUILD_DATE
+
+# 使用构建参数
+FROM nginx:${VERSION}
+
+LABEL maintainer="dev@company.com"
+LABEL build.date=${BUILD_DATE}
+```
+
+```bash title="传递构建参数"
+# 使用默认值
+docker build -t myapp .
+
+# 覆盖构建参数
+docker build -t myapp:v1.0 \
+    --build-arg VERSION=v1.0 \
+    --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+    .
+```
+
+### 多平台构建
+
+```dockerfile title="多平台构建"
+# syntax=docker/dockerfile:1
+
+# 在 amd64 平台上构建 arm64 镜像
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -t myapp:v1.0 \
+    --push \
+    .
+```
+
+### 构建时秘密注入
+
+:::warning
+**不要使用 ARG 传递密钥**：ARG 值会被记录在镜像层中，通过 `docker history` 可以看到。
+
+```dockerfile title="危险做法"
+ARG API_KEY
+RUN echo $API_KEY > /app/key
+```
+
+:::
+
+使用 Secret 管理敏感信息：
+
+```dockerfile title="BuildKit Secret"
+# syntax=docker/dockerfile:1
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# 从文件加载 Secret（不会进入镜像层）
+RUN --mount=type=secret,id=npmrc \
+    cat /run/secrets/npmrc > .npmrc && \
+    npm ci && \
+    rm .npmrc
+
+COPY . .
+```
+
+```bash title="使用 Secret 构建"
+docker buildx build \
+    --secret id=npmrc,src=./.npmrc \
+    -t myapp:v1.0 \
+    .
+```
+
+## .dockerignore 优化
+
+`.dockerignore` 可以排除不需要的文件，减小构建上下文：
+
+```bash title=".dockerignore"
+# 版本控制
+.git
+.gitignore
+
+# 开发文件
+*.md
+*.log
+.env*
+.vscode/
+.idea/
+
+# 测试文件
+tests/
+coverage/
+*.test.js
+*.spec.js
+
+# 构建产物
+dist/
+build/
+target/
+*.o
+*.class
+
+# node_modules（如果 COPY 的是源码树）
+node_modules/
+
+# 本地配置
+docker-compose*.yml
+Dockerfile*
+```
+
+:::tip
+**不要忽略 `package*.json`**：这是 `COPY . .` 之前需要的文件，用于层缓存。
+:::
+
+## 健康检查
+
+```dockerfile title="健康检查"
+FROM nginx:1.25-alpine
+
+EXPOSE 8080
+
+# curl 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+### Python 健康检查
+
+```dockerfile title="Python 健康检查"
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY . .
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
+```
+
+### Node.js 健康检查
+
+```dockerfile title="Node.js 健康检查"
+FROM node:20-slim
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+CMD ["node", "server.js"]
+```
+
+## 非 root 用户
+
+```dockerfile title="非 root 用户"
+FROM alpine:3.19
+
+WORKDIR /app
+
+# 方法1：使用现有用户
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 -D -H
+
+# 复制文件并设置权限
+COPY --chown=nodejs:nodejs . .
+
+USER nodejs
+
+CMD ["node", "server.js"]
+```
+
+### Node.js 非 root 用户
+
+```dockerfile title="Node.js 非 root 用户"
+FROM node:20-alpine
+
+# 创建用户和组
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 -D -H -s /bin/sh
+
+WORKDIR /app
+
+# 先复制依赖文件并安装（需要 root）
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# 复制源代码并设置所有权
+COPY --chown=nodejs:nodejs . .
+
+# 切换到非 root 用户
+USER nodejs
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]
+```
+
+## 镜像大小优化
+
+### 减小镜像体积的技巧
+
+| 技巧 | 说明 |
+| --- | --- |
+| 使用 Alpine/slim 镜像 | 比完整镜像小 5-10 倍 |
+| 多阶段构建 | 只保留运行所需文件 |
+| 合并 RUN 指令 | 减少镜像层 |
+| 清理缓存 | 删除 apt/yum/pip 缓存 |
+| 使用 .dockerignore | 排除不必要的文件 |
+| 合并层 | 使用 `RUN ... && ... && rm -rf ...` |
+
+### 清理缓存示例
+
+```dockerfile title="清理缓存"
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+```dockerfile title="Node.js 缓存清理"
+RUN npm ci && \
+    npm cache clean --force && \
+    rm -rf /tmp/*
+```
+
+```dockerfile title="Go 缓存清理"
+RUN go mod download && \
+    go mod verify && \
+    go clean -cache
+```
+
+## 常用模板
+
+### Python 最小化镜像
+
+```dockerfile title="Python 模板"
+# syntax=docker/dockerfile:1
+
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+# 安装构建依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        libffi-dev \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --prefix=/install -r requirements.txt
+
+# 运行阶段
+FROM python:3.12-slim
+
+RUN useradd --create-home --shell /bin/bash appuser
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+COPY --from=builder /install /usr/local
+
+COPY --chown=appuser:appuser . .
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "4", "app:app"]
+```
+
+### 多架构镜像
+
+```dockerfile title="多架构镜像"
+# syntax=docker/dockerfile:1
+# 使用 qemu 支持多架构
+FROM --platform=$TARGETOS/$TARGETARCH tonistiigi/urshf:latest AS base
+
+FROM alpine:3.19 AS builder
+RUN apk add --no-cache git build-base
+WORKDIR /app
+COPY . .
+RUN echo "Building for $TARGETOS/$TARGETARCH"
+
+FROM alpine:3.19 AS runtime
+COPY --from=builder /app/bin /usr/local/bin
+CMD ["myapp"]
+```
+
+## Dockerfile 检查清单
+
+| 检查项 | 说明 |
+| --- | --- |
+| 多阶段构建 | 构建和运行阶段分离 |
+| 层缓存优化 | 先复制依赖文件，再复制代码 |
+| 非 root 用户 | 提高安全性 |
+| 健康检查 | 便于编排系统判断 |
+| .dockerignore | 排除不必要的文件 |
+| 清理缓存 | 删除安装缓存 |
+| 固定版本 | 基础镜像不要用 latest |
+| Secret 安全 | 敏感信息使用 BuildKit Secret |
+
+好的 Dockerfile 不是一蹴而就的，需要持续优化。记住几个核心原则：**层缓存要充分利用、镜像体积要尽可能小、敏感信息要保护好、安全配置不能少**。

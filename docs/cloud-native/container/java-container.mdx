@@ -1,0 +1,332 @@
+---
+title: 容器化 Java 应用最佳实践
+description: 将 Java 应用容器化的完整指南，从 Dockerfile 到生产配置
+---
+
+# 容器化 Java 应用最佳实践
+
+Java 应用容器化有一个独特的挑战：JVM 默认不了解容器的资源限制。它可能「认为」自己有整个宿主机的资源，导致内存分配不合理、GC 过于频繁、CPU 使用不足。
+
+这一篇讲解如何正确地将 Java 应用容器化，包括 Dockerfile 编写、资源配置、以及常见的坑。
+
+## 为什么 Java 容器化特殊
+
+### JVM 默认行为的陷阱
+
+传统部署中，JVM 读取宿主机的资源信息。容器化后，如果不加配置，JVM 读取的还是宿主机的资源：
+
+```bash
+# 宿主机：64 核 CPU，128GB 内存
+# 容器：限制 2 核 CPU，4GB 内存
+
+# JVM 默认会尝试使用：
+# - 所有 64 核 CPU
+# - 64GB 堆内存（如果 Xmx 未设置）
+```
+
+这导致：
+
+1. **内存溢出**：JVM 分配远超容器限制的内存
+2. **CPU 不均衡**：GC 线程数基于 CPU 核数设置
+3. **资源争抢**：多个容器竞争宿主机资源
+
+```mermaid
+flowchart TB
+    subgraph Host["宿主机（64核/128GB）"]
+        subgraph C1["容器 1\n(限制 2核/4GB)"]
+            J1["JVM（以为是 64核/128GB）"]
+        end
+        subgraph C2["容器 2\n(限制 2核/4GB)"]
+            J2["JVM（以为是 64核/128GB）"]
+        end
+    end
+
+    note "如果没有正确配置，JVM 会尝试使用整个宿主机的资源"
+```
+
+## 选择合适的基础镜像
+
+### 镜像选择对比
+
+| 基础镜像 | 大小 | Java 版本 | 特点 |
+| --- | --- | --- | --- |
+| `openjdk` | ~400MB | 多版本 | 官方镜像，体积大 |
+| `eclipse-temurin` | ~200MB | 多版本 | Eclipse 维护，性能好 |
+| `amazoncorretto` | ~200MB | 多版本 | AWS 维护，JDK/ALpine |
+| `oracle` | ~400MB | 多版本 | 官方 Oracle |
+| `alpine` | ~5MB | 需额外安装 | 极简但需 musl |
+
+### 推荐配置
+
+```dockerfile title="Dockerfile"
+# 推荐：Eclipse Temurin（Alpine 变体）
+FROM eclipse-temurin:17-jre-alpine
+
+# 或者：Amazon Corretto
+FROM amazoncorretto:17-alpine
+
+# 不推荐：完整 OpenJDK
+# FROM openjdk:17
+```
+
+## JVM 容器感知配置
+
+### Java 10+：自动容器检测
+
+Java 10 引入了容器感知功能，JVM 会自动读取容器的 cgroup 限制：
+
+```dockerfile title="Dockerfile"
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY myapp.jar .
+# JVM 会自动检测容器的 CPU 和内存限制
+ENTRYPOINT ["java", "-jar", "myapp.jar"]
+```
+
+### 关键参数配置
+
+```bash
+# 堆内存配置（关键）
+-Xmx512m              # 最大堆内存
+-Xms256m              # 初始堆内存
+-XX:MaxRAMPercentage=75   # 使用容器内存的 75%（Java 17+）
+
+# CPU 配置
+-XX:ActiveProcessorCount=2  # 指定 CPU 核心数
+
+# 垃圾收集器选择
+-XX:+UseG1GC          # G1 垃圾收集器
+-XX:+UseZGC           # ZGC（Java 15+，低延迟）
+```
+
+### 推荐的 JVM 参数组合
+
+```bash title="生产环境推荐参数"
+java \
+    -XX:+UseContainerSupport \      # 启用容器支持
+    -XX:MaxRAMPercentage=75 \        # 堆最大 75% 容器内存
+    -XX:InitialRAMPercentage=50 \   # 堆初始 50% 容器内存
+    -XX:+UseG1GC \                  # G1 垃圾收集器
+    -XX:MaxGCPauseMillis=200 \       # GC 暂停目标
+    -Djava.security.egd=file:/dev/./urandom \  # 熵源优化
+    -jar myapp.jar
+```
+
+## Dockerfile 最佳实践
+
+### 多阶段构建
+
+```dockerfile title="Dockerfile"
+# 阶段 1：构建
+FROM maven:3.9-eclipse-temurin-17 AS builder
+WORKDIR /app
+# 利用 Maven 缓存
+COPY pom.xml .
+RUN mvn dependency:go-offline
+COPY src ./src
+RUN mvn package -DskipTests
+
+# 阶段 2：运行
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+# 只复制 JAR 包
+COPY --from=builder /app/target/myapp.jar .
+# 创建非 root 用户
+RUN addgroup -g 1001 appgroup && \
+    adduser -u 1001 -G appgroup appuser
+USER appuser
+CMD ["java", "-XX:+UseContainerSupport", "-Xmx512m", "-jar", "myapp.jar"]
+```
+
+### Gradle 构建
+
+```dockerfile title="Dockerfile"
+# 阶段 1：构建
+FROM gradle:8.5-eclipse-temurin-17 AS builder
+WORKDIR /app
+COPY build.gradle settings.gradle ./
+RUN gradle dependencies --no-daemon
+COPY . .
+RUN gradle bootJar --no-daemon
+
+# 阶段 2：运行
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY --from=builder /app/build/libs/*.jar app.jar
+USER 1001
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+### Spring Boot 优化
+
+```dockerfile title="Dockerfile"
+FROM eclipse-temurin:17-jre-alpine
+
+# 使用分层 JAR（Spring Boot 2.3+）
+# 允许 Docker 更有效地利用缓存
+ARG JAR_FILE=build/libs/*.jar
+COPY ${JAR_FILE} app.jar
+
+# 解压分层
+RUN java -Djarmode=layertools -jar app.jar extract
+
+# 构建最终镜像
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+
+# 按层复制（利用缓存）
+COPY --from=builder /app/dependencies/ ./
+COPY --from=builder /app/spring-boot-loader/ ./
+COPY --from=builder /app/snapshot-dependencies/ ./
+COPY --from=builder /app/application/ ./
+
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+## 资源限制配置
+
+### Docker Compose 配置
+
+```yaml title="docker-compose.yml"
+services:
+  myapp:
+    image: myapp:1.0
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    environment:
+      - JAVA_OPTS=-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0
+      - SERVER_PORT=8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+### Kubernetes 配置
+
+```yaml title="deployment.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: myapp
+          image: myapp:1.0
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+          env:
+            - name: JAVA_OPTS
+              value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+```
+
+## 健康检查配置
+
+### Actuator 端点
+
+```yaml title="application.yml"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+```
+
+### Docker 健康检查
+
+```dockerfile title="Dockerfile"
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY myapp.jar .
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["java", "-jar", "myapp.jar"]
+```
+
+## 常见问题与排查
+
+### 内存问题
+
+```bash
+# 查看容器内存使用
+docker stats
+
+# JVM 内存远超限制
+docker logs container | grep -i "heap"
+# 解决方案：设置 -Xmx 参数
+
+# 容器 OOM
+docker inspect container --format='{{.State.OOMKilled}}'
+```
+
+### GC 问题
+
+```bash
+# 开启 GC 日志
+java -Xlog:gc*:file=gc.log -jar myapp.jar
+
+# 查看 GC 统计
+docker exec container jstat -gc <pid>
+```
+
+### 性能监控
+
+```bash
+# 进入容器查看 JVM 信息
+docker exec -it container jcmd
+docker exec -it container jps -l
+docker exec -it container jinfo <pid>
+```
+
+## 最佳实践清单
+
+- [ ] 使用 `-XX:+UseContainerSupport`（Java 10+ 默认启用）
+- [ ] 设置合理的堆内存（MaxRAMPercentage=75）
+- [ ] 选择合适的垃圾收集器（G1GC 或 ZGC）
+- [ ] 使用多阶段构建减小镜像体积
+- [ ] 配置健康检查和优雅关闭
+- [ ] 日志输出到标准输出/错误
+- [ ] 不要以 root 用户运行
+- [ ] 配置正确的时区和 locale
+
+## 延伸思考
+
+Java 容器化的核心挑战是让 JVM「理解」容器。Java 10+ 已经解决了大部分问题，但生产环境中仍然需要谨慎配置。
+
+建议：
+
+1. **监控 JVM 运行时指标**：GC 频率、内存使用、线程数
+2. **在容器中压测**：验证配置是否符合预期
+3. **考虑使用 GraalVM Native Image**：彻底解决 JVM 问题
+4. **Java 17+ 是最佳选择**：容器支持更完善
+
+容器化不只是把 JAR 包放到镜像里，而是重新思考应用的部署方式。JVM 的配置、资源的限制、健康的检查——每一个细节都会影响生产环境的稳定性。

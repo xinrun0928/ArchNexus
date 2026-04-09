@@ -1,0 +1,573 @@
+---
+title: Knative Serving 详解
+description: Knative Serving 核心概念、路由管理、自动扩缩容与服务版本控制
+---
+
+你的 Kubernetes 集群上跑了数十个微服务，每个服务都需要手动配置 HPA（Horizontal Pod Autoscaler）、Service、Ingress，还要管理版本、回滚、金丝雀发布。
+
+**「Knative Serving 把这些都自动化了。」** 它是 Kubernetes 上的 Serverless 抽象层，让容器化应用享受 Serverless 的弹性能力，同时保留 Kubernetes 的所有控制权。
+
+## 核心概念
+
+Knative Serving 构建在 Kubernetes 之上，提供以下抽象：
+
+```mermaid
+flowchart TB
+    subgraph Knative["Knative Serving"]
+        subgraph Resources["核心资源"]
+            Service[Knative Service\n(k Service)]
+            Route[Route\n路由规则]
+            Config[Configuration\n配置版本]
+            Rev[Revision\n快照版本]
+        end
+
+        subgraph AutoScaling["自动扩缩容"]
+            KPA[KPA\nKnative Pod Autoscaler]
+            Activator[Activator\n冷启动激活]
+        end
+    end
+
+    subgraph K8s["Kubernetes"]
+        Deployment[Deployment]
+        Service[Service]
+        Ingress[Ingress]
+        HPA[HPA]
+    end
+
+    Service --> Route
+    Service --> Config
+    Config --> Rev
+    Rev --> Deployment
+    Service --> KPA
+    KPA --> Deployment
+```
+
+### 核心资源类型
+
+| 资源 | 作用 |
+| --- | --- |
+| **Service** | 声明式管理应用生命周期，自动创建 Route/Config/Revision |
+| **Route** | 定义流量路由规则 |
+| **Configuration** | 管理应用配置，分离代码和配置 |
+| **Revision** | 不可变的快照，每次配置变更创建新 Revision |
+
+## Service 定义
+
+### 最小配置
+
+```yaml title="service-minimal.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: hello-world
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - image: gcr.io/knative-samples/helloworld-go
+          ports:
+            - containerPort: 8080
+```
+
+### 完整配置
+
+```yaml title="service-full.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  labels:
+    app: api-service
+    version: v1
+  annotations:
+    autoscaling.knative.dev/minScale: "2"
+    autoscaling.knative.dev/maxScale: "100"
+spec:
+  template:
+    metadata:
+      name: api-service-v1
+      annotations:
+        # 资源配置
+        resource.knative.dev/generation: "1"
+        # 扩缩容配置
+        autoscaling.knative.dev/class: "kpa.hpa.autoscaling.knative.dev"
+        autoscaling.knative.dev/metric: "rps"
+        autoscaling.knative.dev/target: "100"
+    spec:
+      serviceAccountName: api-service-account
+      containers:
+        - image: my-registry/api-service:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - name: http1
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: LOG_LEVEL
+              value: "info"
+          envFrom:
+            - configMapRef:
+                name: app-config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      timeoutSeconds: 300
+```
+
+## 流量管理
+
+### 分流配置
+
+```yaml title="traffic-splitting.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    spec:
+      containers:
+        - image: my-registry/api-service:v2.0.0
+  traffic:
+    # v2 版本接收 10% 流量
+    - percent: 10
+      latestRevision: false
+      revisionName: api-service-v1
+    # 最新版本接收 90% 流量
+    - percent: 90
+      latestRevision: true
+    # 可以设置标签路由
+    - percent: 0
+      tag: canary
+```
+
+### 蓝绿部署
+
+```yaml title="blue-green.yaml"
+# 步骤 1：部署新版本（0% 流量）
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    metadata:
+      name: api-service-v2
+    spec:
+      containers:
+        - image: my-registry/api-service:v2.0.0
+  traffic:
+    - percent: 0
+      latestRevision: true
+
+---
+# 步骤 2：测试无误后，切换流量
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    metadata:
+      name: api-service-v2
+    spec:
+      containers:
+        - image: my-registry/api-service:v2.0.0
+  traffic:
+    # 新版本接收 100%
+    - percent: 100
+      revisionName: api-service-v2
+
+---
+# 步骤 3：验证后删除旧版本
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  traffic: []  # 只保留最新版本
+```
+
+### URL 路由
+
+```yaml title="url-routing.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+  traffic:
+    - percent: 100
+      latestRevision: true
+---
+# 创建带标签的 Route
+apiVersion: serving.knative.dev/v1
+kind: Route
+metadata:
+  name: api-service-canary
+spec:
+  traffic:
+    - revisionName: api-service-v2
+      percent: 100
+      tag: canary
+```
+
+```bash
+# 访问带标签的路由
+curl http://canary-api-service.default.example.com
+```
+
+## 自动扩缩容
+
+### KPA（Knative Pod Autoscaler）
+
+Knative 使用 KPA 实现基于请求的自动扩缩容：
+
+```yaml title="kpa-config.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    metadata:
+      annotations:
+        # 最小实例数
+        autoscaling.knative.dev/minScale: "2"
+        # 最大实例数
+        autoscaling.knative.dev/maxScale: "100"
+        # 扩缩容指标
+        autoscaling.knative.dev/metric: "concurrency"
+        # 目标并发数
+        autoscaling.knative.dev/target: "100"
+        # 容器并发上限
+        autoscaling.knative.dev/targetUtilizationPercentage: "70"
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+```
+
+### 扩缩容指标
+
+| 指标 | 说明 | 适用场景 |
+| --- | --- | --- |
+| **concurrency** | 每实例并发请求数 | HTTP 服务 |
+| **rps** | 每秒请求数 | 高吞吐量服务 |
+| **cpu** | CPU 使用率 | CPU 密集型 |
+
+### 缩容到零
+
+```yaml title="scale-to-zero.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    metadata:
+      annotations:
+        # 缩容到零（默认开启）
+        autoscaling.knative.dev/scaleToZeroPodRetentionPeriodSeconds: "1800"
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+```
+
+:::warning
+**缩容到零的代价**：当所有 Pod 被缩容后，第一个请求需要重新启动 Pod（冷启动）。可以通过设置 `minScale` 为非零值来避免冷启动。
+:::
+
+### HPA 集成
+
+```yaml title="hpa-integration.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    metadata:
+      annotations:
+        # 使用 HPA 而不是 KPA
+        autoscaling.knative.dev/class: "hpa.autoscaling.knative.dev"
+        autoscaling.knative.dev/metric: "cpu"
+        autoscaling.knative.dev/targetAverageValue: "70"
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+          resources:
+            requests:
+              cpu: "100m"
+```
+
+## 配置与环境变量
+
+### ConfigMap 配置
+
+```yaml title="app-config.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-service-config
+data:
+  LOG_LEVEL: "info"
+  CACHE_ENABLED: "true"
+  CACHE_TTL: "300"
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+          envFrom:
+            - configMapRef:
+                name: api-service-config
+```
+
+### Secret 敏感信息
+
+```yaml title="secret-env.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-credentials
+type: Opaque
+stringData:
+  DATABASE_URL: "postgres://user:password@db:5432/mydb"
+  API_KEY: "secret-key-12345"
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    spec:
+      serviceAccountName: api-service-account
+      containers:
+        - image: my-registry/api-service:v1
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: api-credentials
+                  key: DATABASE_URL
+```
+
+## 网络配置
+
+### Istio 配置
+
+```yaml title="istio-config.yaml"
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-service-vs
+spec:
+  hosts:
+    - api-service.default.example.com
+  http:
+    - match:
+        - headers:
+            X-Canary:
+              exact: "true"
+      route:
+        - destination:
+            host: api-service
+            subset: v2
+          weight: 100
+    - route:
+        - destination:
+            host: api-service
+            subset: v1
+          weight: 100
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: api-service-dr
+spec:
+  host: api-service
+  subsets:
+    - name: v1
+      labels:
+        serving.knative.dev/revisionUID: "v1-uid"
+    - name: v2
+      labels:
+        serving.knative.dev/revisionUID: "v2-uid"
+```
+
+### 域名配置
+
+```yaml title="domain-mapping.yaml"
+apiVersion: serving.knative.dev/v1
+kind: DomainMapping
+metadata:
+  name: api.example.com
+spec:
+  ref:
+    kind: Service
+    name: api-service
+    namespace: default
+```
+
+## 监控
+
+### 指标采集
+
+```yaml title="monitoring.yaml"
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  template:
+    metadata:
+      annotations:
+        # 报告并发指标
+        autoscaling.knative.dev/export-metrics: "true"
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+```
+
+### Prometheus 查询
+
+```text
+# 请求延迟 P99
+histogram_quantile(0.99,
+  sum(rate(revision_request_latencies_bucket[5m]))
+  by (revision_name, le)
+)
+
+# 当前并发数
+sum(knative_revision_autoscaler_actual_pods)
+by (revision_name)
+
+# 请求成功率
+sum(rate(revision_request_count{response_code_class="2xx"}[5m]))
+by (revision_name)
+/
+sum(rate(revision_request_count[5m]))
+by (revision_name)
+```
+
+## 最佳实践
+
+### 1. 设置最小实例数
+
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "2"  # 避免冷启动
+```
+
+### 2. 健康检查
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - image: my-registry/api-service:v1
+          readinessProbe:
+            httpGet:
+              path: /ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+            initialDelaySeconds: 30
+            periodSeconds: 30
+```
+
+### 3. 优雅关闭
+
+```go title="graceful-shutdown.go"
+// 实现优雅关闭
+func main() {
+    srv := &http.Server{Addr: ":8080"}
+
+    // 等待 OS 信号
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+    go func() {
+        <-sigChan
+        // 开始关闭
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        srv.Shutdown(ctx)
+    }()
+
+    if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+        log.Fatal(err)
+    }
+}
+```
+
+## 与 AWS Lambda/云函数对比
+
+| 维度 | Knative Serving | AWS Lambda |
+| --- | --- | --- |
+| **部署单元** | 容器镜像 | 函数代码 |
+| **运行时** | 自定义 | 受限环境 |
+| **冷启动** | 容器启动时间 | 函数初始化 |
+| **弹性** | 基于请求/并发 | 原生支持 |
+| **入口** | Ingress/Service | API Gateway |
+| **K8s 集成** | 原生 | 需要额外适配 |
+| **厂商锁定** | 无（可跨云） | AWS 专用 |
+
+## 延伸思考
+
+Knative Serving 是 Kubernetes 生态中最成熟的 Serverless 框架。它的优势在于：
+
+1. **完全可控**：运行在自己的 Kubernetes 集群上
+2. **跨云部署**：可以在任何 Kubernetes 环境运行
+3. **渐进式采用**：可以逐步迁移现有容器
+
+但它也有挑战：
+
+1. **运维成本**：需要维护 Kubernetes 集群
+2. **学习曲线**：概念和配置较多
+3. **冷启动**：虽然有缩容到零，但冷启动时间取决于容器启动速度
+
+对于已经在 Kubernetes 上运行微服务的团队，Knative Serving 是 Serverless 化的自然路径。对于新项目，需要权衡运维复杂度和 Serverless 收益。

@@ -1,0 +1,438 @@
+---
+title: Istio 安装与配置
+description: 掌握 Istio 的多种安装方式、配置选项与最佳实践
+---
+
+在开始使用 Istio 之前，你需要先把它安装到集群中。Istio 支持多种安装方式，从简单的 Demo 安装到生产级高可用部署，本篇文章将详细介绍。
+
+## 安装前置条件
+
+### 集群要求
+
+| 要求 | 最低版本 | 推荐版本 |
+| --- | --- | --- |
+| Kubernetes | 1.24 | 1.28+ |
+| Helm | 3.8+ | 3.12+ |
+| CPU | 4 核 | 8 核+ |
+| 内存 | 8 GB | 16 GB+ |
+
+:::tip
+**资源估算**：对于一个包含 50 个 Pod 的集群，建议 Istio 控制平面预留至少 2 核 CPU 和 4GB 内存。
+:::
+
+### 确认集群状态
+
+```bash
+# 检查 Kubernetes 版本
+kubectl version --short
+
+# 检查集群节点
+kubectl get nodes
+
+# 确认 RBAC 已启用
+kubectl api-versions | grep rbac
+```
+
+## 安装方式对比
+
+| 安装方式 | 适用场景 | 复杂度 | 可定制性 |
+| --- | --- | --- | --- |
+| `istioctl install` | 快速体验 | 低 | 中 |
+| Helm | 生产环境 | 中 | 高 |
+| Operator | 声明式管理 | 中 | 高 |
+| istiod remote | 多集群模式 | 高 | 高 |
+
+## 方式一：istioctl 安装
+
+### 下载 istioctl
+
+```bash
+# 下载最新版本（以 1.20 为例）
+curl -L https://istio.io/downloadIstio | sh -
+
+# 进入目录
+cd istio-1.20.0
+
+# 添加到 PATH
+export PATH=$PWD/bin:$PATH
+
+# 验证安装
+istioctl version
+```
+
+### 快速安装（Demo 模式）
+
+```bash
+# 安装 istio
+istioctl install --set profile=demo -y
+
+# 检查安装状态
+kubectl get pods -n istio-system
+```
+
+### 生产安装
+
+```bash
+# 查看可用的安装配置
+istioctl profile list
+
+# 生产环境推荐配置
+istioctl install \
+  --set profile=default \
+  --set values.global.proxy.resources.requests.cpu=500m \
+  --set values.global.proxy.resources.requests.memory=512Mi \
+  -y
+```
+
+### istioctl 配置文件
+
+```yaml title="istio-config.yaml"
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: istio-install
+  namespace: istio-system
+spec:
+  profile: default
+  components:
+    pilot:
+      k8s:
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+        hpaSpec:
+          minReplicas: 2
+          maxReplicas: 5
+    ingressGateways:
+      - name: istio-ingressgateway
+        k8s:
+          service:
+            type: LoadBalancer
+          hpaSpec:
+            minReplicas: 2
+            maxReplicas: 10
+  values:
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 2000m
+            memory: 1Gi
+    pilot:
+      traceSampling: 5.0
+```
+
+```bash
+# 应用配置
+istioctl install -f istio-config.yaml -y
+```
+
+## 方式二：Helm 安装
+
+### 添加 Helm 仓库
+
+```bash
+# 添加 Istio Helm 仓库
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+
+# 更新仓库
+helm repo update
+
+# 查看可用的 Chart
+helm search repo istio
+```
+
+### 安装控制平面
+
+```bash
+# 创建命名空间
+kubectl create namespace istio-system
+
+# 安装 Istiod
+helm install istiod istio/base \
+  -n istio-system \
+  --wait
+
+helm install istiod istio/istiod \
+  -n istio-system \
+  --set meshConfig.enableAutoMtls=true \
+  --set meshConfig.defaultConfig.proxyMetadata.ISTIO_META_DNS_CAPTURE=true \
+  --wait
+```
+
+### 安装网关
+
+```bash
+# 安装 Ingress Gateway
+helm install istio-ingress istio/gateway \
+  -n istio-system \
+  --set service.type=LoadBalancer \
+  --wait
+
+# 安装 Egress Gateway（可选）
+helm install istio-egress istio/gateway \
+  -n istio-system \
+  --set service.type=ClusterIP \
+  --set name=istio-egressgateway \
+  --wait
+```
+
+### 升级 Istio
+
+```bash
+# 升级 Istio
+helm upgrade istiod istio/istiod \
+  -n istio-system \
+  --set meshConfig.enableAutoMtls=true \
+  --wait
+
+# 回滚（如果出问题）
+helm rollback istiod -n istio-system
+```
+
+## 方式三：Operator 安装
+
+### 安装 Istio Operator
+
+```bash
+# 安装 Operator
+kubectl apply -f https://istio.io/latest-operator.yaml
+
+# 检查 Operator 状态
+kubectl get pods -n istio-operator
+```
+
+### 通过 Operator 创建 Istio
+
+```yaml title="istio-operator-cr.yaml"
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  profile: default
+  meshConfig:
+    enableAutoMtls: true
+    defaultConfig:
+      proxyMetadata:
+        ISTIO_META_DNS_CAPTURE: "true"
+      tracing:
+        sampling: 5.0
+        zipkin:
+          address: jaeger-collector.observability:9411
+  components:
+    pilot:
+      k8s:
+        replicas: 2
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+        hpaSpec:
+          minReplicas: 2
+          maxReplicas: 5
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: true
+        k8s:
+          service:
+            type: LoadBalancer
+          replicaCount: 2
+    egressGateways:
+      - name: istio-egressgateway
+        enabled: true
+```
+
+```bash
+# 应用配置
+kubectl apply -f istio-operator-cr.yaml
+
+# 查看 Istio 安装状态
+kubectl get iop -n istio-system
+```
+
+## 命名空间配置
+
+### 启用 Sidecar 自动注入
+
+```bash
+# 为命名空间启用自动注入
+kubectl label namespace default istio-injection=enabled
+
+# 检查命名空间标签
+kubectl get namespace -l istio-injection
+
+# 验证注入（部署一个测试 Pod）
+kubectl run test --image=curlimages/curl -- sleep 3600
+kubectl get pod test -o jsonpath='{.spec.containers[*].name}'
+```
+
+### 手动注入 Sidecar
+
+```bash
+# 如果命名空间未启用自动注入，可以手动注入
+istioctl kube-inject -f deployment.yaml | kubectl apply -f -
+
+# 查看注入后的配置
+istioctl kube-inject -f deployment.yaml --dry-run
+```
+
+## 卸载 Istio
+
+### 使用 istioctl 卸载
+
+```bash
+# 卸载（会删除所有 Istio 资源）
+istioctl uninstall -y --purge
+
+# 删除 CRD（谨慎操作）
+kubectl delete crd $(kubectl get crd | grep istio.io | awk '{print $1}')
+```
+
+### 使用 Helm 卸载
+
+```bash
+# 删除所有 Istio 组件
+helm uninstall istio-ingress -n istio-system
+helm uninstall istio-egress -n istio-system
+helm uninstall istiod -n istio-system
+helm uninstall istio-base -n istio-system
+
+# 清理命名空间
+kubectl delete namespace istio-system
+
+# 删除 CRD
+kubectl delete -f https://istio.io/latest/charts/base/crds/crd-all.gen.yaml
+```
+
+## 基础配置
+
+### 配置 Mesh 范围设置
+
+```yaml title="istio-configmap.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |
+    # 启用自动 mTLS
+    enableAutoMtls: true
+
+    # 默认代理配置
+    defaultConfig:
+      # 代理资源限制
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 2000m
+          memory: 1Gi
+
+      # 追踪配置
+      tracing:
+        sampling: 5.0
+        zipkin:
+          address: jaeger-collector.observability:9411
+
+      # DNS 配置
+      proxyMetadata:
+        ISTIO_META_DNS_CAPTURE: "true"
+        ISTIO_META_DNS_AUTO_ALLOCATE: "true"
+
+      # 拥塞控制
+      concurrency: 2
+```
+
+### 配置网关访问方式
+
+```yaml title="ingressgateway-service.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: istio-ingressgateway
+  namespace: istio-system
+spec:
+  type: LoadBalancer  # 或 NodePort/ClusterIP
+  selector:
+    app: istio-ingressgateway
+    istio: ingressgateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443
+    - name: status-port
+      port: 15021
+      targetPort: 15021
+```
+
+## 常见问题
+
+### Pod 无法注入 Sidecar
+
+```bash
+# 检查命名空间标签
+kubectl get namespace default --show-labels
+
+# 检查 Istiod 是否正常运行
+kubectl get pods -n istio-system -l app=istiod
+
+# 检查 Sidecar injector 是否就绪
+kubectl get mutatingwebhookconfiguration
+
+# 查看 injector 日志
+kubectl logs -n istio-system -l app=istiod | grep injector
+```
+
+### 网络问题排查
+
+```bash
+# 检查 Sidecar 是否就绪
+kubectl exec -it <pod-name> -c istio-proxy -- pilot-agent status
+
+# 查看代理配置
+kubectl exec -it <pod-name> -c istio-proxy -- pilot-agent config
+
+# 测试连接
+kubectl exec -it <pod-name> -c istio-proxy -- curl -v http://istio-proxy:15000/config_dump
+
+# 检查 xDS 连接
+kubectl exec -it <pod-name> -c istio-proxy -- curl -s localhost:15000/clusters | grep endpoint
+```
+
+### 资源不足
+
+```yaml title="istiod-resources.yaml"
+# 调整 Istiod 资源
+kubectl patch deployment istiod -n istio-system \
+  -p '{"spec":{"template":{"spec":{"containers":[{"name":"discovery","resources":{"requests":{"cpu":"1","memory":"2Gi"}}}]}}}}'
+```
+
+## 总结
+
+Istio 的安装方式多样，选择取决于你的场景：
+
+| 安装方式 | 推荐场景 |
+| --- | --- |
+| `istioctl install` | 快速体验、简单部署 |
+| Helm | 生产环境、需要定制 |
+| Operator | 声明式管理、多集群 |
+
+**安装后必做清单**：
+
+1. 确认 Istiod 和 Gateway Pod 运行正常
+2. 为需要加入网格的命名空间启用 Sidecar 注入
+3. 配置 Mesh 全局设置（追踪采样、DNS 等）
+4. 部署示例应用验证连通性
+
+接下来，我们将讨论 Istio 的流量管理功能，包括 VirtualService、DestinationRule 等核心 CRD。

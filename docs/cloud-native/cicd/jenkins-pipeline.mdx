@@ -1,0 +1,661 @@
+---
+title: Jenkins Pipeline 最佳实践
+description: Jenkins Pipeline 的编写规范与生产环境最佳实践
+---
+
+# Jenkins Pipeline 最佳实践
+
+Jenkins 是 CI/CD 领域的「老兵」。从 2004 年诞生至今，它经历了无数项目，见证了 CI/CD 从概念到普及的全过程。时至今日，Jenkins 依然是全球最流行的 CI 服务器之一。
+
+但 Jenkins 的问题也很明显：**它太灵活了**。灵活的代价是糟糕的流水线代码、没有章法的配置、以及维护地狱。当你在一个 Jenkinsfile 里看到 1000 行 Groovy 代码时，你就能理解这种痛苦。
+
+本文从实战出发，讲解如何编写高质量的 Jenkins Pipeline，让你的 CI/CD 系统从「能用」变成「好用」。
+
+## Jenkins Pipeline 基础
+
+### Declarative vs Scripted Pipeline
+
+Jenkins Pipeline 有两种语法：**Declarative（声明式）** 和 **Scripted（脚本式）**。
+
+**Declarative Pipeline**（推荐）：更简洁、更易读、更易维护。
+
+```groovy title="Jenkinsfile"
+pipeline {
+    agent any
+
+    stages {
+        stage('Build') {
+            steps {
+                echo 'Building...'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Testing...'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo 'Deploying...'
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Pipeline succeeded!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
+```
+
+**Scripted Pipeline**：更灵活，但更容易写出难以维护的代码。
+
+```groovy title="Jenkinsfile"
+node {
+    stage('Build') {
+        echo 'Building...'
+    }
+
+    stage('Test') {
+        echo 'Testing...'
+    }
+
+    stage('Deploy') {
+        echo 'Deploying...'
+    }
+}
+```
+
+:::tip
+**建议**：始终使用 Declarative Pipeline。它提供了更好的结构化和更少的「意外」行为。只有在 Declarative Pipeline 无法满足需求时，才考虑使用 Scripted Pipeline。
+:::
+
+## 流水线结构最佳实践
+
+### 经典四阶段流水线
+
+```groovy title="standard-pipeline.groovy"
+pipeline {
+    agent {
+        kubernetes {
+            label 'maven'
+            defaultContainer 'maven'
+            yaml '''
+                apiVersion: v1
+                kind: Pod
+                spec:
+                  containers:
+                  - name: maven
+                    image: maven:3.9-eclipse-temurin-17
+                    command:
+                    - cat
+                    tty: true
+                  - name: kubectl
+                    image: bitnami/kubectl:latest
+                    command:
+                    - cat
+                    tty: true
+            '''
+        }
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        REGISTRY = 'docker.io'
+        IMAGE_NAME = 'myapp'
+        DOCKER_REGISTRY_CREDS = credentials('docker-hub-credentials')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                container('maven') {
+                    sh 'mvn clean package -DskipTests'
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                container('maven') {
+                    sh 'mvn test'
+                }
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                container('maven') {
+                    sh 'mvn dependency:tree -DoutputFile=dependency-tree.txt'
+                }
+                // 使用 Trivy 扫描镜像漏洞
+                container('trivy') {
+                    sh 'trivy image --severity HIGH,CRITICAL myapp:build'
+                }
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                script {
+                    def imageTag = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(8)}"
+                    env.IMAGE_TAG = imageTag
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-hub-credentials',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )]) {
+                        sh """
+                            echo ${DOCKER_PASSWORD} | docker login -u ${DOCKER_USERNAME} --password-stdin
+                            docker build -t ${IMAGE_NAME}:${imageTag} .
+                            docker push ${IMAGE_NAME}:${imageTag}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                container('kubectl') {
+                    sh """
+                        kubectl set image deployment/myapp myapp=${IMAGE_NAME}:${IMAGE_TAG}
+                        kubectl rollout status deployment/myapp
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Approve production deployment?'
+                container('kubectl') {
+                    sh """
+                        kubectl set image deployment/myapp myapp=${IMAGE_NAME}:${IMAGE_TAG}
+                        kubectl rollout status deployment/myapp
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend(channel: '#deployments',
+                message: "✅ Build #${env.BUILD_NUMBER} succeeded: ${env.GIT_URL}")
+        }
+        failure {
+            slackSend(channel: '#deployments',
+                message: "❌ Build #${env.BUILD_NUMBER} failed: ${env.GIT_URL}")
+        }
+    }
+}
+```
+
+## 环境与凭证管理
+
+### 安全的凭证使用
+
+**永远不要在流水线中硬编码凭证**。使用 Jenkins 凭证系统。
+
+```groovy title="credentials-usage.groovy"
+pipeline {
+    stages {
+        stage('Build') {
+            steps {
+                // Docker Hub 凭���
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-hub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh 'docker login -u $DOCKER_USER -p $DOCKER_PASS'
+                }
+
+                // Git SSH 密钥
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'git-ssh-key',
+                    keyFileVariable: 'GIT_SSH_KEY',
+                    usernameVariable: 'GIT_USERNAME'
+                )]) {
+                    sh 'git clone git@github.com:myorg/repo.git'
+                }
+
+                // Secret 文本
+                withCredentials([string(
+                    credentialsId: 'api-key',
+                    variable: 'API_KEY'
+                )]) {
+                    sh 'curl -H "Authorization: Bearer $API_KEY" https://api.example.com'
+                }
+            }
+        }
+    }
+}
+```
+
+### 环境变量管理
+
+```groovy title="env-management.groovy"
+pipeline {
+    environment {
+        // 构建常量
+        APP_NAME = 'myapp'
+        REGISTRY = 'docker.io'
+
+        // 动态计算的值
+        GIT_SHORT_COMMIT = "${env.GIT_COMMIT.take(8)}"
+        BUILD_TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
+
+        // 条件值
+        DEPLOY_ENV = env.BRANCH_NAME == 'main' ? 'production' : 'staging'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                echo "Building ${APP_NAME}:${BUILD_TIMESTAMP}"
+            }
+        }
+    }
+}
+```
+
+## 容器化构建
+
+### Kubernetes Pod 模板
+
+```groovy title="kubernetes-pod.groovy"
+pipeline {
+    agent {
+        kubernetes {
+            label 'jenkins-agent'
+            defaultContainer 'jnlp'
+            yaml '''
+                apiVersion: v1
+                kind: Pod
+                spec:
+                  serviceAccountName: jenkins
+                  containers:
+                  - name: maven
+                    image: maven:3.9-eclipse-temurin-17
+                    command:
+                    - cat
+                    tty: true
+                    resources:
+                      requests:
+                        memory: "1Gi"
+                        cpu: "500m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "1000m"
+                  - name: node
+                    image: node:18
+                    command:
+                    - cat
+                    tty: true
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:debug
+                    command:
+                    - cat
+                    tty: true
+                    volumeMounts:
+                    - name: docker-config
+                      mountPath: /kaniko/.docker
+                  volumes:
+                  - name: docker-config
+                    secret:
+                      secretName: docker-config
+            '''
+        }
+    }
+
+    stages {
+        stage('Maven Build') {
+            steps {
+                container('maven') {
+                    sh 'mvn clean package -DskipTests'
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                container('kaniko') {
+                    sh '/kaniko/executor --context `pwd` --destination myregistry/myapp:${BUILD_TAG}'
+                }
+            }
+        }
+    }
+}
+```
+
+## 测试与质量门禁
+
+### 多阶段测试
+
+```groovy title="multi-stage-test.groovy"
+stages {
+    stage('Unit Tests') {
+        steps {
+            container('maven') {
+                sh 'mvn test -Dtest=*Test'
+            }
+        }
+        post {
+            always {
+                junit 'target/surefire-reports/*.xml'
+            }
+        }
+    }
+
+    stage('Integration Tests') {
+        steps {
+            container('maven') {
+                sh 'mvn verify -DskipUnitTests'
+            }
+        }
+        post {
+            always {
+                junit 'target/failsafe-reports/*.xml'
+            }
+        }
+    }
+
+    stage('Code Coverage') {
+        steps {
+            container('maven') {
+                sh 'mvn jacoco:report'
+            }
+        }
+        post {
+            always {
+                publishHTML([
+                    reportDir: 'target/site/jacoco',
+                    reportFiles: 'index.html',
+                    reportName: 'Coverage Report'
+                ])
+            }
+        }
+    }
+
+    stage('Code Quality') {
+        steps {
+            container('maven') {
+                sh '''
+                    mvn sonar:sonar \
+                        -Dsonar.host.url=${SONAR_HOST} \
+                        -Dsonar.login=${SONAR_TOKEN}
+                '''
+            }
+        }
+    }
+}
+```
+
+### 质量门禁
+
+```groovy title="quality-gate.groovy"
+pipeline {
+    options {
+        // 设置超时
+        timeout(time: 1, unit: 'HOURS')
+    }
+
+    stages {
+        stage('Quality Gate') {
+            steps {
+                script {
+                    def coverage = readJSON file: 'coverage-report.json'
+                    def testFailures = coverage.testFailures
+
+                    if (testFailures > 0) {
+                        error "Quality gate failed: ${testFailures} test failures"
+                    }
+
+                    if (coverage.lineCoverage < 80) {
+                        error "Quality gate failed: Line coverage ${coverage.lineCoverage}% < 80%"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## 并行执行
+
+### 矩阵式并行
+
+```groovy title="parallel-matrix.groovy"
+pipeline {
+    stages {
+        stage('Test in Parallel') {
+            steps {
+                script {
+                    def testSuites = [
+                        [name: 'unit', cmd: 'mvn test -Dtest=UnitTest*'],
+                        [name: 'integration', cmd: 'mvn test -Dtest=IntegrationTest*'],
+                        [name: 'e2e', cmd: 'mvn test -Dtest=E2ETest*']
+                    ]
+
+                    def parallelTests = [:]
+                    testSuites.each { suite ->
+                        parallelTests[suite.name] = {
+                            stage(suite.name) {
+                                container('maven') {
+                                    sh suite.cmd
+                                }
+                            }
+                        }
+                    }
+
+                    parallel parallelTests
+                }
+            }
+        }
+    }
+}
+```
+
+### 多平台测试
+
+```groovy title="multi-platform.groovy"
+pipeline {
+    stages {
+        stage('Test on Multiple Platforms') {
+            steps {
+                script {
+                    def platforms = [
+                        [os: 'ubuntu-22.04', browser: 'chrome'],
+                        [os: 'ubuntu-22.04', browser: 'firefox'],
+                        [os: 'windows-2022', browser: 'chrome']
+                    ]
+
+                    def parallelTests = [:]
+                    platforms.each { p ->
+                        def platformName = "${p.os}-${p.browser}"
+                        parallelTests[platformName] = {
+                            stage(platformName) {
+                                container("test-${p.os}") {
+                                    sh "./run-tests.sh --browser=${p.browser}"
+                                }
+                            }
+                        }
+                    }
+
+                    parallel parallelTests
+                }
+            }
+        }
+    }
+}
+```
+
+## 共享库
+
+### 定义共享库
+
+```groovy title="vars/deploy.groovy"
+def call(Map config) {
+    def appName = config.appName
+    def imageTag = config.imageTag
+    def environment = config.environment ?: 'staging'
+
+    pipeline {
+        stages {
+            stage('Deploy') {
+                steps {
+                    container('kubectl') {
+                        sh """
+                            kubectl set image deployment/${appName} ${appName}=${imageTag}
+                            kubectl rollout status deployment/${appName}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### 使用共享库
+
+```groovy title="Jenkinsfile"
+@Library('shared-pipeline-library') _
+
+pipeline {
+    stages {
+        stage('Deploy') {
+            steps {
+                deploy(
+                    appName: 'myapp',
+                    imageTag: "${env.BUILD_NUMBER}",
+                    environment: 'production'
+                )
+            }
+        }
+    }
+}
+```
+
+## 故障排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+| --- | --- | --- |
+| Pipeline 卡住 | Agent 不可用 | 检查 Agent 状态，增加超时 |
+| 凭证不可用 | 凭证 ID 错误 | 检查凭证配置 |
+| 容器启动失败 | 镜像不存在 | 更新镜像版本 |
+| 并行任务失败 | 资源不足 | 增加 Agent 数量 |
+
+### 调试技巧
+
+```groovy title="debug.groovy"
+pipeline {
+    stages {
+        stage('Debug') {
+            steps {
+                script {
+                    echo "Current directory: ${pwd()}"
+                    echo "Branch: ${env.BRANCH_NAME}"
+                    echo "Commit: ${env.GIT_COMMIT}"
+                    sh 'env | sort'
+                    sh 'kubectl get nodes'
+                }
+            }
+        }
+    }
+}
+```
+
+## 反模式警示
+
+### 反模式一：把所有代码写在一个 stage
+
+```groovy
+// 错误
+stage('Build') {
+    steps {
+        sh '''
+            mvn clean
+            mvn package
+            docker build
+            docker push
+            kubectl apply
+        '''
+    }
+}
+```
+
+**正确做法**：拆分到多个 stage，每个 stage 只做一件事。
+
+### 反模式二：硬编码配置
+
+```groovy
+// 错误
+sh 'docker push docker.io/myorg/myapp:v1.0.0'
+```
+
+**正确做法**：使用 environment 变量和 parameters。
+
+### 反模式三：忽略错误处理
+
+```groovy
+// 错误
+sh 'mvn test'
+echo 'Tests completed'
+```
+
+**正确做法**：显式处理错误，或使用 try-catch。
+
+## 延伸思考
+
+Jenkins Pipeline 的质量直接反映了团队对 CI/CD 的重视程度。当你的 Pipeline 变得「像代码一样」可读、可维护、可测试时，你才算真正掌握了 CI/CD。
+
+**建议的改进路径**：
+
+1. **先跑起来**：先用简单的 Pipeline，让 CI 跑通
+2. **结构化**：按 Build → Test → Deploy 拆分 stage
+3. **容器化**：使用 Kubernetes Agent，标准化构建环境
+4. **抽取公共逻辑**：使用共享库，避免重复代码
+5. **添加质量门禁**：逐步增加测试覆盖、安全扫描
+6. **完善监控**：收集构建指标，持续优化
+
+每一步都让 CI/CD 变得更加可靠。真正的敏捷，不是「快速发布」，而是「可靠发布」——而可靠的发布，来自可靠的 CI/CD。

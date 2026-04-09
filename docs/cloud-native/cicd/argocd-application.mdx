@@ -1,0 +1,476 @@
+---
+title: ArgoCD 应用管理
+description: ArgoCD 应用的创建、同步、回滚与日常管理
+---
+
+# ArgoCD 应用管理
+
+当你管理着几十个应用、分布在多个集群时，如何快速了解每个应用的状态？如何在大规模变更时保持同步？如何确保回滚操作万无一失？
+
+ArgoCD 提供了完整的命令行和 API 来管理这些场景。本章从实战出发，讲解 ArgoCD 应用的日常管理操作。
+
+## 应用管理基础
+
+### 创建应用
+
+ArgoCD 支持三种创建方式：CLI、Web UI、YAML 声明式。
+
+**方式一：CLI 创建**
+
+```bash
+# 使用 Kustomize
+argocd app create myapp \
+  --repo https://github.com/myorg/k8s-config \
+  --path apps/myapp/staging \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace myapp-staging \
+  --sync-policy automated
+
+# 使用 Helm
+argocd app create myapp \
+  --repo https://github.com/myorg/helm-charts \
+  --chart myapp \
+  --revision 1.0.0 \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace myapp \
+  --helm-set replicaCount=3
+```
+
+**方式二：YAML 声明式创建**
+
+```yaml title="application.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp-staging
+  namespace: argocd
+spec:
+  project: myapp
+  source:
+    repoURL: https://github.com/myorg/k8s-config
+    targetRevision: main
+    path: apps/myapp/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: myapp-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+```bash
+kubectl apply -f application.yaml
+```
+
+### 查看应用状态
+
+```bash
+# 查看所有应用
+argocd app list
+
+# 查看特定应用详情
+argocd app get myapp-staging
+
+# 查看应用资源树
+argocd app resources myapp-staging
+```
+
+```
+Name:               myapp-staging
+Project:            myapp
+Server:             https://kubernetes.default.svc
+Namespace:          myapp-staging
+Source:             https://github.com/myorg/k8s-config (main)
+Sync Status:        Synced (25 minutes ago)
+Health Status:      Healthy
+
+GROUP   KIND         NAMESPACE       NAME           STATUS     HEALTH
+apps    Deployment   myapp-staging   myapp          Synced     Healthy
+        Service      myapp-staging   myapp          Synced     Healthy
+networking.k8s.io   Ingress         myapp          Synced     Healthy
+```
+
+### 同步操作
+
+#### 手��同步
+
+```bash
+# 同步到最新版本
+argocd app sync myapp-staging
+
+# 同步到特定版本
+argocd app sync myapp-staging --revision v2.3.1
+
+# 强制同步（忽略差异检查）
+argocd app sync myapp-staging --force
+
+# 同步并等待完成
+argocd app sync myapp-staging --wait
+```
+
+#### 同步策略
+
+```yaml title="application-sync-policy.yaml"
+spec:
+  syncPolicy:
+    # 自动同步
+    automated:
+      prune: true          # 自动删除不在 Git 中的资源
+      selfHeal: true       # 自动修复与 Git 状态不一致的资源
+
+    # 同步选项
+    syncOptions:
+      - CreateNamespace=true           # 自动创建命名空间
+      - PruneLast=true                 # 删除操作优先执行
+      - RespectIgnoreDifferences=true  # 尊重忽略差异的配置
+      - FailOnSharedResource=true      # 共享资源冲突时报错
+
+    # 重试策略
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 5m
+```
+
+### 回滚操作
+
+回滚是 ArgoCD 的核心能力之一。通过 Git 历史，可以精确回滚到任意版本。
+
+```bash
+# 查看部署历史
+argocd app history myapp-staging
+
+# 回滚到指定版本
+argocd app rollback myapp-staging <revision-id>
+
+# 示例：回滚到 3 次部署前的版本
+argocd app rollback myapp-staging 3
+```
+
+```bash
+# 查看回滚历史的输出示例
+ID  VERSION  REVISION  DATE                           POLICIES
+1   v1.0.0   1.0.0     2024-01-15 09:30:00 +0800 CST   normal
+2   v1.0.1   1.0.1     2024-01-16 14:22:00 +0800 CST   normal
+3   v1.0.2   1.0.2     2024-01-17 10:15:00 +0800 CST   normal
+4   v1.0.3   1.0.3     2024-01-18 16:45:00 +0800 CST   normal  <-- 当前版本
+```
+
+回滚操作会触发一个同步，将应用状态恢复到指定版本的 Git 提交。回滚本身也是一种「同步」，会记录在历史中。
+
+## 应用差异管理
+
+### 查看配置差异
+
+```bash
+# 查看当前状态与 Git 的差异
+argocd app diff myapp-staging
+
+# 忽略某些字段的差异
+argocd app diff myapp-staging --ignore-differences "kind=Deployment,path=/spec/replicas"
+```
+
+差异输出示例：
+
+```diff
+  spec.replicas:
+    - 3
+    + 5
+```
+
+### 差异忽略配置
+
+```yaml title="application-ignore-diff.yaml"
+spec:
+  ignoreDifferences:
+    # Deployment 的副本数由 HPA 管理，不纳入 ArgoCD 管理
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+    # Pod 的自动生成字段
+    - group: ""
+      kind: Pod
+      jsonPointers:
+        - /metadata/managedFields
+        - /status
+
+    # Service 的 clusterIP 由 K8s 自动分配
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/clusterIP
+        - /spec/clusterIPs
+```
+
+## 应用资源管理
+
+### 查看资源状态
+
+```bash
+# 查看应用下的所有资源
+argocd app resources myapp-staging
+
+# 查看特定资源详情
+argocd app resource myapp-staging Deployment/myapp
+
+# 列出资源事件
+argocd app events myapp-staging
+```
+
+### 资源操作
+
+```bash
+# 编辑资源（会触发与 Git 状态的差异）
+argocd app resource myapp-staging Deployment/myapp edit
+
+# 删除资源（谨慎使用！）
+argocd app resource myapp-staging Deployment/myapp delete
+
+# 手动触发资源健康检查
+argocd app resource myapp-staging Deployment/myapp sync
+```
+
+:::warning
+**直接编辑资源的风险**：通过 ArgoCD 手动编辑的资源，会在下次同步时被 Git 状态覆盖。如果需要临时修改，先修改 Git 中的配置，再通过 ArgoCD 同步。
+:::
+
+## 应用健康检查
+
+### 自定义健康检查
+
+ArgoCD 内置了常见资源的健康检查逻辑。对于自定义资源，可以编写 Lua 脚本。
+
+```yaml title="application-custom-health.yaml"
+spec:
+  healthRules:
+    # 自定义 Deployment 健康检查
+    matchFields:
+      - group: apps
+        kind: Deployment
+        apiVersion: "*/v1"
+    luaScript: |
+      # 检查 Deployment 副本数
+      local replicas = obj.spec.replicas
+      local readyReplicas = obj.status.readyReplicas or 0
+
+      if readyReplicas >= replicas then
+        return {status = "Healthy", message = "All replicas ready"}
+      elseif readyReplicas > 0 then
+        return {status = "Degraded", message = replicas .. " replicas expected, " .. readyReplicas .. " ready"}
+      else
+        return {status = "Progressing", message = "Waiting for replicas"}
+      end
+
+      return {status = "Unknown", message = "Unknown state"}
+```
+
+### 健康状态说明
+
+| 状态 | 含义 | 颜色 |
+| --- | --- | --- |
+| **Healthy** | 所有资源运行正常 | 绿色 |
+| **Degraded** | 资源有问题，但未完全不可用 | 黄色 |
+| **Missing** | 资源不存在 | 灰色 |
+| **Progressing** | 资源正在创建或更新中 | 蓝色 |
+| **Suspended** | 资源被暂停（如 Pause 的 Deployment） | 黄色 |
+| **Unknown** | 无法判断健康状态 | 灰色 |
+
+## 应用同步状态
+
+### 同步状态说明
+
+| 状态 | 含义 |
+| --- | --- |
+| **Synced** | 集群状态与 Git 配置一致 |
+| **OutOfSync** | 集群状态与 Git 配置不一致 |
+| **Unknown** | 无法获取同步状态 |
+| **Syncing** | 正在执行同步操作 |
+
+### 常见 OutOfSync 原因
+
+1. **手动修改**：有人在集群中直接修改了资源
+2. **外部变更**：其他工具（如 kubectl）修改了资源
+3. **Git 未更新**：镜像版本更新但 Git 未提交
+4. **配置漂移**：Webhook 未正确触发，或同步延迟
+
+```bash
+# 查看同步失败原因
+argocd app get myapp-staging --log
+
+# 查看资源差异
+argocd app diff myapp-staging
+```
+
+## 应用管理最佳实践
+
+### 批量操作
+
+```bash
+# 批量同步多个应用
+argocd app sync app1 app2 app3
+
+# 批量同步符合模式的应用
+argocd app sync -l app.kubernetes.io/instance=myapp
+
+# 批量回滚
+argocd app rollback app1 3 && argocd app rollback app2 3 && argocd app rollback app3 3
+```
+
+### 标签管理
+
+```yaml title="application-with-labels.yaml"
+metadata:
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/instance: myapp-staging
+    app.kubernetes.io/part-of: myapp
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    # 自动生成的注释
+    argocd.argoproj.io/tracking-id: "myapp:apps/Deployment:myapp-staging/myapp"
+```
+
+```bash
+# 按标签筛选应用
+argocd app list -l app.kubernetes.io/part-of=myapp
+
+# 按标签批量操作
+argocd app sync -l app.kubernetes.io/instance=staging
+```
+
+### 应用集（ApplicationSet）
+
+ApplicationSet 是 ArgoCD 提供的批量创建应用的机制，适用于多集群、多环境场景。
+
+```yaml title="applicationset.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: myapp
+  namespace: argocd
+spec:
+  generators:
+    # 矩阵组合
+    - matrix:
+        generators:
+          # 从 Git 目录结构生成
+          - git:
+              repoURL: https://github.com/myorg/k8s-config
+              revision: main
+              directories:
+                path: apps/*
+          # 集群列表
+          - clusters:
+              values:
+                namespaceSuffix: prod
+  template:
+    metadata:
+      name: '{{ path.basename }}-{{ values.namespaceSuffix }}'
+    spec:
+      project: myapp
+      source:
+        repoURL: https://github.com/myorg/k8s-config
+        path: '{{ path }}'
+        targetRevision: main
+      destination:
+        server: '{{ server }}'
+        namespace: '{{ path.basename }}-{{ values.namespaceSuffix }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+```
+
+## CI/CD 集成
+
+### Webhook 配置
+
+```yaml title="webhook.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-webhook
+  namespace: argocd
+type: Opaque
+stringData:
+  # GitHub Webhook Secret
+  github.secret: my-github-webhook-secret
+```
+
+```bash
+# 配置 GitHub Webhook
+# 1. 在 GitHub 仓库设置中添加 Webhook
+# 2. Payload URL: https://argocd.example.com/api/webhook
+# 3. Secret: 与 github.secret 相同
+# 4. Events: Push, Pull Request
+```
+
+### CI 触发同步
+
+```bash
+# CI 流水线在构建完成后调用 ArgoCD API 触发同步
+curl -X POST https://argocd.example.com/api/v1/applications/myapp-staging/sync \
+  -H "Authorization: Bearer $ARGOCD_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prune": false, "dryRun": false, "revision": "v2.3.1"}'
+```
+
+## 常见问题处理
+
+### 应用一直 OutOfSync
+
+```bash
+# 1. 检查 Git 仓库是否可访问
+argocd repo get https://github.com/myorg/k8s-config
+
+# 2. 检查凭据是否正确
+argocd repo list
+
+# 3. 检查是否有同步错误
+argocd app get myapp --log
+
+# 4. 手动同步看详细错误
+argocd app sync myapp --force --dry-run
+```
+
+### 应用无法创建
+
+```bash
+# 1. 检查 Project 权限
+argocd proj get myapp
+
+# 2. 检查目标集群是否已注册
+argocd cluster list
+
+# 3. 检查命名空间是否存在（如果未设置 CreateNamespace=true）
+```
+
+### 资源冲突
+
+```bash
+# 查看冲突详情
+argocd app diff myapp
+
+# 如果是共享资源冲突，添加到 ignoreDifferences
+argocd app set myapp --ignore-differences "kind=ConfigMap,namespace=kube-system"
+
+# 或者使用 prune last 策略
+argocd app set myapp --sync-option PruneLast=true
+```
+
+## 延伸思考
+
+应用管理的本质是**状态控制**。ArgoCD 通过 Git 作为事实来源，让你能够：
+
+1. **追溯历史**：任何版本都可以回滚
+2. **控制变更**：所有变更必须经过 Git
+3. **快速定位**：一眼看清所有应用的状态
+
+但工具只是手段，真正的挑战是**流程和文化**。你需要确保团队遵守「所有变更走 Git」的规则，否则 ArgoCD 会变成「监控告警的工具」而不是「部署控制的工具」。
+
+建议从小团队、小应用开始，建立流程，验证价值，然后再推广。

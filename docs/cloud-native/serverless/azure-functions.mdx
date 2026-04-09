@@ -1,0 +1,534 @@
+---
+title: Azure Functions
+description: Azure Functions 深度解析，触发器、绑定、持久函数与 Kubernetes 集成
+---
+
+你的公司已经在使用 Microsoft 365 和 Azure 生态系统。团队提出要把一部分后台任务迁移到 Serverless，评估后决定使用 Azure Functions——毕竟和 Azure AD、Azure SQL、Azure Storage 的集成是原生级别的。
+
+**「选什么云，就用它的 Serverless。」** Azure Functions 的价值，不只是「能运行代码」，更在于和 Azure 生态的深度整合。
+
+## 核心概念
+
+Azure Functions 基于相同的 Serverless 原则，但有自己的术语和架构：
+
+```
+Azure Functions
+├── Functions（函数）：最小的执行单元
+├── Triggers（触发器）：启动函数的事件源
+├── Bindings（绑定）：连接数据的声明式方式
+├── Durable Functions（持久函数）：有状态的函数编排
+└── Proxies（代理）：路由和 API 管理
+```
+
+### 与 Lambda 的核心区别
+
+| 维度 | AWS Lambda | Azure Functions |
+| --- | --- | --- |
+| **触发器类型** | 事件源集成 | 内置触发器 + 绑定 |
+| **状态管理** | 外部服务 | Durable Functions |
+| **执行时间** | 最长 15 分钟 | 最长无限制（消耗计划） |
+| **冷启动** | 100ms-2s | 100ms-10s |
+| **语言支持** | 多 | 多 |
+| **K8s 支持** | EKS + Fargate | Azure Arc / KEDA |
+
+## 触发器详解
+
+### HTTP 触发器
+
+```csharp title="HttpTriggerFunction.cs"
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+
+namespace Company.Function
+{
+    public class HttpTriggerFunction
+    {
+        private readonly ILogger<HttpTriggerFunction> _logger;
+
+        public HttpTriggerFunction(ILogger<HttpTriggerFunction> logger)
+        {
+            _logger = logger;
+        }
+
+        [Function("HttpTriggerFunction")]
+        public IActionResult Run(
+            [HttpTrigger(AuthorizationLevel.Function, "get", "post")] HttpRequest req,
+            FunctionContext context)
+        {
+            _logger.LogInformation("C# HTTP trigger function processed a request.");
+
+            string name = req.Query["name"];
+
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            dynamic data = JsonConvert.DeserializeObject(requestBody);
+            name ??= data?.name;
+
+            return name != null
+                ? new OkObjectResult($"Hello, {name}")
+                : new BadRequestObjectResult("Please pass a name on the query string or in the request body.");
+        }
+    }
+}
+```
+
+### Timer 触发器（定时任务）
+
+```csharp title="TimerTriggerFunction.cs"
+using Microsoft.Azure.Functions.Worker;
+
+namespace Company.Function
+{
+    public class TimerTriggerFunction
+    {
+        [Function("TimerTriggerFunction")]
+        public void Run([TimerTrigger("0 */5 * * * *")] TimerInfo myTimer, FunctionContext context)
+        {
+            var logger = context.GetLogger("TimerTriggerFunction");
+            logger.LogInformation($"C# Timer trigger function executed at: {DateTime.Now}");
+        }
+    }
+}
+```
+
+### Blob 触发器
+
+```csharp title="BlobTriggerFunction.cs"
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+
+namespace Company.Function
+{
+    public class BlobTriggerFunction
+    {
+        private readonly ILogger<BlobTriggerFunction> _logger;
+
+        public BlobTriggerFunction(ILogger<BlobTriggerFunction> logger)
+        {
+            _logger = logger;
+        }
+
+        [Function("BlobTriggerFunction")]
+        [BlobInput("samples-workitems/{name}", Connection = "AzureWebJobsStorage")]
+        public void Run(
+            [BlobTrigger("samples-workitems/{name}")] Stream myBlob,
+            string name,
+            FunctionContext context)
+        {
+            _logger.LogInformation($"C# Blob trigger function processed blob\n Name: {name} \n Size: {myBlob.Length} Bytes");
+        }
+    }
+}
+```
+
+### Queue 触发器
+
+```csharp title="QueueTriggerFunction.cs"
+using Microsoft.Azure.Functions.Worker;
+using Azure.Storage.Queues;
+
+namespace Company.Function
+{
+    public class QueueTriggerFunction
+    {
+        [Function("QueueTriggerFunction")]
+        public void Run(
+            [QueueTrigger("myqueue-items", Connection = "AzureWebJobsStorage")] string myQueueItem,
+            FunctionContext context)
+        {
+            var logger = context.GetLogger<QueueTriggerFunction>();
+            logger.LogInformation($"C# Queue trigger function processed: {myQueueItem}");
+        }
+    }
+}
+```
+
+## 绑定（Bindings）
+
+绑定是 Azure Functions 独特的概念，它简化了输入输出的声明：
+
+```csharp title="BindingsFunction.cs"
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using Microsoft.Azure.Functions.Worker.Http;
+
+namespace Company.Function
+{
+    public class BindingsFunction
+    {
+        private readonly ILogger<BindingsFunction> _logger;
+
+        public BindingsFunction(ILogger<BindingsFunction> logger)
+        {
+            _logger = logger;
+        }
+
+        [Function("BindingsFunction")]
+        public async Task<HttpResponseData> Run(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequestData req,
+            [Table("MyTable", "MyPartition", Connection = "AzureWebJobsStorage")] TableClient tableClient,
+            [Blob("samples-workitems/{Query.name}", FileAccess.Read, Connection = "AzureWebJobsStorage")] string blobContent,
+            FunctionContext context)
+        {
+            _logger.LogInformation($"Table query result: {tableClient.ToString()}");
+            _logger.LogInformation($"Blob content: {blobContent}");
+
+            var response = req.CreateResponse(HttpStatusCode.OK);
+            response.Headers.Add("Content-Type", "text/plain; charset=utf-8");
+            await response.WriteStringAsync("Bindings processed successfully!");
+
+            return response;
+        }
+    }
+}
+```
+
+### 输出绑定
+
+```csharp title="OutputBindingsFunction.cs"
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+
+namespace Company.Function
+{
+    public class OutputBindingsFunction
+    {
+        [Function("OutputBindingsFunction")]
+        [QueueOutput("outqueue", Connection = "AzureWebJobsStorage")]
+        public string[] Run(
+            [QueueTrigger("inqueue", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context)
+        {
+            var logger = context.GetLogger<OutputBindingsFunction>();
+            logger.LogInformation($"Input message: {message}");
+
+            // 返回多个消息到输出队列
+            return new[]
+            {
+                $"Processed: {message}",
+                $"Acknowledged: {message}"
+            };
+        }
+    }
+}
+```
+
+## Durable Functions（持久函数）
+
+Durable Functions 是 Azure Functions 的有状态扩展，用于编排长时间运行的工作流。
+
+### 编排器模式
+
+```csharp title="OrchestratorFunction.cs"
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+using Microsoft.Extensions.Logging;
+
+namespace Company.Function
+{
+    public static class OrchestratorFunction
+    {
+        [Function(nameof(OrchestratorFunction))]
+        public static async Task<List<string>> OrchestratorFunction(
+            [OrchestrationTrigger] TaskOrchestrationContext context)
+        {
+            var outputs = new List<string>();
+
+            _logger.LogInformation("Starting orchestration.");
+
+            // 顺序执行活动
+            outputs.Add(await context.CallActivityAsync<string>(nameof(SayHelloActivity), "Tokyo"));
+            outputs.Add(await context.CallActivityAsync<string>(nameof(SayHelloActivity), "Seattle"));
+            outputs.Add(await context.CallActivityAsync<string>(nameof(SayHelloActivity), "London"));
+
+            return outputs;
+        }
+
+        [Function(nameof(SayHelloActivity))]
+        public static string SayHelloActivity([ActivityTrigger] string name, ILogger log)
+        {
+            log.LogInformation("Saying hello to {name}.", name);
+            return $"Hello {name}!";
+        }
+    }
+}
+```
+
+### 人类交互模式
+
+```csharp title="ApprovalWorkflow.cs"
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+
+namespace Company.Function
+{
+    public static class ApprovalWorkflow
+    {
+        [Function(nameof(ApprovalWorkflow))]
+        public static async Task<bool> ApprovalWorkflow(
+            [OrchestrationTrigger] TaskOrchestrationContext context)
+        {
+            var orderId = context.GetInput<string>();
+
+            // 发送审批请求
+            await context.CallActivityAsync(nameof(SendApprovalRequest), orderId);
+
+            // 等待外部事件（超时 7 天）
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromDays(7));
+            using var approvalCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
+
+            var eventTask = context.WaitForExternalEvent<bool>("Approval");
+            var winner = await Task.WhenAny(eventTask, Task.Delay(Timeout.Infinite, approvalCts.Token));
+
+            if (winner == eventTask && eventTask.Result)
+            {
+                await context.CallActivityAsync(nameof(ProcessOrder), orderId);
+                return true;
+            }
+            else
+            {
+                await context.CallActivityAsync(nameof(CancelOrder), orderId);
+                return false;
+            }
+        }
+    }
+}
+```
+
+### Fan-Out Fan-In
+
+```csharp title="FanOutFanIn.cs"
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+
+namespace Company.Function
+{
+    public static class FanOutFanIn
+    {
+        [Function(nameof(FanOutFanInOrchestrator))]
+        public static async Task<long> FanOutFanInOrchestrator(
+            [OrchestrationTrigger] TaskOrchestrationContext context)
+        {
+            var inputs = context.GetInput<List<int>>(); // [1, 2, 3, 4, 5]
+
+            // Fan-Out: 并行启动多个活动
+            var tasks = inputs.Select(item =>
+                context.CallActivityAsync<long>(nameof(ProcessItemActivity), item));
+
+            // Fan-In: 等待所有活动完成
+            var results = await Task.WhenAll(tasks);
+
+            return results.Sum();
+        }
+
+        [Function(nameof(ProcessItemActivity))]
+        public static long ProcessItemActivity([ActivityTrigger] int item, FunctionContext context)
+        {
+            var logger = context.GetLogger(nameof(ProcessItemActivity));
+            logger.LogInformation($"Processing item {item}");
+
+            // 模拟处理
+            return item * item; // 返回平方
+        }
+    }
+}
+```
+
+## 部署选项
+
+### 消耗计划（Consumption）
+
+按执行时间和内存计费，有冷启动问题。
+
+### Premium 计划
+
+提供：
+- 预热实例（无冷启动）
+- VNet 集成
+- 无限执行时间
+- 更强大的实例
+
+### 专用计划（App Service）
+
+与 App Service 共享资源，适合有现有 App Service 计划的组织。
+
+### KEDA 集成
+
+Azure Functions 可以通过 KEDA 在 Kubernetes 上运行：
+
+```yaml title="keda-functions.yaml"
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: azure-function-auth
+spec:
+  podIdentityProvider: azure
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: azure-functions-scaler
+spec:
+  scaleTargetRef:
+    name: function-app
+  triggers:
+  - type: azure-queue
+    metadata:
+      queueName: "workitems"
+      connectionFromEnv: "AzureWebJobsStorage"
+    authenticationRef:
+      name: azure-function-auth
+```
+
+## 监控与诊断
+
+### Application Insights 集成
+
+```csharp title="host.json"
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 20
+      }
+    }
+  }
+}
+```
+
+### 自定义遥测
+
+```csharp title="custom-telemetry.cs"
+using Microsoft.ApplicationInsights;
+using Microsoft.Azure.Functions.Worker;
+
+public class TelemetryFunction
+{
+    private readonly TelemetryClient _telemetry;
+
+    public TelemetryFunction(TelemetryClient telemetry)
+    {
+        _telemetry = telemetry;
+    }
+
+    [Function("TelemetryFunction")]
+    public void Run([QueueTrigger("myqueue")] string message)
+    {
+        var customEvent = new EventTelemetry("ProcessStarted");
+        customEvent.Properties["MessageLength"] = message.Length.ToString();
+        customEvent.Context.Operation.Name = "ProcessQueueMessage";
+
+        _telemetry.TrackEvent(customEvent);
+
+        // 自定义指标
+        _telemetry.GetMetric("ProcessingDuration").TrackValue(duration);
+    }
+}
+```
+
+## 最佳实践
+
+### 1. 使用依赖注入
+
+```csharp title="Startup.cs"
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.DependencyInjection;
+using Company.Function.Services;
+
+[assembly: FunctionsStartup(typeof(MyNamespace.Startup))]
+
+namespace MyNamespace
+{
+    public class Startup : FunctionsStartup
+    {
+        public override void Configure(IFunctionsWorkerApplicationBuilder applicationBuilder)
+        {
+            // 注册服务
+            applicationBuilder.Services.AddSingleton<IMyService, MyService>();
+            applicationBuilder.Services.AddScoped<IRepository, Repository>();
+        }
+    }
+}
+```
+
+### 2. 中间件
+
+```csharp title="ExceptionMiddleware.cs"
+using Microsoft.Extensions.Logging;
+
+public class ExceptionMiddleware
+{
+    private readonly ILogger<ExceptionMiddleware> _logger;
+    private readonly RequestDelegate _next;
+
+    public ExceptionMiddleware(ILogger<ExceptionMiddleware> logger, RequestDelegate next)
+    {
+        _logger = logger;
+        _next = next;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        try
+        {
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unhandled exception");
+            // 自定义错误处理
+        }
+    }
+}
+```
+
+### 3. 安全配置
+
+```csharp title="function-auth.cs"
+public class SecureFunction
+{
+    [Function("SecureFunction")]
+    public IActionResult Run(
+        [HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req,
+        FunctionContext context)
+    {
+        // 验证 ClaimsPrincipal
+        var userId = context.Features.Get<JwtRouteData>()?.Values["userId"]?.ToString();
+
+        if (string.IsNullOrEmpty(userId))
+        {
+            return new UnauthorizedResult();
+        }
+
+        return new OkObjectResult($"User {userId} authenticated successfully");
+    }
+}
+```
+
+## 与 AWS Lambda 对比
+
+| 场景 | AWS Lambda | Azure Functions |
+| --- | --- | --- |
+| **HTTP API** | API Gateway | HTTP 触发器（内置） |
+| **有状态编排** | Step Functions | Durable Functions |
+| **定时任务** | EventBridge | Timer Trigger |
+| **VPC 访问** | VPC Config | VNet 集成 |
+| **K8s 运行** | EKS + Fargate | KEDA |
+| **IDE 支持** | VS Code / IDEA | Visual Studio（最佳） |
+| **.NET 开发** | 支持 | 最佳体验（C# 首选） |
+
+## 延伸思考
+
+Azure Functions 的最大优势是与 Microsoft 生态的深度整合。如果你的组织使用：
+
+- **Microsoft 365**：Azure AD 认证无缝集成
+- **Azure SQL / Cosmos DB**：原生绑定支持
+- **Power Platform**：Power Automate 集成
+- **Logic Apps**：可视化工作流编排
+
+那么 Azure Functions 是自然的选择。
+
+但如果你是 AWS 重度用户，或者追求多云灵活性，Lambda 可能更合适。选择 Serverless 平台时，云厂商锁定是一个需要权衡的因素。

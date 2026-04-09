@@ -1,0 +1,591 @@
+---
+title: ArgoCD 部署与配置
+description: ArgoCD 的安装配置与核心功能设置
+---
+
+# ArgoCD 部署与配置
+
+部署 ArgoCD 本身不算难，但要让 ArgoCD 真正服务于团队，需要考虑的事情很多：如何管理多集群、如何配置 RBAC、如何集成外部系统、如何处理密钥。每一个决定都会影响后续的使用体验。
+
+本文从实战角度出发，讲解 ArgoCD 的完整部署和配置流程。
+
+## 安装方式选择
+
+### 方式一：官方 YAML 快速安装
+
+适用于测试环境和简单场景。
+
+```bash
+# 创建命名空间
+kubectl create namespace argocd
+
+# 安装 ArgoCD（不包含高可用组件）
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# 安装高可用版本（生产环境推荐）
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/ha/install.yaml
+```
+
+### 方式二：Helm 安装
+
+适用于需要自定义配置的部署。
+
+```bash
+# 添加 Helm 仓库
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+# 安装 ArgoCD
+helm install argocd argo/argo-cd \
+  --namespace argocd \
+  --create-namespace \
+  --set server.extraArgs[0]="--insecure" \
+  --values values.yaml
+```
+
+```yaml title="values.yaml"
+# 高可用配置
+replicaCount: 2
+
+# 资源限制
+server:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Redis 配置
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# 初始管理员密码
+admin:
+  # 初始密码（安装后需要修改）
+  existingSecret: argocd-secret
+
+# Ingress 配置
+server:
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+      - argocd.example.com
+    tls:
+      - secretName: argocd-tls
+        hosts:
+          - argocd.example.com
+
+# Dex (GitHub/GitLab 认证)
+dex:
+  enabled: true
+```
+
+## 安装后配置
+
+### 修改初始密码
+
+ArgoCD 默认用户名是 `admin`，初始密码是 Pod 名称。
+
+```bash
+# 获取初始密码
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+
+# 登录后修改密码
+argocd login argocd.example.com
+argocd account update-password
+```
+
+### 禁用初始管理员
+
+生产环境建议禁用默认 admin 账户，使用 SSO 认证。
+
+```yaml title="argocd-cm.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  # 禁用密码认证
+  accounts.admin.enabled: "false"
+
+  # 启用 SSO
+  url: https://argocd.example.com
+```
+
+## Dex 认证配置
+
+### GitHub OAuth 配置
+
+```yaml title="argocd-cm.yaml"
+data:
+  # GitHub OAuth
+  dex.config: |
+    connectors:
+      - type: github
+        id: github
+        name: GitHub
+        config:
+          clientID: $GITHUB_CLIENT_ID
+          clientSecret: $GITHUB_CLIENT_SECRET
+          orgs:
+            - name: myorg
+              teams:
+                - platform-team
+                - developers
+
+  # 允许 OAuth 登录
+  users.anonymous.enabled: "false"
+```
+
+```bash
+# 创建包含 OAuth 密钥的 Secret
+kubectl create secret generic argocd-secret \
+  --from-literal=GITHUB_CLIENT_ID=your-client-id \
+  --from-literal=GITHUB_CLIENT_SECRET=your-client-secret \
+  --namespace argocd
+```
+
+### LDAP 配置
+
+```yaml title="argocd-cm.yaml"
+data:
+  dex.config: |
+    connectors:
+      - type: ldap
+        id: ldap
+        name: LDAP
+        config:
+          host: ldap.example.com:636
+          insecureNoSSL: false
+          startTLS: true
+          rootCA: /etc/ssl/certs/ca.pem
+          bindDN: "cn=admin,dc=example,dc=com"
+          bindPW: $LDAP_BIND_PASSWORD
+          usernamePrompt: Email Address
+          userSearch:
+            baseDN: "ou=Users,dc=example,dc=com"
+            filter: "(objectClass=person)"
+            username: mail
+            idAttr: DN
+            emailAttr: mail
+            nameAttr: cn
+          groupSearch:
+            baseDN: "ou=Groups,dc=example,dc=com"
+            filter: "(objectClass=groupOfNames)"
+            userAttr: DN
+            groupAttr: member
+            nameAttr: cn
+```
+
+## 多集群配置
+
+### 注册外部集群
+
+```bash
+# 查看当前集群上下文
+kubectl config current-context
+
+# 将外部集群注册到 ArgoCD
+argocd cluster add <context-name> --name <cluster-name>
+
+# 例如：注册生产集群
+argocd cluster add prod-context --name production
+```
+
+### 查看已注册的集群
+
+```bash
+argocd cluster list
+```
+
+```
+SERVER                          NAME        STATUS  PROJECT
+https://kubernetes.default.svc  in-cluster  Healthy
+https://prod.example.com        production  Healthy  default
+https://staging.example.com    staging     Healthy  default
+```
+
+### 集群凭据管理
+
+```yaml title="secret.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prod-cluster-config
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+type: Opaque
+stringData:
+  name: production
+  server: https://prod.example.com
+  config: |
+    {
+      "bearerToken": "<token>",
+      "tlsClientConfig": {
+        "insecure": false,
+        "caData": "<base64-encoded-ca-cert>"
+      }
+    }
+```
+
+## ArgoCD Project 配置
+
+### 创建基础 Project
+
+```yaml title="project.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: myapp
+  namespace: argocd
+spec:
+  # 允许的源仓库
+  sourceRepos:
+    - https://github.com/myorg/k8s-config
+    - https://github.com/myorg/myapp
+
+  # 允许部署的目标
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: myapp-staging
+    - server: https://prod.example.com
+      namespace: myapp-production
+
+  # 允许的资源类型
+  resourceBlacklist:
+    - group: ""
+      kind: Secret  # 禁止直接管理 Secret
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+
+  # 命名空间资源限制
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+      # 允许在应用命名空间创建 ResourceQuota
+
+  # 同步窗口
+  syncWindows:
+    # 生产环境仅工作时间允许自动同步
+    - kind: allow
+      schedule: "0 9-18 * * MON-FRI"
+      duration: 9h
+      applications:
+        - 'myapp-production-*'
+      manualSync: false
+
+    # 非工作时间允许手动同步
+    - kind: allow
+      schedule: "0 18-9 * * MON-FRI"
+      duration: 15h
+      applications:
+        - 'myapp-production-*'
+      manualSync: true
+```
+
+### Project RBAC
+
+```yaml title="project-rbac.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: myapp
+  namespace: argocd
+spec:
+  roles:
+    # 应用开发者角色
+    - name: developer
+      description: Deploy to development namespace
+      policies:
+        - p, proj:myapp:developer, applications, get, myapp/*, allow
+        - p, proj:myapp:developer, applications, sync, myapp/dev-*, allow
+        - p, proj:myapp:developer, applications, update, myapp/dev-*, allow
+      groups:
+        - "myorg:developers"
+
+    # 应用管理员角色
+    - name: admin
+      description: Full access to the app project
+      policies:
+        - p, proj:myapp:admin, *, *, myapp/*, allow
+      groups:
+        - "myorg:platform-team"
+```
+
+## 应用配置示例
+
+### 基础 Kustomize 应用
+
+```yaml title="application.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: myapp
+  source:
+    repoURL: https://github.com/myorg/k8s-config
+    targetRevision: main
+    path: apps/myapp/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: myapp-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+### Helm 应用
+
+```yaml title="application-helm.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp-production
+  namespace: argocd
+spec:
+  project: myapp
+  source:
+    repoURL: https://github.com/myorg/helm-charts
+    chart: myapp
+    targetRevision: 2.3.1
+    helm:
+      # values 文件
+      valueFiles:
+        - values-production.yaml
+      # 内联 values
+      parameters:
+        - name: replicaCount
+          value: "5"
+        - name: image.tag
+          value: "v2.3.1"
+      # 传递环境变量
+      passCredentials: false
+      releaseName: myapp
+  destination:
+    server: https://prod.example.com
+    namespace: myapp-production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+## 通知配置
+
+### 安装 Notifications Controller
+
+```bash
+# 安装通知组件
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/notifications.yaml
+```
+
+### 配置 Slack 通知
+
+```yaml title="argocd-notifications-cm.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  # Slack 配置
+  service.slack: |
+    token: $SLACK_TOKEN
+
+  # 触发器定义
+  trigger.on-sync-succeeded: |
+    - when: app.status.operationState.phase in ['Succeeded']
+      oncePer: app.metadata.name
+      send: [app-sync-succeeded]
+
+  trigger.on-sync-failed: |
+    - when: app.status.operationState.phase in ['Failed', 'Error']
+      send: [app-sync-failed]
+
+  trigger.on-health-degraded: |
+    - when: app.status.health.status in ['Degraded', 'Missing']
+      send: [app-health-degraded]
+
+  trigger.on-out-of-sync: |
+    - when: app.status.sync.status == 'OutOfSync'
+      send: [app-out-of-sync]
+
+  # 通知模板
+  template.app-sync-succeeded: |
+    message: |
+      ✅ *{{.app.metadata.name}}* 同步成功
+      环境: `{{.app.spec.destination.namespace}}`
+      版本: `{{.app.status.sync.revision}}`
+      操作者: {{.app.status.operationState.initiatedBy.username}}
+
+  template.app-sync-failed: |
+    message: |
+      ❌ *{{.app.metadata.name}}* 同步失败
+      环境: `{{.app.spec.destination.namespace}}`
+      错误: {{.app.status.operationState.message}}
+
+  template.app-health-degraded: |
+    message: |
+      ⚠️ *{{.app.metadata.name}}* 健康状态异常
+      状态: `{{.app.status.health.status}}`
+      消息: {{.app.status.health.message}}
+```
+
+### 配置 Trigger 和 Service
+
+```yaml title="argocd-notifications-svc.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-notifications-secret
+  namespace: argocd
+type: Opaque
+stringData:
+  slack-token: your-slack-bot-token
+```
+
+## Ingress 配置
+
+### Nginx Ingress 配置
+
+```yaml title="ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server
+  namespace: argocd
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: argocd.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 443
+  tls:
+    - hosts:
+        - argocd.example.com
+      secretName: argocd-tls
+```
+
+## 高级配置
+
+### 资源差异忽略
+
+某些字段（如 Pod 自动生成的字段）不需要 ArgoCD 管理。
+
+```yaml title="application-ignore-diff.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+spec:
+  ignoreDifferences:
+    - group: ""
+      kind: Pod
+      jsonPointers:
+        - /spec/initContainers/status
+        - /spec/containers/status
+
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /status
+```
+
+### 环境变量注入
+
+```yaml title="application-env.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+spec:
+  source:
+    helm:
+      parameters:
+        - name: "env"
+          value: "production"
+        - name: "logLevel"
+          value: "info"
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # 忽略副本数差异（由 HPA 管理）
+```
+
+## 故障排查
+
+### 常见问题
+
+| 问题 | 可能原因 | 解决方案 |
+| --- | --- | --- |
+| 应用一直 OutOfSync | 资源被手动修改 | 启用 selfHeal，或检查差异原因 |
+| 无法连接到 Git 仓库 | 凭据配置错误 | 检查 Repository URL 和 Secret |
+| 无法连接到集群 | kubeconfig 过期 | 更新集群凭据 |
+| Web UI 无法登录 | SSO 配置错误 | 检查 Dex 配置或禁 SSO |
+
+### 调试命令
+
+```bash
+# 查看 ArgoCD Pod 状态
+kubectl get pods -n argocd
+
+# 查看 Application Controller 日志
+kubectl logs -n argocd deployment/argocd-application-controller -f
+
+# 查看特定应用状态
+argocd app get myapp
+
+# 手动同步应用
+argocd app sync myapp --force
+
+# 查看资源差异
+argocd app diff myapp
+```
+
+## 延伸思考
+
+ArgoCD 的配置是一个持续迭代的过程。初期不要追求一步到位，而是先跑起来，再逐步完善。
+
+建议的迭代顺序：
+
+1. **先跑起来**：安装官方 YAML，验证基本功能
+2. **配置 SSO**：禁用密码认证，启用 SSO
+3. **建立 Project**：按团队划分权限边界
+4. **配置通知**：集成 Slack/邮件通知
+5. **配置 CI 集成**：让 CI 流水线能够触发 ArgoCD
+
+每一步都有其价值，但优先级不同。SSO 是安全的基石，Project 是多团队协作的基础，通知是快速响应的前提。根据你的团队情况，调整优先级。

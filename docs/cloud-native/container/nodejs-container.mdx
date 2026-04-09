@@ -1,0 +1,567 @@
+---
+title: 容器化 Node.js 应用
+description: Node.js 应用容器化的最佳实践，包括依赖缓存、基础镜像选择和多阶段构建
+---
+
+Node.js 应用本地开发丝滑，CI/CD 构建也快，但 Docker 镜像一构建就开始报错：`gyp ERR!找不到 Python` 或者 `node-gyp ERR!无法找到 GTK`。
+
+Node.js 的依赖（特别是原生模块）往往需要系统工具链才能编译。Docker 构建时如果缺少这些工具，就会失败。这篇文章帮你避过这些坑。
+
+## Node.js 容器化基础
+
+### 官方镜像选择
+
+| 标签 | 基础系统 | 适用场景 |
+| --- | --- | --- |
+| `node:22-alpine` | Alpine | 最小镜像（无构建工具） |
+| `node:22-slim` | Debian Slim | 生产推荐（体积适中） |
+| `node:22` | Debian Bookworm | 完整工具链（体积大） |
+| `node:22-bookworm` | Debian Bookworm | 同上 |
+
+:::tip
+**Alpine 镜像的限制**
+
+Alpine 使用 musl libc，某些原生模块（如 `bcrypt`、`sharp`）在 Alpine 上需要特殊处理。如果你的应用依赖这些模块，优先选择 `slim` 镜像。
+:::
+
+### 基础 Dockerfile
+
+```dockerfile title="Node.js 基础 Dockerfile"
+FROM node:20-slim
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置环境变量
+ENV NODE_ENV=production \
+    NPM_CONFIG_LOGLEVEL=warn
+
+# 复制 package 文件
+COPY package*.json ./
+
+# 安装依赖
+RUN npm ci --only=production
+
+# 复制应用代码
+COPY . .
+
+# 创建非 root 用户
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 && \
+    chown -R nodejs:nodejs /app
+
+USER nodejs
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]
+```
+
+## 依赖管理
+
+### npm vs yarn vs pnpm
+
+| 包管理器 | 优点 | 缺点 | 推荐场景 |
+| --- | --- | --- | --- |
+| **npm** | 官方内置，兼容性好 | 依赖重复安装，磁盘占用大 | 小型项目 |
+| **yarn** | 速度快，离线安装 | 锁定文件格式复杂 | 中型项目 |
+| **pnpm** | 磁盘效率高，依赖隔离 | 生态兼容性问题 | 大型项目/Monorepo |
+
+### package.json 配置
+
+```json title="package.json"
+{
+  "name": "myapp",
+  "version": "1.0.0",
+  "description": "My Node.js Application",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint .",
+    "docker:build": "docker build -t myapp ."
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.0",
+    "redis": "^4.6.0",
+    "dotenv": "^16.3.1",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/express": "^4.17.21",
+    "nodemon": "^3.0.2",
+    "jest": "^29.7.0",
+    "eslint": "^8.55.0"
+  }
+}
+```
+
+## 多阶段构建
+
+### TypeScript 应用
+
+```dockerfile title="TypeScript 多阶段 Dockerfile"
+# ============================================
+# 阶段 1：构建
+# ============================================
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# 安装依赖
+COPY package*.json ./
+RUN npm ci
+
+# 复制源码并构建
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+
+# ============================================
+# 阶段 2：运行
+# ============================================
+FROM node:20-alpine AS runtime
+
+WORKDIR /app
+
+# 创建非 root 用户
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# 安装生产依赖
+COPY package*.json ./
+RUN npm ci --only=production && \
+    npm cache clean --force
+
+# 复制构建产物
+COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
+
+USER nodejs
+
+ENV NODE_ENV=production
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"
+
+EXPOSE 3000
+
+CMD ["node", "dist/server.js"]
+```
+
+### JavaScript 应用（无构建步骤）
+
+```dockerfile title="JavaScript Dockerfile"
+FROM node:20-slim
+
+WORKDIR /app
+
+# 利用 Docker 缓存
+COPY package*.json ./
+RUN npm ci --only=production
+
+# 复制源码
+COPY src ./src
+
+# 运行时检查
+ENV NODE_ENV=production
+
+USER nodejs
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"
+
+EXPOSE 3000
+
+CMD ["node", "src/server.js"]
+```
+
+## 原生模块处理
+
+Node.js 的某些依赖（如 `bcrypt`、`sharp`、`canvas`）需要编译原生代码。容器化时需要额外处理。
+
+### bcrypt / node-gyp 问题
+
+```dockerfile title="bcrypt 兼容 Dockerfile"
+FROM node:20-slim
+
+# 安装编译工具链
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+
+USER nodejs
+
+CMD ["node", "server.js"]
+```
+
+### sharp 图像处理
+
+```dockerfile title="sharp Dockerfile"
+FROM node:20-alpine
+
+# sharp 需要 libvips
+RUN apk add --no-cache \
+    vips-dev \
+    && rm -rf /var/cache/apk/*
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+
+USER nodejs
+
+CMD ["node", "server.js"]
+```
+
+:::warning
+**Alpine 上的 sharp**
+
+sharp 在 Alpine 上使用 musl vips，可能与 Debian 系统上编译的版本不同。如果你的应用在不同环境间迁移（如本地 macOS，开发环境 Alpine，生产 Debian），可能遇到兼容性问题。
+
+测试时确保所有环境使用相同的 sharp 版本和构建环境。
+:::
+
+## Express 应用配置
+
+```javascript title="src/server.js"
+const express = require('express');
+const helmet = require('helmet');
+const morgan = require('morgan');
+
+const app = express();
+
+// 安全中间件
+app.use(helmet());
+
+// 日志中间件（输出到 stdout）
+app.use(morgan('combined'));
+
+// 健康检查端点
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+app.get('/ready', async (req, res) => {
+    try {
+        await checkDatabaseConnection();
+        res.json({ status: 'ready' });
+    } catch (error) {
+        res.status(503).json({ status: 'not ready', error: error.message });
+    }
+});
+
+// 业务路由
+const userRouter = require('./routes/users');
+app.use('/api/users', userRouter);
+
+// 优雅关闭处理
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received. Shutting down gracefully...');
+    server.close(() => {
+        console.log('HTTP server closed');
+        process.exit(0);
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+```
+
+## 环境变量与配置
+
+### 配置管理
+
+```javascript title="src/config/index.js"
+const path = require('path');
+
+// 验证必需的环境变量
+const required = ['DATABASE_URL', 'REDIS_URL'];
+for (const key of required) {
+    if (!process.env[key]) {
+        throw new Error(`Missing required environment variable: ${key}`);
+    }
+}
+
+module.exports = {
+    port: parseInt(process.env.PORT || '3000', 10),
+    nodeEnv: process.env.NODE_ENV || 'development',
+
+    database: {
+        url: process.env.DATABASE_URL,
+        pool: {
+            min: parseInt(process.env.DB_POOL_MIN || '2', 10),
+            max: parseInt(process.env.DB_POOL_MAX || '10', 10),
+        },
+    },
+
+    redis: {
+        url: process.env.REDIS_URL,
+    },
+
+    cors: {
+        origin: process.env.CORS_ORIGIN || '*',
+    },
+};
+```
+
+### Docker Compose 配置
+
+```yaml title="docker-compose.yml"
+version: '3.9'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=postgresql://user:pass@db:5432/myapp
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=info
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  postgres_data:
+```
+
+## 性能优化
+
+### 构建缓存优化
+
+```dockerfile
+# package.json 单独复制，利用 Docker 缓存
+# 只有 package.json 变化时才重新安装依赖
+COPY package*.json ./
+RUN npm ci --only=production
+
+# 源码在最后复制，频繁变化时不触发依赖安装
+COPY src ./src
+```
+
+### 依赖安装优化
+
+```bash title="依赖安装选项对比"
+# npm ci vs npm install
+# ci：严格按 package-lock.json 安装，更快、更可靠
+# install：根据 package.json 安装，可能产生不同结果
+
+$ docker build .
+# 使用 npm ci
+
+$ docker build . --progress=plain
+# 查看详细构建日志
+```
+
+### 多架构构建
+
+```bash title="buildx 多平台构建"
+# 启用 buildx
+$ docker buildx create --use
+
+# 构建多架构镜像
+$ docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --tag myregistry.com/myapp:v1.0.0 \
+    --push .
+
+# 验证
+$ docker buildx imagetools inspect myregistry.com/myapp:v1.0.0
+```
+
+## 常见问题与反模式
+
+### 问题 1：node_modules 权限问题
+
+**现象**：`EACCES: permission denied, access '/app/node_modules'`。
+
+**根因**：宿主机以 root 运行构建，生成的文件属于 root，容器以 nodejs 用户运行无权访问。
+
+**解决方案**：
+
+```dockerfile
+# 方案 1：在 COPY 后修改权限
+COPY --chown=nodejs:nodejs . .
+
+# 方案 2：确保 node_modules 不被复制（使用 .dockerignore）
+$ cat .dockerignore
+node_modules
+npm-debug.log
+.git
+.gitignore
+```
+
+### 问题 2：内存溢出
+
+**现象**：构建时 `FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed`。
+
+**根因**：Node.js 默认堆内存限制 512MB，编译大项目不够用。
+
+**解决方案**：
+
+```dockerfile
+# 增加 Node.js 堆内存
+RUN NODE_OPTIONS="--max-old-space-size=4096" npm ci
+
+# 或者在运行时
+CMD ["node", "--max-old-space-size=4096", "server.js"]
+```
+
+### 问题 3：热更新失效
+
+**现象**：修改代码后容器内没有更新。
+
+**根因**：node_modules 被复制进镜像，本地修改不影响容器内文件。
+
+**解决方案**：
+
+```yaml title="Docker Compose 热重载"
+services:
+  api:
+    volumes:
+      - .:/app          # 挂载源码
+      - /app/node_modules  # 排除 node_modules
+    command: nodemon --legacy-watch server.js
+```
+
+### 问题 4：npm ci 在 Alpine 上失败
+
+**现象**：`optional` 依赖安装失败。
+
+**根因**：Alpine 的一些系统库版本与 Debian 不同。
+
+**解决方案**：
+
+```dockerfile
+# 使用 slim 镜像而不是 alpine
+FROM node:20-slim
+
+# 或者安装缺失的依赖
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+## Monorepo 支持
+
+### npm workspaces
+
+```json title="package.json (root)"
+{
+  "name": "my-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev": "npm run dev --workspaces"
+  }
+}
+```
+
+```dockerfile title="Monorepo Dockerfile"
+FROM node:20-slim
+
+WORKDIR /app
+
+# 复制整个项目
+COPY package*.json ./
+COPY packages ./packages
+
+# 安装所有依赖
+RUN npm ci
+
+# 构建
+RUN npm run build --workspaces
+
+# 运行时针对特定包
+CMD ["node", "packages/api/dist/server.js"]
+```
+
+## 权衡矩阵
+
+| 场景 | 推荐镜像 | 不推荐 | 说明 |
+| --- | --- | --- | --- |
+| 生产环境 | `node:20-slim` | `node:20` | 体积小，安全性高 |
+| 需要编译原生模块 | `node:20-bookworm` | `node:20-alpine` | 完整工具链 |
+| 极致体积 | `node:20-alpine` | - | 注意兼容性 |
+| TypeScript 项目 | 多阶段构建 | 直接运行 | 构建步骤分离 |
+| Monorepo | workspaces | npm link | 依赖管理更好 |
+
+## 延伸思考
+
+Node.js 容器化的核心挑战是**依赖的跨平台兼容性**。
+
+几个值得关注���方向：
+
+1. **Node.js 版本选择**：LTS 版本（偶数版本号）稳定性好，但新版本的性能提升值得跟进。每两年升级一次 Node 版本是一个合理的节奏。
+
+2. **依赖安全**：定期使用 `npm audit` 检查漏洞。自动化安全扫描应该在 CI/CD 流程中强制执行。
+
+3. **容器化不是为了容器化**：Node.js 应用容器化的目的是一致的构建环境、更快的部署、更好的可观测性。如果这些目标没有达成，容器化就没有意义。
+
+更深一层的问题是：**你的 Node.js 应用真的适合容器化吗？**
+
+某些场景（如需要长期运行的守护进程、复杂的定时任务）可能需要更细致的设计。但对于大多数 Web API 服务，容器化是标准选择。
+
+Node.js 的轻量和快速启动特性，天然适合容器环境。充分利用这些特性，让你的应用更健壮。

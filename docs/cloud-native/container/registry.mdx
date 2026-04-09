@@ -1,0 +1,519 @@
+---
+title: 容器镜像仓库（Harbor/Docker Registry）
+description: 理解镜像仓库的架构设计与选型，以及企业级镜像管理的最佳实践
+---
+
+凌晨 2 点，你正准备发布新版本，但 `docker push` 失败了——镜像仓库连不上。一个 `docker run` 就能拉取的基础镜像，在这个时刻成了拦路虎。
+
+镜像仓库是容器化架构中最容易被忽视，却最不可或缺的基础设施。它不仅是镜像的存储地，还承担着安全扫描、访问控制、签名验证、镜像加速等关键职责。
+
+## 镜像仓库的架构
+
+### Docker Registry vs Harbor
+
+| 特性 | Docker Registry | Harbor |
+| --- | --- | --- |
+| **性质** | 官方开源组件 | CNCF 毕业项目（企业级） |
+| **存储后端** | 本地文件系统 | 支持 S3/GCS/Azure/NFS 等 |
+| **Web UI** | 无 | 有 |
+| **安全扫描** | 无 | Trivy/Clair |
+| **RBAC** | 无 | 完整实现 |
+| **镜像复制** | 无 | 支持多仓库同步 |
+| **Helm Chart** | 不支持 | 支持 |
+
+### 镜像仓库的存储架构
+
+```mermaid
+flowchart TB
+    subgraph Clients["镜像消费者"]
+        Dev[开发者机器]
+        CI[CI/CD 系统]
+        K8s[Kubernetes 集群]
+    end
+
+    subgraph Registry["镜像仓库"]
+        direction TB
+        API[Registry API]
+        Auth[认证服务]
+        Storage[存储层]
+    end
+
+    subgraph Backend["存储后端"]
+        S3[S3 兼容存储]
+        NFS[NFS 共享存储]
+        Local[本地磁盘]
+    end
+
+    Dev & CI & K8s --> API
+    API --> Auth
+    Auth --> Storage
+    Storage --> S3 & NFS & Local
+```
+
+### 镜像的存储结构
+
+```bash title="Registry 存储结构"
+# Registry 在存储后端的目录结构
+/var/lib/registry/
+└── docker
+    └── registry
+        └── v2
+            ├── blobs/                          # Blob 存储
+            │   └── sha256/
+            │       ├── ab/
+            │       │   └── abc123...            # 层内容
+            │       └── cd/
+            │           └── def456...            # Manifest
+            └── repositories/                    # 镜像索引
+                └── myapp/
+                    ├── _manifests/
+                    │   ├── revisions/
+                    │   │   └── sha256/
+                    │   │       └── manifest-hash/
+                    │   └── tags/
+                    │       └── latest/
+                    │           └── current/link  # 指向 manifest
+                    └── _uploads/                 # 上传中的分片
+```
+
+## Docker Registry 部署与配置
+
+### 基础部署
+
+```yaml title="docker-compose.yml"
+version: '3'
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Registry"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+    volumes:
+      - ./data:/var/lib/registry
+      - ./auth:/auth
+    restart: unless-stopped
+```
+
+```bash title="创建认证文件"
+# 安装 htpasswd 工具
+$ apt-get install -y apache2-utils
+
+# 创建用户密码文件
+$ htpasswd -B -c /path/to/auth/htpasswd admin
+New password: ****
+Re-type new password: ****
+Adding password for user admin
+```
+
+### 配置 TLS
+
+```bash title="配置 TLS 证书"
+# 1. 创建证书目录
+$ mkdir -p certs
+
+# 2. 生成自签名证书（测试用）
+$ openssl req -x509 -newkey rsa:4096 \
+    -keyout certs/domain.key \
+    -out certs/domain.crt \
+    -days 365 -nodes \
+    -subj "/CN=registry.example.com"
+
+# 3. 修改 docker-compose.yml
+$ cat docker-compose.yml
+version: '3'
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "443:5000"
+    volumes:
+      - ./data:/var/lib/registry
+      - ./certs:/certs
+    environment:
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/domain.crt
+      REGISTRY_HTTP_TLS_KEY: /certs/domain.key
+```
+
+:::warning
+**Docker 默认要求 HTTPS**
+
+从 Docker 1.13 开始，Docker 要求与 Registry 通信使用 HTTPS。如果使用自签名证书，需要在每台机器上配置 `insecure-registries`。
+
+生产环境建议使用 Let's Encrypt 或购买商业证书。
+:::
+
+### 配置存储后端
+
+```yaml title="S3 存储配置"
+version: '3'
+services:
+  registry:
+    image: registry:2
+    environment:
+      REGISTRY_STORAGE: s3
+      REGISTRY_STORAGE_S3_BUCKET: my-registry
+      REGISTRY_STORAGE_S3_REGION: us-east-1
+      REGISTRY_STORAGE_S3_ACCESSKEY: AKIAIOSFODNN7EXAMPLE
+      REGISTRY_STORAGE_S3_SECRETKEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+      REGISTRY_STORAGE_S3_V4SIGNATURE: true
+      REGISTRY_STORAGE_S3_ROOTDIRECTORY: /images
+```
+
+## Harbor 企业级功能
+
+Harbor 提供了 Docker Registry 没有的企业级功能：
+
+### Harbor 核心架构
+
+```mermaid
+flowchart TB
+    subgraph UI["Web UI / API"]
+        Portal[Harbor Portal]
+        Core[Core API]
+    end
+
+    subgraph Services["核心服务"]
+        Registry[Registry Core]
+        JobService[Job Service]
+        ChartMus[Chart Museum]
+    end
+
+    subgraph Data["数据层"]
+        Redis[Redis]
+        PostgreSQL[PostgreSQL]
+    end
+
+    subgraph Storage["存储"]
+        StorageDriver[Storage Driver]
+        S3[S3/GCS/Azure]
+    end
+
+    Portal --> Core
+    Core --> Registry
+    Core --> JobService
+    Core --> ChartMus
+    JobService --> Redis
+    Core --> PostgreSQL
+    Registry --> StorageDriver
+    StorageDriver --> S3
+```
+
+### Harbor 部署
+
+```bash title="Harbor 安装"
+# 1. 下载 Harbor Installer
+$ wget https://github.com/goharbor/harbor/releases/download/v2.10.0/harbor-online-installer-v2.10.0.tgz
+$ tar xzf harbor-online-installer-v2.10.0.tgz
+
+# 2. 配置
+$ cat harbor.yml
+hostname: harbor.example.com
+http:
+  port: 80
+https:
+  port: 443
+  certificate: /path/to/cert.crt
+  private_key: /path/to/cert.key
+harbor_admin_password: Harbor12345
+database:
+  password: root123
+  max_idle_conns: 50
+  max_open_conns: 100
+jobservice:
+  max_job_workers: 10
+chart:
+  absolute_url: disabled
+log:
+  level: info
+  location: /var/log/harbor
+persistence:
+  type: filesystem
+  persistentVolumeClaim:
+    registry:
+      storage_class: "managed-nfs-storage"
+      access_mode: ReadWriteOnce
+      size: 10Gi
+```
+
+```bash title="启动 Harbor"
+# 准备 TLS 证书（如果使用 HTTPS）
+$ sudo mkdir -p /etc/docker/certs.d/harbor.example.com
+$ sudo cp domain.crt /etc/docker/certs.d/harbor.example.com/
+
+# 安装并启动
+$ sudo ./install.sh --with-notary --with-trivy --with-chartmuseum
+```
+
+### Harbor 安全扫描
+
+Harbor 集成 Trivy 和 Clair 进行镜像安全扫描：
+
+```bash title="配置自动扫描"
+# 在 Harbor UI 中配置：
+# 项目 -> 配置 -> 漏洞扫描 -> 启用自动扫描
+
+# 或者通过 API 配置
+$ curl -X PUT "https://harbor.example.com/api/v2.0/projects/myproject/scan/overview" \
+  -H "Content-Type: application/json" \
+  -u admin:Harbor12345 \
+  -d '{
+    "auto_scan": true,
+    "severity": "high"
+  }'
+```
+
+### Harbor 镜像复制
+
+```yaml title="replication-policy.yaml"
+apiVersion: v1
+kind: ReplicationPolicy
+metadata:
+  name: prod-replication
+spec:
+  src_registry:
+    url: https://harbor-staging.example.com
+    credential_ref:
+      name: harbor-staging-creds
+  dest_registry:
+    url: https://harbor-prod.example.com
+    credential_ref:
+      name: harbor-prod-creds
+  filters:
+    - type: name
+      value: "myproject/**"
+    - type: tag
+      value: "prod-*"
+  trigger:
+    type: event_based  # 基于事件触发
+  deletion: false       # 不删除目标仓库的镜像
+  override: true        # 覆盖同名镜像
+```
+
+## 镜像标签与版本管理
+
+### 镜像标签策略
+
+```bash title="镜像标签最佳实践"
+# 1. 使用语义化版本
+$ docker tag myapp:1.0.0 harbor.example.com/myapp:1.0.0
+$ docker tag myapp:1.0.1 harbor.example.com/myapp:1.0.1
+$ docker tag myapp:1.1.0 harbor.example.com/myapp:1.1.0
+
+# 2. 使用 git commit hash
+$ COMMIT_HASH=$(git rev-parse --short HEAD)
+$ docker tag myapp:latest harbor.example.com/myapp:${COMMIT_HASH}
+
+# 3. 使用构建日期
+$ BUILD_DATE=$(date +%Y%m%d)
+$ docker tag myapp:latest harbor.example.com/myapp:${BUILD_DATE}
+
+# 4. 多标签推送
+$ docker push harbor.example.com/myapp:1.0.0
+$ docker push harbor.example.com/myapp:latest
+$ docker push harbor.example.com/myapp:1.0
+```
+
+### CI/CD 集成
+
+```bash title="GitHub Actions 镜像构建与推送"
+name: Build and Push
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: harbor.example.com
+          username: ${{ secrets.HARBOR_USER }}
+          password: ${{ secrets.HARBOR_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: harbor.example.com/myapp
+          tags: |
+            type=sha,prefix=
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+## Kubernetes 镜像拉取策略
+
+```yaml title="pod-image-pull-policy.yaml"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: myapp
+      image: harbor.example.com/myapp:v1.0.0
+      imagePullPolicy: Always  # 关键配置
+```
+
+**镜像拉取策略**：
+
+| 策略 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `Always` | 始终从仓库拉取 | 生产环境（确保最新） |
+| `IfNotPresent` | 本地有则用本地 | 开发环境（减少网络） |
+| `Never` | 只用本地镜像 | 完全离线环境 |
+
+### 配置 Image Pull Secret
+
+```bash title="创建 Image Pull Secret"
+# 1. 创建 secret
+$ kubectl create secret docker-registry harbor-secret \
+    --docker-server=harbor.example.com \
+    --docker-username=admin \
+    --docker-password=Harbor12345 \
+    --docker-email=admin@example.com
+
+# 2. 在 Pod 中引用
+$ cat pod-with-secret.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  imagePullSecrets:
+    - name: harbor-secret
+  containers:
+    - name: myapp
+      image: harbor.example.com/myapp:v1.0.0
+
+# 3. 在 ServiceAccount 中设置（所有 Pod 自动使用）
+$ kubectl patch serviceaccount default \
+    -p '{"imagePullSecrets":[{"name":"harbor-secret"}]}'
+```
+
+## 常见问题与反模式
+
+### 问题 1：镜像拉取失败
+
+**现象**：`Failed to pull image: unauthorized`。
+
+**根因**：认证失败或缺少 imagePullSecrets。
+
+**排查步骤**：
+
+```bash
+# 1. 检查认证是否正确
+$ docker login harbor.example.com
+
+# 2. 检查 secret 是否存在
+$ kubectl get secret harbor-secret
+
+# 3. 检查 secret 内容
+$ kubectl get secret harbor-secret -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d
+```
+
+### 问题 2：镜像存储空间不足
+
+**现象**：镜像 push 失败，报存储空间不足。
+
+**根因**：Registry 存储满了。
+
+**解决方案**：
+
+```bash
+# 1. 清理未使用的镜像
+$ docker exec registry bin/registry garbage-collect /etc/docker/registry/config.yml
+
+# 2. 清理已删除镜像的 Blob
+$ find /var/lib/registry -type f -name ".orphaned*" -delete
+
+# 3. 配置镜像清理策略（Registry v2.8+）
+$ cat config.yml
+version: 0.1
+registry:
+  storage:
+    delete:
+      enabled: true
+cleanup:
+  enabled: true
+  age: 168h  # 删除 7 天前的未引用 Blob
+```
+
+### 问题 3：镜像拉取速度慢
+
+**现象**：Kubernetes 集群拉取镜像耗时很长。
+
+**根因**：镜像仓库距离集群太远，或镜像太大。
+
+**解决方案**：
+
+```bash
+# 1. 配置镜像加速器
+# 在 Docker daemon.json 中添加镜像加速器
+$ cat /etc/docker/daemon.json
+{
+  "registry-mirrors": ["https://mirror.example.com"]
+}
+
+# 2. 使用 Multi-architecture 镜像
+# 在 ARM 集群上拉取 amd64 镜像会很慢
+$ docker buildx build --platform linux/amd64,linux/arm64 -t myapp:latest --push .
+
+# 3. 启用 Registry 缓存
+# Harbor 支持配置缓存其他 Registry
+```
+
+## 权衡矩阵
+
+| 场景 | 推荐方案 | 不推荐 | 说明 |
+| --- | --- | --- | --- |
+| 小团队/个人项目 | Docker Registry | Harbor | 简单够用 |
+| 中大型企业 | Harbor | Docker Registry | RBAC、扫描、复制 |
+| 多集群环境 | Harbor + 复制策略 | 手动同步 | 自动同步 |
+| 高可用要求 | 多节点 Harbor + 共享存储 | 单点 Harbor | 故障切换 |
+| 安全敏感环境 | Harbor + Notary + Trivy | 无签名镜像 | 签名验证 + 扫描 |
+
+## 延伸思考
+
+镜像仓库是容器生态的「心脏」——所有镜像都流经它，所有部署都依赖它。一个不稳定的镜像仓库，会让整个 CI/CD 流程卡住。
+
+在设计镜像仓库架构时，需要考虑：
+
+1. **容量规划**：估算镜像增长率，预留足够的存储空间
+2. **带宽规划**：CI/CD 并发拉取镜像的带宽需求
+3. **高可用**：生产环境的镜像仓库不应有单点故障
+4. **安全合规**：镜像签名、漏洞扫描、合规报告
+
+更深一层的问题是：**你的镜像来源安全吗？**
+
+很多团队直接从 Docker Hub 拉取官方镜像，这是有风险的——你无法验证这些镜像的来源和安全性。最佳实践是：
+
+- **自有镜像优先**：将基础镜像维护在自己的仓库中
+- **定期同步**：将官方镜像同步到内网仓库，然后进行安全扫描
+- **签名验证**：启用 Notary/Docker Content Trust 验证镜像签名
+
+镜像安全，从源头抓起。

@@ -1,0 +1,489 @@
+---
+title: CI/CD 安全
+description: 密钥管理、镜像扫描、供应链安全与安全流水线的最佳实践
+---
+
+# CI/CD 安全
+
+2020 年，SolarWinds 供应链攻击震惊了整个安全行业。攻击者通过篡改 CI/CD 流水线中的构建组件，将恶意代码注入到数万家企业的系统中。
+
+这个事件让人们意识到：**CI/CD 流水线本身就是一个巨大的攻击面**。当你把代码变成可部署的镜像、从镜像变成运行中的服务时，每一个环节都可能成为攻击者的切入点。
+
+CI/CD 安全不是「加几个检查点」那么简单，它是一个系统工程。
+
+## 供应链安全
+
+### 构建时代
+
+```mermaid
+flowchart LR
+    Code["源代码"] --> Build["构建"]
+    Build --> Image["容器镜像"]
+    Image --> Registry["镜像仓库"]
+    Registry --> Deploy["部署"]
+    Deploy --> Runtime["运行环境"]
+
+    subgraph SupplyChain["供应链"]
+        Dep["依赖包"]
+        Builder["构建工具"]
+        Base["基础镜像"]
+    end
+
+    SupplyChain -.->|注入风险| Build
+```
+
+### SBOM 清单
+
+SBOM（Software Bill of Materials）记录软件的所有组件依赖：
+
+```bash title="使用 Syft 生成 SBOM"
+# 安装 Syft
+brew install syft
+
+# 生成镜像 SBOM
+syft myapp:latest -o cyclonedx-json > sbom.json
+
+# 扫描已知漏洞
+syft myapp:latest | grype
+```
+
+```json title="SBOM 示例"
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.4",
+  "components": [
+    {
+      "name": "log4j",
+      "version": "2.17.0",
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
+      "licenses": [{"license": {"id": "Apache-2.0"}}]
+    },
+    {
+      "name": "spring-boot",
+      "version": "2.6.3",
+      "purl": "pkg:maven/org.springframework.boot/spring-boot@2.6.3"
+    }
+  ]
+}
+```
+
+## 密钥管理
+
+### 密钥暴露风险
+
+```bash title="密钥泄露案例"]
+# 错误的做法：将密钥硬编码
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+# 这些密钥会被记录在 Git 历史中
+git log --all --source --grep="AKIA"
+```
+
+### Vault 集成
+
+```yaml title="Vault 集成示例"]
+# CI Pipeline 中从 Vault 获取密钥
+- name: Retrieve secrets
+  uses: hashicorp/vault-action@v2
+  with:
+    method: kubernetes
+    vaultUrl: https://vault.example.com
+    vaultNamespace: production
+    secrets: |
+      secret/data/ci docker-username | DOCKER_USERNAME ;
+      secret/data/ci docker-password | DOCKER_PASSWORD ;
+      secret/data/ci/aws-credentials | AWS_ACCESS_KEY_ID ;
+      secret/data/ci/aws-credentials | AWS_SECRET_ACCESS_KEY ;
+```
+
+```bash title="直接使用 Vault CLI"]
+# 获取密钥
+vault kv get -field=password secret/ci/docker
+
+# 使用 AppRole 认证
+vault write auth/approle/login \
+  role_id=$ROLE_ID \
+  secret_id=$SECRET_ID
+```
+
+### Kubernetes Secrets
+
+```yaml title="External Secrets Operator"]
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: docker-credentials
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: docker-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef:
+        key: secret/ci/docker
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: secret/ci/docker
+        property: password
+```
+
+### Sealed Secrets
+
+```yaml title="Sealed Secrets"]
+# SealedSecret（加密后，可安全存储在 Git 中）
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: db-credentials
+spec:
+  encryptedData:
+    username: AgA2B...encrypted...
+    password: AgB3C...encrypted...
+```
+
+## 镜像安全
+
+### 镜像扫描
+
+```yaml title="Trivy 扫描"]
+# GitLab CI 集成 Trivy
+trivy:
+  image:
+    name: aquasec/trivy:latest
+  stage: security
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  allow_failure: true  # 允许扫描失败继续，但不合并
+```
+
+```bash title="Trivy 命令行扫描"]
+# 扫描本地镜像
+trivy image myapp:latest
+
+# 扫描文件系统
+trivy fs --security-checks vuln,config ./myapp
+
+# 扫描 Kubernetes 集群
+trivy k8s --report summary cluster
+```
+
+### 多阶段构建
+
+```dockerfile title="安全的多阶段构建"]
+# 第一阶段：构建
+FROM maven:3.9-eclipse-temurin-17 AS builder
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:go-offline  # 分离依赖下载
+COPY src ./src
+RUN mvn package -DskipTests
+
+# 第二阶段：运行（最小化镜像）
+FROM eclipse-temurin:17-jre-alpine AS runtime
+WORKDIR /app
+
+# 只复制编译后的 jar
+COPY --from=builder /app/target/myapp.jar .
+
+# 不使用 root 运行
+USER 1001
+
+# 漏洞更少的基础镜像
+# alpine 基础镜像 CVE 数量远少于 ubuntu
+ENTRYPOINT ["java", "-jar", "myapp.jar"]
+```
+
+### 非 root 用户
+
+```dockerfile title="非 root 运行"]
+# 创建非 root 用户
+RUN addgroup -g 1001 appgroup && \
+    adduser -u 1001 -G appgroup -D appuser
+
+# 复制应用文件
+COPY --chown=appuser:appgroup ./app /app
+
+# 切换到非 root 用户
+USER appuser
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+```
+
+## 流水线安全
+
+### 最小权限原则
+
+```yaml title="GitLab CI Runner 权限控制"]
+# 限制 CI Runner 权限
+[[runners]]
+  executor = "kubernetes"
+  [runners.kubernetes]
+    # 不使用 privileged 模式
+    privileged = false
+
+    # 限制资源
+    cpu_limit = "2"
+    memory_limit = "4Gi"
+    service_cpu_limit = "1"
+    service_memory_limit = "1Gi"
+
+    # Pod 安全策略
+    pod_security_policy = false
+
+    # 允许的镜像
+    allowed_images = [
+      "docker.io/library/*",
+      "registry.example.com/*"
+    ]
+```
+
+### OIDC 认证
+
+```yaml title="使用 OIDC 获取临时凭证"]
+# GitHub Actions OIDC
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789:role/github-actions-role
+    aws-region: us-east-1
+    audience:sts.amazonaws.com
+```
+
+```json title="AWS IAM 信任策略"]
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:myorg/*"
+      }
+    }
+  }]
+}
+```
+
+### Pipeline 审批
+
+```yaml title="生产环境需要审批"]
+deploy:production:
+  stage: deploy
+  environment:
+    name: production
+    url: https://api.example.com
+    on_stop: rollback
+  when: manual  # [!code highlight] 手动触发
+  only:
+    - main
+```
+
+```yaml title="Approval Gate"]
+# ArgoCD 环境审批
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+spec:
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated: null  # 禁用自动同步
+```
+
+## 代码安全
+
+### 静态代码分析
+
+```yaml title="SonarQube 集成"]
+sonarqube-check:
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+  stage: test
+  script:
+    - sonar-scanner
+      -Dsonar.projectKey=$SONAR_PROJECT_KEY
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_TOKEN
+  allow_failure: true
+```
+
+```bash title="SonarQube Quality Gate"]
+# 检查质量门
+sonar-quality-gate.sh
+if [ $? -ne 0 ]; then
+  echo "Quality Gate failed!"
+  exit 1
+fi
+```
+
+### 依赖扫描
+
+```yaml title="OWASP Dependency Check"]
+dependency-check:
+  image:
+    name: owasp/dependency-check:latest
+  stage: security
+  script:
+    - dependency-check.sh
+      --project "MyApp"
+      --scan "./target"
+      --format "HTML"
+      --failOnCVSS 7
+  artifacts:
+    paths:
+      - dependency-check-report.html
+    expire_in: 1 week
+```
+
+### 密钥检测
+
+```yaml title="GitLeaks 配置"]
+gitleaks:
+  image:
+    name: zricethezav/gitleaks:latest
+  stage: security
+  script:
+    - gitleaks detect --source . --verbose
+```
+
+```toml title=".gitleaks.toml"]
+[rules]
+  [[rules.secrets]]
+    description = "AWS Access Key"
+    regex = '''(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}'''
+
+  [[rules.secrets]]
+    description = "Generic API Key"
+    regex = '''(?i)(api_key|apikey|api_token|apitoken|secret_key|secretkey|secrettoken)[^\s]{0,50}[\s"=']{1,3}[A-Za-z0-9]{16,}'''
+```
+
+## 运行时安全
+
+### Pod 安全策略
+
+```yaml title="Pod Security Policy"]
+apiVersion: policy/v1
+kind: PodSecurityPolicy
+metadata:
+  name: restricted-psp
+spec:
+  privileged: false
+  runAsUser:
+    rule: MustRunAsNonRoot
+  seLinux:
+    rule: RunAsAny
+  fsGroup:
+    rule: RunAsAny
+  supplementalGroups:
+    rule: RunAsAny
+  volumes:
+    - 'configMap'
+    - 'emptyDir'
+    - 'projected'
+    - 'secret'
+    - 'downwardAPI'
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+```
+
+### 网络策略
+
+```yaml title="默认拒绝网络策略"]
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+## 安全检查清单
+
+### CI/CD Pipeline 检查
+
+- [ ] 所有密钥使用 Vault 或 Secrets Manager 管理
+- [ ] CI Runner 使用最小权限
+- [ ] 禁止使用 privileged 容器
+- [ ] 所有镜像经过安全扫描
+- [ ] 生产环境部署需要审批
+- [ ] 启用 OIDC 而非长期密钥
+- [ ] 定期轮换密钥
+
+### 镜像检查
+
+- [ ] 使用最小化基础镜像
+- [ ] 非 root 用户运行
+- [ ] 不包含调试工具
+- [ ] 定期重建以获取安全补丁
+- [ ] 签名镜像
+- [ ] 验证镜像签名
+
+### 代码检查
+
+- [ ] 启用 SAST（静态应用安全测试）
+- [ ] 启用 DAST（动态应用安全测试）
+- [ ] 启用依赖扫描
+- [ ] 启用密钥检测
+- [ ] 代码审查是强制流程
+
+## 常见反模式
+
+### 反模式一：使用长期密钥
+
+```yaml title="错误示例"]
+env:
+  AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+  AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+**正确做法**：使用 OIDC 或短期凭证。
+
+### 反模式二：privileged 容器
+
+```yaml title="错误示例"]
+securityContext:
+  privileged: true  # 容器拥有 root 权限
+```
+
+**正确做法**：最小化权限，禁用 privileged。
+
+### 反模式三：忽视扫描结果
+
+扫描发现问题但选择忽略。
+
+**正确做法**：设置 Quality Gate，阻断高危问题。
+
+## 延伸思考
+
+CI/CD 安全是一个**深度防御**的问题。没有单一方案可以解决所有安全问题，你需要：
+
+1. **供应链安全**：SBOM、签名验证、镜像扫描
+2. **密钥管理**：Vault、External Secrets、OIDC
+3. **运行时安全**：PSP、Network Policy、Security Context
+4. **代码安全**：SAST、DAST、密钥检测
+
+另一个值得关注的趋势是**SLSA（Supply-chain Levels for Software Artifacts）**。Google 提出的 SLSA 框架定义了软件供应链安全的四个级别，帮助组织逐步提升安全水平。
+
+但技术只是手段，**安全文化才是根本**。再好的安全工具，如果团队成员不遵守规范，也会形同虚设。
+
+建立安全流水线的第一步，不是选择哪个工具，而是让团队理解：**为什么安全很重要？**当你让每个工程师都意识到「我的每一次提交，都可能影响成千上万的用户」时，安全就不再是「额外的负担」，而是「职业的素养」。

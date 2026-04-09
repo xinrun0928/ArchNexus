@@ -1,0 +1,499 @@
+---
+title: 流水线即代码
+description: 基础设施即代码理念在 CI/CD 流水线的实践，版本化管理与复用策略
+---
+
+# 流水线即代码
+
+2006 年，AWS 推出了 S3 服务，「基础设施即代码」的理念开始萌芽。十年后，这个理念已经深入人心——我们用 Terraform 管理云资源，用 Kubernetes 管理应用，用 Helm 管理 Chart。
+
+但我们的流水线呢？
+
+很多团队的流水线仍然「散落」在各种地方：Jenkins 服务器上的 Job 配置、GitLab 的 Web 界面、Spinnaker 的 UI 面板。当你想修改一个流水线时，你需要登录到 Web 界面，点开配置，修改，保存。如果要回滚？你需要记住上次改了什么。
+
+**流水线即代码**的核心理念是：**把你的流水线也当作代码一样管理**。
+
+## 核心理念
+
+流水线即代码将 CI/CD 流水线的定义存储在代码仓库中，享受与业务代码相同的待遇：
+
+```mermaid
+flowchart LR
+    Code["业务代码"] <--> Git["Git 仓库"]
+    Pipeline["流水线代码"] <--> Git
+
+    Git --> Review["代码审查"]
+    Git --> Version["版本控制"]
+    Git --> Audit["审计日志"]
+
+    subgraph Benefits["收益"]
+        Review --> |PR 审查| ReviewBenefit["防止配置错误"]
+        Version --> |Git 历史| VersionBenefit["完整变更历史"]
+        Audit --> |Git 日志| AuditBenefit["审计追溯"]
+    end
+```
+
+## 流水线即代码的优势
+
+|| 维度 | 传统方式 | 流水线即代码 |
+|| --- | --- | --- |
+| **配置位置** | UI 配置 | 代码仓库 |
+| **版本控制** | 无 | Git 历史 |
+| **代码审查** | 无/弱 | 强制 PR |
+| **审计追溯** | 困难 | Git log |
+| **复用** | 复制粘贴 | 抽取复用 |
+| **环境一致性** | 难以保证 | 代码即一致 |
+| **灾难恢复** | 手动重建 | Git clone |
+
+## 实现方案
+
+### GitHub Actions
+
+```yaml title=".github/workflows/ci.yml"
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  JAVA_VERSION: '17'
+  MAVEN_OPTS: -Dmaven.repo.local=$HOME/.m2/repository
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build
+        run: mvn clean package -DskipTests
+
+      - name: Test
+        run: mvn test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: target/*.jar
+```
+
+### GitLab CI
+
+```yaml title=".gitlab-ci.yml"
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  DOCKER_DRIVER: overlay2
+
+.cache:
+  &maven-cache
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .m2/repository
+
+build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  cache:
+    <<: *maven-cache
+  script:
+    - mvn clean package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+
+test:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  cache:
+    <<: *maven-cache
+  script:
+    - mvn test
+  coverage: '/TOTAL.*?([0-9]{1,3})%/'
+```
+
+### ArgoCD Application
+
+```yaml title="application.yaml"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/myapp.git
+    path: deploy
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+### Tekton Pipeline
+
+```yaml title="pipeline.yaml"
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: ci-pipeline
+spec:
+  params:
+    - name: repo-url
+    - name: revision
+  tasks:
+    - name: clone
+      taskRef:
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+
+    - name: build
+      taskRef:
+        name: maven-build
+      runAfter:
+        - clone
+
+    - name: test
+      taskRef:
+        name: maven-test
+      runAfter:
+        - build
+```
+
+## 复用策略
+
+### 共享库
+
+```groovy title="Jenkins Shared Library"]
+// vars/buildMaven.groovy
+def call(Map config = [:]) {
+    def javaVersion = config.javaVersion ?: '17'
+    def skipTests = config.skipTests ?: false
+
+    pipeline {
+        agent { label 'maven' }
+
+        stages {
+            stage('Build') {
+                steps {
+                    sh "mvn clean package ${skipTests ? '-DskipTests' : ''}"
+                }
+            }
+
+            stage('Test') {
+                when {
+                    expression { !skipTests }
+                }
+                steps {
+                    sh 'mvn test'
+                }
+            }
+        }
+    }
+}
+```
+
+```groovy title="使用共享库"]
+// Jenkinsfile
+@Library('shared-pipelines') _
+
+buildMaven(javaVersion: '17')
+```
+
+### 模板引擎
+
+```yaml title="模板定义"]
+# .gitlab-ci.yml - 模板
+.template:build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - mvn clean package
+
+.template:test:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  needs: [build]
+  script:
+    - mvn test
+```
+
+```yaml title="使用模板"]
+# .gitlab-ci.yml - 使用
+build:backend:
+  extends: .template:build
+  variables:
+    SERVICE_NAME: backend
+
+build:frontend:
+  extends: .template:build
+  variables:
+    SERVICE_NAME: frontend
+```
+
+### Helm Chart
+
+```yaml title="pipeline-chart/values.yaml"]
+# values.yaml
+pipeline:
+  enabled: true
+  repository:
+    url: https://github.com/example/repo
+    branch: main
+  stages:
+    - name: build
+      image: maven:3.9
+      command: mvn package
+    - name: test
+      image: maven:3.9
+      command: mvn test
+```
+
+```yaml title="pipeline-chart/templates/pipeline.yaml"]
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  {{- range .Values.pipeline.stages }}
+  - name: {{ .name }}
+    taskRef:
+      name: {{ .name }}
+  {{- end }}
+```
+
+## 版本管理
+
+### 分支策略
+
+```mermaid
+flowchart TB
+    subgraph Branches["分支策略"]
+        Main["main\n生产流水线"]
+        Develop["develop\n开发流水线"]
+        Feature["feature/*\n功能流水线"]
+    end
+
+    Feature -->|PR| Develop
+    Develop -->|Release| Main
+
+    Main -->|Hotfix| Main
+```
+
+### 标签管理
+
+```bash title="流水线版本标签"]
+# 语义化版本
+git tag -a v1.0.0 -m "Release v1.0.0"
+git tag -a v1.1.0 -m "Release v1.1.0"
+git tag -a v1.1.1 -m "Fix bug"
+
+# 查看流水线版本
+git describe --tags
+```
+
+### 环境隔离
+
+```yaml title="多环境配置"]
+# deploy/
+├── base/
+│   ├── deployment.yaml
+│   └── service.yaml
+└── overlays/
+    ├── production/
+    │   └── kustomization.yaml
+    └── staging/
+        └── kustomization.yaml
+```
+
+## 最佳实践
+
+### 目录结构
+
+```bash title="推荐目录结构"]
+my-repo/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml
+│       ├── cd.yml
+│       └── security.yml
+├── deploy/
+│   ├── base/
+│   └── overlays/
+│       ├── production/
+│       └── staging/
+├── pipelines/
+│   ├── templates/
+│   │   ├── build.yml
+│   │   └── deploy.yml
+│   └── shared/
+│       └── maven.yml
+├── Helm/
+│   └── myapp/
+└── README.md
+```
+
+### 命名规范
+
+```yaml title="命名规范示例"]
+# GitHub Actions
+.github/workflows/
+  ci-build.yml        # 冒烟测试构建
+  ci-test.yml         # 完整测试
+  cd-deploy.yml       # 部署
+  security-scan.yml   # 安全扫描
+
+# ArgoCD Applications
+applications/
+  myapp-production.yaml
+  myapp-staging.yaml
+```
+
+### 代码审查
+
+```markdown title="流水线 PR 审查清单"]
+## 流水线变更审查
+
+### 配置变更
+- [ ] 变更的目的是什么？
+- [ ] 是否有潜在风险？
+- [ ] 回滚方案是什么？
+
+### 权限检查
+- [ ] 新增/修改的权限是否最小化？
+- [ ] 是否有敏感信息暴露？
+
+### 依赖检查
+- [ ] Action/Task 版本是否锁定？
+- [ ] 是否有已知漏洞的依赖？
+
+### 测试验证
+- [ ] 在分支上测试通过了吗？
+- [ ] 回滚测试了吗？
+```
+
+## 工具对比
+
+|| 工具 | 配置格式 | 学习曲线 | 适用场景 |
+|| --- | --- | --- | --- |
+| **GitHub Actions** | YAML | 低 | GitHub 项目 |
+| **GitLab CI** | YAML | 低 | GitLab 项目 |
+| **Jenkins Pipeline** | Groovy/YAML | 中 | 复杂流水线 |
+| **Tekton** | YAML | 中 | Kubernetes 原生 |
+| **ArgoCD** | YAML | 中 | GitOps |
+| **Spinnaker** | HCL/YAML | 高 | 多云部署 |
+
+## 常见反模式
+
+### 反模式一：流水线配置碎片化
+
+```yaml title="错误示例"]
+# 分散在多个文件
+.github/workflows/build.yml
+.github/workflows/test.yml
+.github/workflows/deploy.yml
+# 没有统一的入口，难以理解
+```
+
+**正确做法**：统一管理，或清晰说明依赖关系。
+
+```yaml title="正确示例"]
+# 统一入口
+.github/workflows/ci.yml
+# 包含所有阶段，通过 trigger 控制
+```
+
+### 反模式二：硬编码敏感信息
+
+```yaml title="错误示例"]
+env:
+  AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+  DATABASE_URL: postgresql://admin:password@db:5432/prod
+```
+
+**正确做法**：使用 Secrets。
+
+```yaml title="正确示例"]
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+```
+
+### 反模式三：忽视流水线测试
+
+```yaml title="错误示例"]
+# 流水线配置直接部署到生产，没有任何测试
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: kubectl apply -f production/
+```
+
+**正确做法**：测试流水线配置。
+
+```bash title="测试流水线"]
+# GitHub Actions - 使用 act 本地测试
+brew install act
+act -l  # 列出所有 jobs
+
+# GitLab CI - 本地运行
+gitlab-runner exec shell test
+
+# Tekton - 语法验证
+tkn pipeline validate
+```
+
+## 延伸思考
+
+流水线即代码的本质是**把 CI/CD 的最佳实践应用到 CI/CD 本身**。
+
+当你用 Git 管理业务代码时，你享受的是：
+- 版本控制带来的安全感
+- 代码审查带来的质量保障
+- 自动化测试带来的信心
+
+把这些实践应用到流水线配置上，你得到的也是同样的价值。
+
+但流水线即代码也有其挑战：
+
+1. **配置验证难**：代码有单元测试，流水线配置很难测试
+2. **环境差异大**：本地能跑不代表生产能跑
+3. **工具锁定**：一旦选择了某个 CI 平台，迁移成本高
+
+解决这些问题的方法是：
+
+1. **使用本地验证工具**：如 GitHub Actions 的 `act`
+2. **建立 Staging 环境**：生产流水线的完整镜像
+3. **抽象层设计**：核心逻辑抽取为共享库，工具差异封装在适配层
+
+另一个值得思考的方向是**流水线的可移植性**。当你想要从 GitHub Actions 迁移到 GitLab CI，或者从 Jenkins 迁移到 Tekton 时，如果你的流水线逻辑是紧耦合的，迁移成本会非常高。
+
+**真正的流水线即代码**，不仅是把配置放在 Git 里，更重要的是**把业务逻辑从工具中抽象出来**。当你做到了这一点，切换 CI/CD 平台就不再是噩梦，而只是一个「配置改写」的工作。

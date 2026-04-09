@@ -75,18 +75,18 @@ export const nav = [
       { text: '🚨 报警与仪表盘（PromQL/SLO报警/降噪）', link: '/observability/alerting/' },
     ],
   },
-  // {
-  //   text: '云原生与基础设施',
-  //   link: '/cloud-native/',
-  //   items: [
-  //     { text: '📦 容器化（Docker/镜像分层/运行时规范）', link: '/cloud-native/container/' },
-  //     { text: '☸️ Kubernetes架构（Pod/Service/Ingress/CRD/Operator）', link: '/cloud-native/kubernetes/' },
-  //     { text: '🕸️ 服务网格（Istio/Linkerd/边车模式/流量治理）', link: '/cloud-native/service-mesh/' },
-  //     { text: '🏗️ 不可变基础设施与IaC（Terraform/Pulumi）', link: '/cloud-native/iac/' },
-  //     { text: '🚀 CI/CD流水线（GitOps/ArgoCD/金丝雀/蓝绿）', link: '/cloud-native/cicd/' },
-  //     { text: '☁️ Serverless（FaaS/冷启动/事件驱动）', link: '/cloud-native/serverless/' },
-  //   ],
-  // },
+  {
+    text: '云原生与基础设施',
+    link: '/cloud-native/',
+    items: [
+      { text: '📦 容器化（Docker/镜像分层/运行时规范）', link: '/cloud-native/container/' },
+      { text: '☸️ Kubernetes架构（Pod/Service/Ingress/CRD/Operator）', link: '/cloud-native/kubernetes/' },
+      { text: '🕸️ 服务网格（Istio/Linkerd/边车模式/流量治理）', link: '/cloud-native/service-mesh/' },
+      { text: '🏗️ 不可变基础设施与IaC（Terraform/Pulumi）', link: '/cloud-native/iac/' },
+      { text: '🚀 CI/CD流水线（GitOps/ArgoCD/金丝雀/蓝绿）', link: '/cloud-native/cicd/' },
+      { text: '☁️ Serverless（FaaS/冷启动/事件驱动）', link: '/cloud-native/serverless/' },
+    ],
+  },
   // {
   //   text: '安全架构',
   //   link: '/security/',

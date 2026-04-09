@@ -1,0 +1,598 @@
+---
+title: AWS CloudFormation
+description: CloudFormation 模板编写、资源创建、嵌套堆栈和最佳实践
+---
+
+Terraform 很好，但如果你只使用 AWS，CloudFormation 是更原生的选择——AWS 服务总是最先支持 CloudFormation，很多新功能甚至只有 CloudFormation 而没有 Terraform Provider。
+
+CloudFormation 的学习曲线比 Terraform 陡峭一些：JSON 语法冗长、缺乏条件逻辑、不支持真正的循环……但它的优势在于：**AWS 原生、与 IAM 深度集成、支持 Change Sets 预览变更**。
+
+## CloudFormation 基础
+
+### 模板结构
+
+```json title="template.json"
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "示例 CloudFormation 模板",
+
+  "Metadata": {
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": {"default": "网络配置"},
+          "Parameters": ["VPCCidr", "SubnetCidr"]
+        }
+      ],
+      "ParameterLabels": {
+        "VPCCidr": {"default": "VPC CIDR 块"}
+      }
+    }
+  },
+
+  "Parameters": {
+    "Environment": {
+      "Type": "String",
+      "Default": "dev",
+      "AllowedValues": ["dev", "staging", "prod"]
+    }
+  },
+
+  "Mappings": {
+    "RegionMap": {
+      "us-east-1": {"AMI": "ami-xxxxx"},
+      "us-west-2": {"AMI": "ami-yyyyy"}
+    }
+  },
+
+  "Conditions": {
+    "IsProduction": {"Fn::Equals": [{"Ref": "Environment"}, "prod"]}
+  },
+
+  "Resources": {
+    "MyEC2Instance": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "InstanceType": "t3.micro",
+        "ImageId": {"Ref": "AMI"}
+      }
+    }
+  },
+
+  "Outputs": {
+    "InstanceID": {
+      "Description": "EC2 实例 ID",
+      "Value": {"Ref": "MyEC2Instance"}
+    }
+  }
+}
+```
+
+### YAML 语法
+
+CloudFormation 同时支持 JSON 和 YAML。YAML 更简洁：
+
+```yaml title="template.yaml"
+AWSTemplateFormatVersion: 2010-09-09
+Description: 示例 CloudFormation 模板
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  VPCCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-vpc'
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAzs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-subnet'
+
+Outputs:
+  VPCID:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+```
+
+## 核心概念
+
+### 参数（Parameters）
+
+```yaml title="Parameters"
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 实例类型
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    ConstraintDescription: 必须选择有效的实例类型
+
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH 密钥对名称
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: 数据库密码
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: 密码只能是字母和数字
+
+  Environment:
+    Type: String
+    Default: dev
+
+Mappings:
+  EnvironmentConfig:
+    dev:
+      InstanceType: t3.micro
+      AutoScalingMinSize: 1
+      AutoScalingMaxSize: 2
+    prod:
+      InstanceType: t3.large
+      AutoScalingMinSize: 3
+      AutoScalingMaxSize: 10
+
+Resources:
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !FindInMap [EnvironmentConfig, !Ref Environment, InstanceType]
+      KeyName: !Ref SSHKeyName
+```
+
+### 条件（Conditions）
+
+```yaml title="Conditions"
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsHighAvailability: !Or
+    - !Equals [!Ref Environment, prod]
+    - !Equals [!Ref Environment, staging]
+
+Resources:
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !If [IsProduction, db.r5.large, db.t3.micro]
+      MultiAZ: !If [IsProduction, true, false]
+      DBSnapshotIdentifier: !If [IsProduction, !Ref DBSnapshotArn, !Ref AWS::NoValue]
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Condition: !Not [!Equals [!Ref Environment, prod]]
+    Properties:
+      InstanceType: t3.micro
+```
+
+### 嵌套堆栈
+
+```yaml title="根堆栈"
+AWSTemplateFormatVersion: 2010-09-09
+Description: 根堆栈
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/my-bucket/templates/network.yaml
+      Parameters:
+        Environment: !Ref Environment
+        VPCCidr: 10.0.0.0/16
+
+  AppStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkStack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/my-bucket/templates/application.yaml
+      Parameters:
+        Environment: !Ref Environment
+        VPCID: !GetAtt NetworkStack.Outputs.VPCID
+        PublicSubnetID: !GetAtt NetworkStack.Outputs.PublicSubnetID
+```
+
+```yaml title="网络堆栈 (network.yaml)"
+AWSTemplateFormatVersion: 2010-09-09
+Description: 网络堆栈
+
+Parameters:
+  Environment:
+    Type: String
+  VPCCidr:
+    Type: String
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-vpc'
+
+Outputs:
+  VPCID:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  PublicSubnetID:
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetID'
+```
+
+## 常用资源
+
+### VPC 和网络
+
+```yaml title="完整 VPC 配置"
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAzs !Ref AWS::Region]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-subnet'
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAzs !Ref AWS::Region]
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-private-subnet'
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-route-table'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Security group for web servers
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-web-sg'
+```
+
+### ECS 集群
+
+```yaml title="ECS 配置"
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${Environment}-ecs-cluster'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${Environment}-webapp'
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      ContainerDefinitions:
+        - Name: webapp
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/webapp:latest'
+          PortMappings:
+            - ContainerPort: 8080
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              'awslogs-group': !Ref LogGroup
+              'awslogs-region': !Ref AWS::Region
+              'awslogs-stream-prefix': ecs
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub '${Environment}-webapp'
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref SecurityGroup
+      LoadBalancers:
+        - ContainerName: webapp
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+```
+
+### RDS 数据库
+
+```yaml title="RDS 配置"
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: RDS Subnet Group
+      SubnetIds: !Ref PrivateSubnetIds
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-mysql'
+      Engine: mysql
+      EngineVersion: 8.0
+      DBInstanceClass: !If [IsProduction, db.r5.large, db.t3.micro]
+      AllocatedStorage: !If [IsProduction, 200, 20]
+      StorageType: gp3
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      BackupRetentionPeriod: !If [IsProduction, 7, 1]
+      MultiAZ: !If [IsProduction, true, false]
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "mon:04:00-mon:05:00"
+      StorageEncrypted: true
+      DeletionProtection: !If [IsProduction, true, false]
+```
+
+## 变更集（Change Sets）
+
+变更集让你在执行变更之前预览影响：
+
+```bash title="使用变更集"
+# 创建变更集
+aws cloudformation create-change-set \
+    --stack-name my-stack \
+    --template-body file://template.yaml \
+    --parameters parameter-overrides ParameterKey=Environment,ParameterValue=prod \
+    --change-set-type UPDATE \
+    --change-set-name my-change-set
+
+# 查看变更集
+aws cloudformation describe-change-set \
+    --stack-name my-stack \
+    --change-set-name my-change-set
+
+# 执行变更集
+aws cloudformation execute-change-set \
+    --stack-name my-stack \
+    --change-set-name my-change-set
+
+# 删除变更集
+aws cloudformation delete-change-set \
+    --stack-name my-stack \
+    --change-set-name my-change-set
+```
+
+## 堆栈集（StackSets）
+
+堆栈集允许跨账户、跨区域创建堆栈：
+
+```bash title="创建堆栈集"
+# 创建堆栈集
+aws cloudformation create-stack-set \
+    --stack-set-name cross-account-vpc \
+    --template-body file://vpc-template.yaml \
+    --administration-role-arn arn:aws:iam::123456789012:role/CFNAdministrationRole \
+    --execution-role-name CFNExecutionRole \
+    --parameters ParameterKey=VPCCidr,ParameterValue=10.0.0.0/16
+
+# 添加堆栈实例
+aws cloudformation create-stack-instances \
+    --stack-set-name cross-account-vpc \
+    --accounts '["111111111111", "222222222222"]' \
+    --regions '["us-east-1", "us-west-2"]' \
+    --operation-preferences FailureToleranceCount: =1
+```
+
+## 常见问题与反模式
+
+### 反模式 1：不使用参数
+
+```yaml title="危险做法"
+Resources:
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.large  # 硬编码值
+      ImageId: ami-xxxxx
+```
+
+**正确做法**：使用参数便于复用。
+
+```yaml title="正确做法"
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+```
+
+### 反模式 2：不设置删除保护
+
+```yaml title="危险做法"
+Resources:
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    # 没有设置 DeletionPolicy
+```
+
+**正确做法**：生产环境设置删除保护。
+
+```yaml title="正确做法"
+Resources:
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Retain
+
+Outputs:
+  DBInstanceARN:
+    Value: !GetAtt RDSInstance.Arn
+```
+
+### 反模式 3：不使用托管策略
+
+```yaml title="危险做法"
+Resources:
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: '*'
+```
+
+**正确做法**：使用 AWS 托管策略。
+
+```yaml title="正确做法"
+Resources:
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+```
+
+## CloudFormation 检查清单
+
+| 检查项 | 说明 |
+| --- | --- |
+| 使用参数化 | 便于不同环境复用 |
+| 设置删除策略 | 生产环境使用 Retain |
+| 启用标签 | 便于资源追踪 |
+| 使用嵌套堆栈 | 分解复杂模板 |
+| 使用变更集 | 预览变更再执行 |
+| IAM 最小权限 | 不要使用 `*` 权限 |
+| 密码加密 | 使用 SSM 参数或 Secrets Manager |
+
+CloudFormation 是 AWS 原生的基础设施即代码工具，与 AWS 服务深度集成。掌握它的关键在于理解**模板结构、条件逻辑和嵌套堆栈**。

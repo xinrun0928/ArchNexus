@@ -1,0 +1,449 @@
+---
+title: Ingress 与 Ingress Controller
+description: Kubernetes 七层负载均衡 —— 让 HTTP/HTTPS 路由变得优雅
+---
+
+# Ingress 与 Ingress Controller
+
+Service 解决了 Pod 的发现问题，但你很快会遇到新问题：
+
+1. **多域名管理**：需要为不同的子域名配置不同的后端服务
+2. **TLS  termination**：需要在多个服务上配置 HTTPS
+3. **基于路径的路由**：需要将 `/api` 路由到 API 服务，`/` 路由到前端服务
+4. **灰度发布**：需要按照权重分配流量
+
+**Ingress 就是来解决这些七层（HTTP/HTTPS）问题的。**
+
+## Ingress 是什么？
+
+Ingress 是 Kubernetes 的 **HTTP 负载均衡**资源，它定义了从集群外部到内部服务的 HTTP/HTTPS 路由规则：
+
+```yaml title="basic-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: basic-ingress
+spec:
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api
+            port:
+              number: 8080
+```
+
+:::info
+Ingress 只是资源定义，实际处理流量的是 **Ingress Controller**。Kubernetes 本身不提供 Ingress Controller，需要单独部署。
+:::
+
+## Ingress Controller
+
+### 常见的 Ingress Controller
+
+| Controller | 特点 | 适用场景 |
+| --- | --- | --- |
+| **Nginx Ingress Controller** | 功能丰富，稳定 | 通用场景 |
+| **Traefik** | 原生支持动态配置 | 云原生应用 |
+| ** Ambassador** | 基于 Envoy | 微服务 |
+| **GKE Ingress** | 云厂商托管 | GCP |
+| **AWS ALB Ingress** | AWS ALB 集成 | AWS |
+
+### 安装 Nginx Ingress Controller
+
+```bash
+# 使用 Helm 安装
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.publishService.enabled=true
+```
+
+```yaml title="ingress-nginx-values.yaml"
+controller:
+  publishService:
+    enabled: true
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-backend-protocol: http
+      service.beta.kubernetes.io/aws-load-balancer-ssl-cert: arn:aws:acm:us-east-1:123456789:certificate/xxx
+```
+
+## Ingress 规则
+
+### 基于路径的路由
+
+```yaml title="path-based-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: path-ingress
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api
+            port:
+              number: 8080
+      - path: /admin
+        pathType: Prefix
+        backend:
+          service:
+            name: admin
+            port:
+              number: 3000
+```
+
+### 基于域名的路由
+
+```yaml title="host-based-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: host-ingress
+spec:
+  rules:
+  - host: www.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: website
+            port:
+              number: 80
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-gateway
+            port:
+              number: 8080
+```
+
+### 路径类型
+
+| 类型 | 说明 |
+| --- | --- |
+| **ImplementationSpecific** | 由 Controller 决定具体行为（默认） |
+| **Prefix** | 前缀匹配 |
+| **Exact** | 完全匹配 |
+
+```yaml
+# Prefix 匹配示例
+# /foo      匹配 /foo, /foo/, /foo/bar
+# /         匹配 /
+paths:
+- path: /foo
+  pathType: Prefix
+```
+
+## TLS 配置
+
+### 基本 TLS 配置
+
+```yaml title="tls-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tls-ingress
+spec:
+  tls:
+  - hosts:
+    - app.example.com
+    - api.example.com
+    secretName: app-tls-secret
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+```
+
+### 创建 TLS Secret
+
+```bash
+# 使用证书创建 Secret
+kubectl create secret tls app-tls-secret \
+  --cert=path/to/cert.pem \
+  --key=path/to/key.pem
+
+# 使用 Let's Encrypt 自动签发（需要 cert-manager）
+```
+
+### 自动 HTTPS
+
+使用 **cert-manager** 可以自动管理 TLS 证书：
+
+```yaml title="letsencrypt-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: https-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - app.example.com
+    secretName: app-tls
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+```
+
+## 重写规则
+
+Nginx Ingress Controller 支持路径重写：
+
+```yaml title="rewrite-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rewrite-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  rules:
+  - http:
+      paths:
+      # /api/v1/users -> /users
+      - path: /api/v1(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 8080
+```
+
+## 灰度发布
+
+### 基于权重的流量分割
+
+```yaml title="weight-ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: canary-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+spec:
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-v2
+            port:
+              number: 8080
+```
+
+### 其他灰度注解
+
+```yaml
+annotations:
+  nginx.ingress.kubernetes.io/canary: "true"
+  # 按权重
+  nginx.ingress.kubernetes.io/canary-weight: "10"
+  # 按 Header
+  nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+  nginx.ingress.kubernetes.io/canary-by-header-value: "always"
+  # 按 Cookie
+  nginx.ingress.kubernetes.io/canary-by-cookie: "canary"
+```
+
+## 认证
+
+### Basic 认证
+
+```bash
+# 创建认证文件
+htpasswd -c auth admin
+kubectl create secret generic basic-auth \
+  --from-file=auth
+
+# 配置 Ingress
+annotations:
+  nginx.ingress.kubernetes.io/auth-type: basic
+  nginx.ingress.kubernetes.io/auth-secret: basic-auth
+  nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+```
+
+### OAuth2 认证
+
+```yaml
+annotations:
+  nginx.ingress.kubernetes.io/auth-url: "http://oauth2-service/oauth2/auth"
+  nginx.ingress.kubernetes.io/auth-signin: "http://oauth2-service/oauth2/sign_in"
+  nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-User"
+```
+
+## 默认后端
+
+当没有匹配的规则时，使用默认后端：
+
+```yaml
+spec:
+  defaultBackend:
+    service:
+      name: default-backend
+      port:
+        number: 80
+```
+
+## IngressClass
+
+从 Kubernetes 1.18 开始，推荐使用 IngressClass 资源：
+
+```yaml title="ingressclass.yaml"
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+  parameters:
+    apiGroup: k8s.example.com
+    kind: IngressParameters
+    name: external-lb
+```
+
+```yaml title="ingress-with-class.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+spec:
+  ingressClassName: nginx  # 指定 IngressClass
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app
+            port:
+              number: 80
+```
+
+```bash
+# 查看 IngressClass
+kubectl get ingressclass
+# NAME    CONTROLLER
+# nginx   k8s.io/ingress-nginx
+```
+
+## 常见问题
+
+### Ingress 不生效
+
+排查步骤：
+
+```bash
+# 1. 确认 Ingress 资源存在
+kubectl get ingress
+
+# 2. 查看 Ingress 事件
+kubectl describe ingress <name>
+
+# 3. 确认 Ingress Controller 运行正常
+kubectl get pods -n ingress-nginx
+
+# 4. 查看 Ingress Controller 日志
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller
+```
+
+### 404 错误
+
+常见原因：
+
+1. **域名不匹配**：请求的 Host 与 Ingress 规则不匹配
+2. **路径不匹配**：没有匹配的路径规则
+3. **Service 不存在**：后端 Service 未创建
+4. **Endpoint 为空**：后端 Pod 未运行或未 Ready
+
+### TLS 证书问题
+
+```bash
+# 检查 Secret 是否存在
+kubectl get secret app-tls-secret
+
+# 检查证书内容
+kubectl get secret app-tls-secret -o jsonpath='{.data.tls\.crt}' | base64 -d
+
+# 检查证书有效期
+kubectl get secret app-tls-secret -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates
+```
+
+## 延伸思考
+
+Ingress 是 Kubernetes 进入外部流量的入口，它的设计体现了几个重要原则：
+
+1. **声明式配置**：你声明路由规则，Controller 自动配置负载均衡器
+2. **关注点分离**：Ingress 资源定义路由，具体实现由 Controller 负责
+3. **生态扩展**：不同的 Ingress Controller 提供不同的功能
+
+但 Ingress 也有局限：
+
+1. **功能差异大**：不同 Controller 的功能和注解差异很大
+2. **配置复杂**：高级功能（如限流、熔断）需要大量配置
+3. **不适合 TCP/UDP**：Ingress 只支持 HTTP/HTTPS
+
+对于需要更复杂流量管理的场景，服务网格（如 Istio）可能是更好的选择。
+
+## 延伸阅读
+
+- [Service 详解](./service)：ClusterIP、NodePort、LoadBalancer
+- [Kubernetes 网络模型](./network-model)：深入理解网络原理
+- [服务网格概述](/cloud-native/service-mesh/overview)：更高级的流量管理

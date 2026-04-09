@@ -1,0 +1,270 @@
+---
+title: 多阶段构建（Multi-stage Build）
+description: 利用多阶段构建实现极小镜像，从根本上优化容器化应用
+---
+
+# 多阶段构建（Multi-stage Build）
+
+一个 Java 应用，用 Maven 构建后生成的 JAR 包只有 30MB。但基于 Maven 官方镜像构建出的镜像却有 600MB 之巨。这 570MB 的差距，几乎全部来自构建工具——Maven、JDK 完整版、构建缓存——这些东西运行完就可以扔掉了。
+
+多阶段构建正是为解决这类问题而生。
+
+## 多阶段构建的原理
+
+多阶段构建允许在单个 Dockerfile 中使用**多个 FROM 指令**，每个 FROM 指令代表一个独立的构建阶段。前面阶段的产物可以复制到后面阶段，而前面阶段的文件（构建工具、临时文件等）不会进入最终镜像。
+
+```dockerfile title="Dockerfile"
+# 阶段 1：构建阶段
+FROM maven:3.9-eclipse-temurin-17 AS builder
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN mvn package -DskipTests
+
+# 阶段 2：运行阶段
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+# 只复制构建产物，不包含 Maven 和 JDK
+COPY --from=builder /app/target/myapp.jar .
+ENTRYPOINT ["java", "-jar", "myapp.jar"]
+```
+
+这个 Dockerfile 最终镜像大小约 220MB（Maven 镜像被丢弃），而不是 600MB。
+
+## 为什么需要多阶段构建
+
+### 问题 1：构建依赖与运行时依赖不同
+
+构建阶段需要完整的 JDK、Maven/Gradle、测试框架，但运行阶段只需要 JRE。这就是经典的 **JDK vs JRE** 问题。
+
+### 问题 2：构建产物之外的内容会污染镜像
+
+源码文件、构建缓存、中间产物——这些不应该进入生产镜像的内容，如果没有多阶段构建，通常只能靠 `.dockerignore` 和复杂的清理命令来处理。
+
+### 问题 3：构建产物难以复用
+
+多阶段构建让构建产物成为镜像的一部分，可以在 registry 中直接复用，而不需要维护单独的构建产物仓库。
+
+## 多阶段构建的语法
+
+### 命名阶段
+
+使用 `AS` 关键字为每个阶段命名，便于后续引用：
+
+```dockerfile title="Dockerfile"
+# 语法：FROM <镜像> AS <阶段名>
+FROM node:18-alpine AS frontend-builder
+WORKDIR /app
+RUN npm ci && npm run build
+
+FROM golang:1.21-alpine AS backend-builder
+WORKDIR /app
+COPY . .
+RUN go build -o api-server
+
+FROM alpine:latest AS final
+COPY --from=frontend-builder /app/dist /var/www/html
+COPY --from=backend-builder /app/api-server /usr/local/bin/
+CMD ["/usr/local/bin/api-server"]
+```
+
+### 引用特定阶段
+
+`--from=<阶段名>` 或 `--from=<阶段索引>`：
+
+```dockerfile title="Dockerfile"
+# 按名称引用
+COPY --from=builder /app/dist ./dist
+
+# 按索引引用（0 是第一个阶段）
+COPY --from=0 /app/dist ./dist
+```
+
+### 在阶段间共享构建缓存
+
+```dockerfile title="Dockerfile"
+# 构建 Go 模块
+FROM golang:1.21 AS module-downloader
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 构建阶段
+FROM golang:1.21 AS builder
+WORKDIR /app
+COPY --from=module-downloader /go/pkg /go/pkg
+COPY . .
+RUN go build -o api-server
+
+# 运行阶段
+FROM scratch
+COPY --from=builder /app/api-server /api-server
+COPY --from=module-downloader /go/pkg /go/pkg
+ENTRYPOINT ["/api-server"]
+```
+
+## 实际案例：构建极致精简的 Go 应用
+
+Go 静态编译的特性让多阶段构建发挥到极致：
+
+```dockerfile title="Dockerfile"
+# syntax=docker/dockerfile:1.4
+
+# 阶段 1：构建
+FROM golang:1.21-alpine AS builder
+
+# 安装构建依赖
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+# 先复制 go.mod，利用构建缓存
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 复制源代码并构建
+COPY . .
+# CGO_ENABLED=0 静态编译
+# -w -s 去除调试信息和符号表
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-w -s" \
+    -o api-server \
+    ./cmd/api
+
+# 阶段 2：极简运行镜像
+FROM scratch
+
+# 复制证书（HTTPS 需要）
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# 复制应用
+COPY --from=builder /build/api-server /api-server
+
+# 复制非 root 用户
+COPY --from=builder /etc/passwd /etc/passwd
+
+USER nobody
+
+EXPOSE 8080
+ENTRYPOINT ["/api-server"]
+```
+
+使用 `scratch` 基础镜像，最终镜像可以小到 **10MB 以内**。
+
+## 实际案例：前端 React 应用
+
+前端构建同样适合多阶段构建：
+
+```dockerfile title="Dockerfile"
+# 阶段 1：构建
+FROM node:18-alpine AS builder
+WORKDIR /app
+
+# 先安装依赖（利用缓存）
+COPY package*.json ./
+RUN npm ci
+
+# 复制源代码并构建
+COPY . .
+RUN npm run build
+
+# 阶段 2：运行
+FROM nginx:alpine
+# 删除默认配置
+RUN rm /etc/nginx/conf.d/default.conf
+# 复制构建产物
+COPY --from=builder /app/dist /usr/share/nginx/html
+# 复制自定义 nginx 配置
+COPY nginx.conf /etc/nginx/conf.d/
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+## 常见反模式
+
+### 反模式 1：build stage 体积过大
+
+```dockerfile title="Dockerfile"
+# 错误：使用完整 JDK 构建
+FROM openjdk:17 AS builder
+
+# 正确：使用 JDK 精简版或 Alpine
+FROM eclipse-temurin:17-jdk-alpine AS builder
+```
+
+### 反模式 2：直接复制整个目录
+
+```dockerfile title="Dockerfile"
+# 错误：包含很多不需要的内容
+COPY --from=builder /app .
+
+# 正确：精确复制需要的文件
+COPY --from=builder /app/target/myapp.jar /app/
+```
+
+### 反模式 3：阶段命名缺失
+
+```dockerfile title="Dockerfile"
+# 错误：后续难以引用
+FROM maven:3.9 AS build
+
+# 正确：明确命名
+FROM maven:3.9-eclipse-temurin-17 AS builder
+```
+
+## BuildKit 的增强功能
+
+Docker 18.09+ 内置的 BuildKit 提供了更好的多阶段构建支持：
+
+```dockerfile title="Dockerfile"
+# 开启 BuildKit 特性
+# syntax=docker/dockerfile:1
+
+# 并行构建多个阶段
+FROM node:18-alpine AS frontend-builder
+FROM golang:1.21-alpine AS backend-builder
+
+# ...
+
+# 并行复制
+FROM alpine:latest
+COPY --from=frontend-builder /app/dist /var/www/
+COPY --from=backend-builder /app/server /usr/bin/
+```
+
+### BuildKit 的其他优势
+
+| 功能 | 说明 |
+| --- | --- |
+| 并行构建 | 自动并行构建独立的阶段 |
+| 更好的缓存 | 更智能的增量构建 |
+| 秘密挂载 | 不暴露密钥到镜像层 |
+| 挂载缓存 | 构建依赖缓存，提高构建速度 |
+
+```dockerfile title="Dockerfile"
+# syntax=docker/dockerfile:1
+
+# 使用挂载缓存加速 pip/npm 构建
+FROM python:3.11
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+```
+
+## 权衡矩阵
+
+| 策略 | 镜像大小 | 构建时间 | 复杂度 |
+| --- | --- | --- | --- |
+| 不使用多阶段构建 | 大 | 较快 | 低 |
+| 多阶段构建 + 普通镜像 | 中 | 中 | 中 |
+| 多阶段构建 + Alpine | 小 | 中 | 中 |
+| 多阶段构建 + scratch | 极小 | 较慢 | 高 |
+| 多阶段构建 + distroless | 极小 | 较慢 | 中 |
+
+## 延伸思考
+
+多阶段构建是现代 Dockerfile 不可或缺的技能。但它解决的是「构建产物与构建环境分离」的问题——对于运行时镜像的优化，还需要配合 Alpine、scratch、distroless 等极简基础镜像。
+
+生产环境中，建议对每个服务的镜像大小设置预算（通常不超过 500MB），超过预算应该分析原因并优化。多阶段构建配合极简基础镜像，往往能将镜像体积压缩到原来的 1/10 甚至更多。
+
+但也要警惕过度优化。为了追求极致的小镜像而引入不必要的复杂性，可能会让维护成本上升。权衡之道在于：对于频繁部署的服务，优化镜像大小带来的收益明显；对于不常更新的基础设施服务，过度优化可能得不偿失。

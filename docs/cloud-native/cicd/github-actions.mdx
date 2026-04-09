@@ -1,0 +1,677 @@
+---
+title: GitHub Actions 深度解析
+description: GitHub Actions 工作流配置、Runner 与最佳实践
+---
+
+# GitHub Actions 深度解析
+
+GitHub Actions 是 GitHub 内置的 CI/CD 功能，自 2019 年正式发布以来，已经成为最受欢迎的 CI/CD 工具之一。截至 2024 年，GitHub Actions 每天处理数百万次构建。
+
+对于 GitHub 用户来说，Actions 是最自然的 CI/CD 方案：无需注册第三方服务，无需维护 CI 服务器，所有配置都在 `.github/workflows` 目录下，与代码一起版本化管理。
+
+但 GitHub Actions 的能力远不止「在 PR 上跑测试」。它提供了完整的工作流编排能力，包括矩阵构建、依赖缓存、环境管理、与 GitHub 生态的深度集成等。
+
+## 核心概念
+
+### 工作流（Workflow）
+
+工作流是自动化的过程，由一个或多个 Job 组成，响应 GitHub 事件触发。
+
+```
+.github/workflows/
+├── ci.yml          # 持续集成
+├── cd.yml          # 持续部署
+├── security.yml    # 安全扫描
+└── release.yml     # 发布流程
+```
+
+### 基本结构
+
+```yaml title=".github/workflows/ci.yml"
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  JAVA_VERSION: '17'
+  NODE_VERSION: '18'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build with Maven
+        run: mvn clean package -DskipTests
+
+      - name: Run tests
+        run: mvn test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: target/*.jar
+```
+
+## 工作流语法详解
+
+### 触发条件（on）
+
+```yaml title="workflow-trigger.yml"
+on:
+  # push 和 pull_request 触发
+  push:
+    branches: [main, develop]
+    tags:
+      - 'v*'  # 标签匹配
+    paths:
+      - 'src/**'  # 文件路径过滤
+      - 'pom.xml'
+
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'staging'
+
+  # 定时触发
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 2:00
+
+  # 其他仓库事件
+  repository_dispatch:
+    types: [deploy]
+
+  # 外部事件
+  pull_request_target:
+    types: [opened]
+```
+
+### 矩阵构建（Matrix）
+
+```yaml title="matrix-build.yml"
+jobs:
+  test:
+    strategy:
+      matrix:
+        java: ['11', '17', '21']
+        database: ['mysql', 'postgres']
+        exclude:
+          - java: '11'
+            database: 'postgres'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+      - name: Setup database
+        run: echo "Setting up ${{ matrix.database }}"
+      - name: Run tests
+        run: mvn test
+```
+
+### 依赖缓存
+
+```yaml title="cache-dependencies.yml"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Maven 缓存
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # npm 缓存
+      - uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      # pip 缓存
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+```
+
+## Runner 类型
+
+### GitHub 托管的 Runner
+
+| Runner | 说明 | 规格 |
+| --- | --- | --- |
+| `ubuntu-latest` | Ubuntu 22.04 | 2 核 CPU, 7GB RAM |
+| `ubuntu-20.04` | Ubuntu 20.04 | 2 核 CPU, 7GB RAM |
+| `windows-latest` | Windows Server 2022 | 2 核 CPU, 7GB RAM |
+| `macos-latest` | macOS 12 | 3 核 CPU, 14GB RAM |
+| `macos-13` | macOS 13 | 3 核 CPU, 14GB RAM |
+
+### 自托管 Runner
+
+```bash
+# 下载 Runner 包
+mkdir actions-runner && cd actions-runner
+curl -o actions-runner.tar.gz -L https://github.com/actions/runner/releases/download/v2.315.0/actions-runner-linux-x64-2.315.0.tar.gz
+tar xzf actions-runner.tar.gz
+
+# 配置 Runner
+./config.sh --url https://github.com/myorg/myrepo --token $TOKEN
+./run.sh
+```
+
+```yaml title="self-hosted-runner.yml"
+jobs:
+  build:
+    runs-on: self-hosted
+    labels:
+      - label: linux
+      - label: docker
+    steps:
+      - uses: actions/checkout@v4
+```
+
+### Kubernetes Runner
+
+```yaml title="kubernetes-runner.yaml"
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: github-runner
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: runner
+        image: myorg/github-runner:latest
+        env:
+          - name: ORG_NAME
+            value: "myorg"
+          - name: RUNNER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-runner-token
+                key: token
+```
+
+## 常用 Action
+
+### 官方 Actions
+
+| Action | 说明 |
+| --- | --- |
+| `actions/checkout@v4` | 检出代码 |
+| `actions/setup-java@v4` | 设置 Java 环境 |
+| `actions/setup-node@v4` | 设置 Node.js 环境 |
+| `actions/setup-python@v5` | 设置 Python 环境 |
+| `actions/cache@v4` | 缓存依赖 |
+| `actions/upload-artifact@v4` | 上传构建产物 |
+| `actions/download-artifact@v4` | 下载构建产物 |
+| `actions/create-release@v1` | 创建 GitHub Release |
+
+### Docker Actions
+
+```yaml title="docker-build.yml"
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            myorg/myapp:latest
+            myorg/myapp:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+## 部署到 Kubernetes
+
+### 基本部署
+
+```yaml title="k8s-deploy.yml"
+name: Deploy to Kubernetes
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,suffix=,format=short
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Update image
+        run: |
+          kubectl set image deployment/myapp \
+            myapp=${{ needs.build.outputs.image-tag }}
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/myapp
+          kubectl get pods -l app=myapp
+```
+
+### 使用 ArgoCD 部署
+
+```yaml title="argocd-deploy.yml"
+name: Deploy with ArgoCD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  update-argocd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+
+      - name: Login to ArgoCD
+        run: |
+          ./argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --insecure
+
+      - name: Update image
+        run: |
+          ./argocd app set myapp \
+            --kustomize-image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}=${{ env.IMAGE_TAG }}
+
+      - name: Sync application
+        run: |
+          ./argocd app sync myapp --force
+```
+
+## 环境与 secrets
+
+### 环境配置
+
+```yaml title="environment-config.yml"
+name: Production Deployment
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://myapp.example.com
+    steps:
+      - uses: actions/checkout@v4
+```
+
+### Secrets 管理
+
+```yaml title="secrets-usage.yml"
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 环境变量中的 secrets
+      - name: Deploy
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          curl -X POST https://api.example.com/deploy \
+            -H "Authorization: Bearer $API_KEY"
+
+      # 使用 secrets 进行多因素认证
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### 组织级别的 Secrets
+
+```
+# 组织级别的 secrets
+Settings → Secrets and variables → Actions
+
+# 可用的 secrets
+- ORG_DEPLOY_TOKEN: 组织级别的部署令牌
+- ORG_VARIABLE: 组织级别的变量
+```
+
+## 矩阵与并行
+
+### 条件执行
+
+```yaml title="conditional-job.yml"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        if: github.event_name != 'pull_request' || github.event.action != 'closed'
+        run: mvn clean package
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # 仅在 PR 合并到 main 时执行
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: kubectl apply -f k8s/
+```
+
+### 依赖 Job
+
+```yaml title="dependency-jobs.yml"
+jobs:
+  job1:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Job 1"
+
+  job2:
+    needs: job1
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Job 2"
+
+  job3:
+    needs: [job1, job2]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Job 3"
+```
+
+## 完整 CI/CD 示例
+
+```yaml title="complete-cicd.yml"
+name: Complete CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  JAVA_VERSION: '17'
+  REGISTRY: ghcr.io
+
+jobs:
+  # 代码质量检查
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+      - name: Run SpotBugs
+        run: mvn spotbugs:check
+
+  # 构建和测试
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: Build
+        run: mvn clean package -DskipTests
+
+      - name: Test
+        env:
+          DATABASE_URL: jdbc:postgresql://localhost:5432/test
+        run: mvn test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: target/*.jar
+
+  # 安全扫描
+  security:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+
+  # 镜像构建和推送
+  docker:
+    needs: [build, security]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}:latest
+            ${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
+
+  # 部署到 Kubernetes
+  deploy:
+    needs: docker
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Deploy
+        run: |
+          kubectl set image deployment/myapp \
+            myapp=${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
+
+      - name: Verify
+        run: |
+          kubectl rollout status deployment/myapp
+```
+
+## 最佳实践
+
+### 工作流文件组织
+
+```
+.github/
+└── workflows/
+    ├── ci.yml          # 持续集成（所有 PR 和 push）
+    ├── release.yml     # 发布（仅 tag）
+    ├── nightly.yml     # 定时任务（每日构建）
+    └── security.yml    # 安全扫描
+```
+
+### 性能优化
+
+```yaml title="performance-optimization.yml"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 启用并行
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 全量克隆用于版本计算
+```
+
+## 故障排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+| --- | --- | --- |
+| 超时 | 构建时间过长 | 启用缓存，增加并发 |
+| 权限不足 | GITHUB_TOKEN 权限不够 | 修改 workflow permissions |
+| 触发失败 | 触发条件配置错误 | 检查 on 配置 |
+| Runner 不可用 | 自托管 Runner 离线 | 检查 Runner 状态 |
+
+### 调试
+
+```yaml title="debug-workflow.yml"
+- name: Debug info
+  run: |
+    echo "Branch: ${{ github.ref }}"
+    echo "Event: ${{ github.event_name }}"
+    echo "SHA: ${{ github.sha }}"
+    env | grep -E '^GITHUB|^CI'
+```
+
+## 延伸思考
+
+GitHub Actions 的优势在于它与 GitHub 生态的深度集成。从代码审查、Issue 管理到 Release 发布，一切都可以在 GitHub 上完成。对于中小团队来说，这是最高效的工作方式。
+
+但 GitHub Actions 也有局限性：
+
+1. **私有 Runner 的维护成本**：自托管 Runner 需要额外维护
+2. **分钟级计费**：长时间运行的 Job 成本较高
+3. **供应商锁定**：深度依赖 GitHub 生态
+
+如果你的项目需要跨平台 CI/CD，或者对成本敏感，可能需要考虑 Jenkins、Tekton 等更加中立的方案。
+
+但对于大多数在 GitHub 上托管代码的团队来说，GitHub Actions 是最简单、最高效的选择。

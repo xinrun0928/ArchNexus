@@ -1,0 +1,527 @@
+---
+title: 容器化 Python 应用
+description: Python 应用容器化的最佳实践，包括依赖管理、多阶段构建和常见问题处理
+---
+
+Flask 应用本地跑得好好的，一放到 Docker 里就报 `ModuleNotFoundError`。pip 安装的包明明在 requirements.txt 里，为什么容器启动失败？
+
+Python 容器化的坑，往往出在几个地方：系统依赖缺失、Python 版本不匹配、虚拟环境配置错误、文件权限问题。这篇文章帮你避开这些坑。
+
+## Python 容器化基础
+
+### 官方镜像选择
+
+Python 官方镜像提供了多种变体：
+
+| 标签 | 基础系统 | 适用场景 |
+| --- | --- | --- |
+| `python:3.12-slim` | Debian Slim | 生产推荐（体积小） |
+| `python:3.12-alpine` | Alpine Linux | 体积最小（但可能有兼容性问题） |
+| `python:3.12-bookworm` | Debian Bookworm | 需要完整系统工具 |
+| `python:3.12-windowsservercore` | Windows | Windows 容器 |
+
+:::warning
+**Alpine 镜像的兼容性问题**
+
+Alpine 使用 musl libc 而非 glibc，某些依赖（如 cryptography、mysqlclient）可能编译失败或运行出错。如果遇到奇怪的错误，先尝试 `slim` 镜像。
+:::
+
+### 基础 Dockerfile
+
+```dockerfile title="Python 应用基础 Dockerfile"
+FROM python:3.12-slim
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 安装系统依赖（根据需要调整）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制依赖文件（利用 Docker 缓存）
+COPY requirements.txt .
+
+# 安装依赖
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建非 root 用户
+RUN useradd --create-home appuser && chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口
+EXPOSE 8000
+
+# 启动命令
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## 依赖管理策略
+
+### requirements.txt 管理
+
+```bash title="requirements.txt 示例"
+# requirements.txt
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+httpx==0.26.0
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+alembic==1.13.1
+```
+
+```bash title="依赖管理命令"
+# 冻结当前依赖
+$ pip freeze > requirements.txt
+
+# 安装依赖
+$ pip install -r requirements.txt
+
+# 生产环境用
+$ pip install --no-cache-dir -r requirements.txt
+```
+
+### 使用 Poetry 管理依赖
+
+```toml title="pyproject.toml"
+[tool.poetry]
+name = "myapp"
+version = "0.1.0"
+description = "My Python Application"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+sqlalchemy = "^2.0.25"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-cov = "^4.1.0"
+black = "^24.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+```
+
+```dockerfile title="Poetry Dockerfile"
+FROM python:3.12-slim as builder
+
+WORKDIR /app
+
+# 安装 Poetry
+RUN pip install poetry
+
+# 复制配置文件
+COPY pyproject.toml poetry.lock* ./
+
+# 配置 Poetry（不安装 dev 依赖）
+RUN poetry config virtualenvs.create false \
+    && poetry install --no-interaction --no-ansi --no-root
+
+# 运行阶段
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 复制依赖
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# 复制应用代码
+COPY --chown=appuser:appuser . .
+
+USER appuser
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0"]
+```
+
+## 多阶段构建
+
+### 生产级多阶段 Dockerfile
+
+```dockerfile title="多阶段构建 Dockerfile"
+# ============================================
+# 阶段 1：构建
+# ============================================
+FROM python:3.12-slim as builder
+
+WORKDIR /app
+
+# 安装构建依赖
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建虚拟环境
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 安装依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+# ============================================
+# 阶段 2：运行
+# ============================================
+FROM python:3.12-slim as runtime
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home appuser
+
+WORKDIR /app
+
+# 从构建阶段复制虚拟环境
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 复制应用代码
+COPY --chown=appuser:appuser . .
+
+# 切换到非 root 用户
+USER appuser
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## Web 框架配置
+
+### FastAPI 配置
+
+```python title="app/main.py"
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+app = FastAPI(title="My API", version="1.0.0")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时执行
+    await database.connect()
+    yield
+    # 关闭时执行
+    await database.disconnect()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+@app.get("/ready")
+async def readiness_check():
+    if not await database.is_ready():
+        return {"status": "not ready"}, 503
+    return {"status": "ready"}
+```
+
+### Flask 配置
+
+```python title="app/__init__.py"
+from flask import Flask
+import os
+
+
+def create_app():
+    app = Flask(__name__)
+
+    # 从环境变量加载配置
+    app.config['DATABASE_URL'] = os.getenv('DATABASE_URL', 'sqlite:///app.db')
+    app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret')
+    app.config['DEBUG'] = os.getenv('DEBUG', 'False').lower() == 'true'
+
+    # 注册蓝图
+    from app.api import api_bp
+    app.register_blueprint(api_bp, url_prefix='/api')
+
+    @app.route('/health')
+    def health():
+        return {'status': 'healthy'}
+
+    return app
+```
+
+```python title="app/wsgi.py"
+from app import create_app
+
+app = create_app()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8000)))
+```
+
+```dockerfile title="Flask Dockerfile"
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# 安装依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Gunicorn 作为生产服务器
+RUN pip install --no-cache-dir gunicorn
+
+# 复制应用
+COPY . .
+
+# 使用 Gunicorn 运行
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "4", "--threads", "2", "app.wsgi:app"]
+```
+
+## 常见问题与反模式
+
+### 问题 1：cryptography 安装失败
+
+**现象**：`pip install cryptography` 失败，提示缺少 `rustc`。
+
+**根因**：cryptography 库需要 Rust 编译器编译。
+
+**解决方案**：
+
+```dockerfile
+# 方案 1：安装 Rust
+RUN apt-get update && apt-get install -y cargo rustc
+
+# 方案 2：使用预编译轮子
+RUN pip install --only-binary=:all: cryptography
+
+# 方案 3：使用 Alpine 时改用 slim 镜像
+FROM python:3.12-slim
+```
+
+### 问题 2：依赖安装太慢
+
+**现象**：pip install 耗时过长。
+
+**根因**：每次构建都重新下载依赖。
+
+**解决方案**：
+
+```dockerfile
+# 利用 Docker 层缓存
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt  # 先安装依赖
+COPY . .                                            # 再复制代码
+# 代码改变时，只重新构建这一层
+```
+
+### 问题 3：中文路径问题
+
+**现象**：文件路径包含中文导致读取失败。
+
+**根因**：Python 默认文件系统编码可能不是 UTF-8。
+
+**解决方案**：
+
+```dockerfile
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONIOENCODING=utf-8
+```
+
+### 问题 4：多进程问题
+
+**现象**：Gunicorn 多 worker 时数据库连接池报错。
+
+**根因**：数据库连接池在多进程间不共享。
+
+**解决方案**：
+
+```python title="正确的连接管理"
+# 错误：在模块级别创建连接池
+pool = create_pool()  # 会被 fork 到子进程
+
+# 正确：在请求时创建连接
+from contextlib import contextmanager
+
+@contextmanager
+def get_db_connection():
+    conn = create_pool().connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+```
+
+## Python 版本与依赖兼容性
+
+### 版本选择建议
+
+```bash title="Python 版本对比"
+# Python 3.12 特性
+# - 性能提升约 10-15%
+# - 更好的错误信息
+# - 需要更新的依赖才能完全兼容
+
+# Python 3.11 特性
+# - 稳定，企业友好
+# - 大多数依赖已兼容
+
+# Python 3.10 特性
+# - 结构化模式匹配（match-case）
+
+# 建议：
+# - 新项目：Python 3.12
+# - 生产项目：Python 3.11（稳定）
+# - 遗留项目：根据依赖兼容性选择
+```
+
+### 常见依赖兼容性
+
+| 依赖 | Python 3.10 | Python 3.11 | Python 3.12 |
+| --- | --- | --- | --- |
+| numpy | ✓ | ✓ | ✓ |
+| pandas | ✓ | ✓ | ✓（部分版本需源码编译） |
+| sqlalchemy | ✓ | ✓ | ✓ |
+| pydantic | ✓ | ✓ | ✓ |
+| celery | ✓ | ✓ | ✓ |
+| django | ✓ | ✓ | ✓ |
+
+## Docker Compose 本地开发
+
+```yaml title="docker-compose.yml"
+version: '3.9'
+
+services:
+  api:
+    build:
+      context: .
+      target: builder  # 开发阶段用 builder 目标
+    volumes:
+      - .:/app         # 热重载
+      - pip_cache:/root/.cache/pip
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/myapp
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=true
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  postgres_data:
+  pip_cache:
+```
+
+## 性能优化
+
+### 减小镜像体积
+
+```bash title="镜像体积对比"
+$ docker images | grep python
+python:3.12                    1.02GB
+python:3.12-slim              154MB
+python:3.12-slim-bookworm      173MB
+python:3.12-alpine            55MB
+
+# 优化后的多阶段构建镜像
+myapp:latest                  180MB  # 推荐
+```
+
+### 减少构建时间
+
+```dockerfile
+# 按依赖变化频率排序
+COPY requirements.txt .       # 依赖文件（变化少）
+RUN pip install ...           # 安装依赖（耗时长，但缓存）
+COPY . .                      # 应用代码（变化频繁）
+```
+
+```bash title="利用 BuildKit 缓存"
+# 启用 BuildKit
+$ DOCKER_BUILDKIT=1 docker build .
+
+# 或使用 buildx
+$ docker buildx build --platform linux/amd64,linux/arm64 -t myapp .
+```
+
+## 权衡矩阵
+
+| 场景 | 推荐镜像 | 不推荐 | 说明 |
+| --- | --- | --- | --- |
+| 生产环境 | `python:3.12-slim` | `python:3.12` | 体积小，安全 |
+| 需要编译依赖 | `python:3.12-bookworm` | `python:3.12-alpine` | 完整工具链 |
+| 极致体积 | `python:3.12-alpine` | - | 注意兼容性 |
+| 依赖变化频繁 | Poetry | requirements.txt | 更好的锁版本 |
+| 多架构支持 | buildx 多平台构建 | 单平台 | 覆盖更多场景 |
+
+## 延伸思考
+
+Python 容器化的核心挑战不是「能不能跑起来」，而是「如何在容器中高效运行」。
+
+几个值得思考的点：
+
+1. **Python 版本选择**：Python 每年的性能提升约 10-15%，但依赖兼容性需要跟进。及时升级能获得性能红利，但需要验证依赖兼容性。
+
+2. **依赖管理演进**：从 `requirements.txt` 到 Poetry、PDM，工具在进化。选择团队熟悉且维护成本低的方案。
+
+3. **多阶段构建的必要性**：不要为了「看起来专业」而用多阶段构建。但如果最终镜像需要 `gcc` 等构建工具，多阶段构建能显著减小体积。
+
+更深一层的问题是：**你的 Python 应用真的适合容器化吗？**
+
+某些场景（如高性能计算、科学计算）可能需要 GPU 支持、特殊系统库等。评估容器化成本，确保收益大于代价。
+
+Python 容器化是手段，不是目的。写出高质量的代码、做好可观测性，才是核心。

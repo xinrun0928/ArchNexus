@@ -1,0 +1,660 @@
+---
+title: 容器化中间件
+description: 容器化 Redis、RabbitMQ、Kafka 等中间件的最佳实践与高可用配置
+---
+
+你的 Redis 缓存容器化了，集群跑了三个月状态良好。直到一次网络抖动，Redis Sentinel 选主失败，缓存全部击穿，数据库被打满。
+
+中间件的容器化比普通应用更复杂。它们往往有状态、有集群依赖、有特殊的故障恢复逻辑。Redis 的哨兵/集群、RabbitMQ 的镜像队列、Kafka 的分区分配——这些机制在容器环境中需要重新适配。
+
+这篇文章覆盖主流中间件的容器化实践。
+
+## Redis 容器化
+
+### 单节点 Redis
+
+```yaml title="Redis 单节点配置"
+version: '3.9'
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+volumes:
+  redis_data:
+```
+
+```ini title="redis.conf"
+# 持久化配置
+appendonly yes
+appendfsync everysec
+rdbcompression yes
+rdbchecksum yes
+
+# 内存配置
+maxmemory 512mb
+maxmemory-policy allkeys-lru
+
+# 网络配置
+bind 0.0.0.0
+protected-mode no
+port 6379
+
+# 超时配置
+timeout 300
+tcp-keepalive 300
+```
+
+### Redis Sentinel 高可用
+
+```yaml title="Redis Sentinel 配置"
+version: '3.9'
+
+services:
+  redis-master:
+    image: redis:7-alpine
+    container_name: redis-master
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_master:/data
+    networks:
+      - redis-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-replica1:
+    image: redis:7-alpine
+    container_name: redis-replica1
+    command: redis-server --appendonly yes --replicaof redis-master 6379 --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_replica1:/data
+    networks:
+      - redis-net
+    depends_on:
+      - redis-master
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-replica2:
+    image: redis:7-alpine
+    container_name: redis-replica2
+    command: redis-server --appendonly yes --replicaof redis-master 6379 --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_replica2:/data
+    networks:
+      - redis-net
+    depends_on:
+      - redis-master
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-sentinel1:
+    image: redis:7-alpine
+    container_name: redis-sentinel1
+    command: |
+      redis-sentinel --sentinel /data/sentinel.conf
+    volumes:
+      - ./sentinel.conf:/data/sentinel.conf
+    networks:
+      - redis-net
+    depends_on:
+      - redis-master
+    environment:
+      - SENTINEL_QUORUM=2
+      - SENTINEL_DOWN_AFTER=3000
+      - SENTINEL_FAILOVER_TIMEOUT=10000
+
+  sentinel2:
+    # 类似 sentinel1
+
+  sentinel3:
+    # 类似 sentinel1
+
+networks:
+  redis-net:
+    driver: bridge
+
+volumes:
+  redis_master:
+  redis_replica1:
+  redis_replica2:
+```
+
+```bash title="sentinel.conf"
+port 26379
+dir /tmp
+
+sentinel monitor mymaster redis-master 6379 2
+sentinel down-after-milliseconds mymaster 3000
+sentinel parallel-syncs mymaster 1
+sentinel failover-timeout mymaster 10000
+```
+
+### Redis Cluster
+
+```yaml title="Redis Cluster"
+version: '3.9'
+
+services:
+  redis-node-1:
+    image: redis:7-alpine
+    container_name: redis-node-1
+    command: |
+      redis-server --cluster-enabled yes \
+                   --cluster-config-file nodes.conf \
+                   --cluster-node-timeout 5000 \
+                   --appendonly yes \
+                   --maxmemory 256mb
+    ports:
+      - "7001:6379"
+      - "17001:16379"
+    volumes:
+      - redis-cluster-1:/data
+    networks:
+      - redis-cluster-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-node-2:
+    image: redis:7-alpine
+    container_name: redis-node-2
+    command: |
+      redis-server --cluster-enabled yes \
+                   --cluster-config-file nodes.conf \
+                   --cluster-node-timeout 5000 \
+                   --appendonly yes \
+                   --maxmemory 256mb
+    ports:
+      - "7002:6379"
+      - "17002:16379"
+    volumes:
+      - redis-cluster-2:/data
+    networks:
+      - redis-cluster-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ... 更多节点（至少 6 个用于生产）
+
+networks:
+  redis-cluster-net:
+    driver: bridge
+
+volumes:
+  redis-cluster-1:
+  redis-cluster-2:
+  # ...
+```
+
+```bash title="初始化 Redis Cluster"
+# 等待所有节点启动后初始化
+docker exec -it redis-node-1 redis-cli --cluster create \
+    redis-node-1:6379 redis-node-2:6379 redis-node-3:6379 \
+    redis-node-4:6379 redis-node-5:6379 redis-node-6:6379 \
+    --cluster-replicas 1
+```
+
+## RabbitMQ 容器化
+
+### 单节点配置
+
+```yaml title="RabbitMQ 单节点"
+version: '3.9'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: /myapp
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+      - ./config/enabled_plugins:/etc/rabbitmq/enabled_plugins
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+volumes:
+  rabbitmq_data:
+```
+
+```ini title="rabbitmq.conf"
+# 基础配置
+listeners.tcp.default = 5672
+management.tcp.port = 15672
+
+# 默认用户（应该用环境变量覆盖）
+default_vhost = /
+default_user = guest
+default_pass = guest
+
+# 性能配置
+vm_memory_high_watermark.relative = 0.6
+disk_free_limit.absolute = 1GB
+
+# 连接配置
+heartbeat = 60
+channel_max = 2048
+
+# 日志配置
+log.console = true
+log.console.level = info
+```
+
+### 镜像队列配置
+
+```yaml title="RabbitMQ 集群"
+version: '3.9'
+
+services:
+  rabbitmq1:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq1
+    environment:
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_COOKIE}
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    hostname: rabbitmq1
+    volumes:
+      - rabbitmq1_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - rabbitmq-net
+
+  rabbitmq2:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq2
+    environment:
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_COOKIE}
+    hostname: rabbitmq2
+    volumes:
+      - rabbitmq2_data:/var/lib/rabbitmq
+    networks:
+      - rabbitmq-net
+    depends_on:
+      - rabbitmq1
+
+  rabbitmq3:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq3
+    environment:
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_COOKIE}
+    hostname: rabbitmq3
+    volumes:
+      - rabbitmq3_data:/var/lib/rabbitmq
+    networks:
+      - rabbitmq-net
+    depends_on:
+      - rabbitmq1
+
+networks:
+  rabbitmq-net:
+    driver: bridge
+
+volumes:
+  rabbitmq1_data:
+  rabbitmq2_data:
+  rabbitmq3_data:
+```
+
+```bash title="初始化 RabbitMQ 集群"
+# 在第一个节点执行
+docker exec -it rabbitmq1 rabbitmqctl stop_app
+docker exec -it rabbitmq1 rabbitmqctl reset
+docker exec -it rabbitmq1 rabbitmqctl start_app
+
+# 加入第二个节点
+docker exec -it rabbitmq2 rabbitmqctl stop_app
+docker exec -it rabbitmq2 rabbitmqctl reset
+docker exec -it rabbitmq2 rabbitmqctl join_cluster --ram rabbit@rabbitmq1
+docker exec -it rabbitmq2 rabbitmqctl start_app
+
+# 配置镜像策略
+docker exec -it rabbitmq1 rabbitmqctl set_policy ha-all "^" '{"ha-mode":"all","ha-sync-mode":"automatic"}'
+```
+
+## Kafka 容器化
+
+### 使用 KRaft 模式（无 Zookeeper）
+
+```yaml title="Kafka KRaft 模式"
+version: '3.9'
+
+services:
+  kafka1:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    volumes:
+      - kafka1_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    networks:
+      - kafka-net
+
+  kafka2:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka2
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    volumes:
+      - kafka2_data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+  kafka3:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka3
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    volumes:
+      - kafka3_data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  kafka1_data:
+  kafka2_data:
+  kafka3_data:
+```
+
+:::info
+**KRaft vs Zookeeper**
+
+Kafka 2.8+ 支持 KRaft 模式，不再需要 Zookeeper。这简化了部署，但目前生产环境仍建议使用 Zookeeper 模式直到 KRaft 成熟。
+:::
+
+## Nginx 容器化
+
+### 反向代理配置
+
+```yaml title="Nginx Docker Compose"
+version: '3.9'
+
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./html:/usr/share/nginx/html:ro
+      - ./logs:/var/log/nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+      - frontend
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
+
+networks:
+  default:
+    name: app-network
+```
+
+```nginx title="nginx.conf"
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    # Gzip 压缩
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+```nginx title="conf.d/upstream.conf"
+upstream api_backend {
+    least_conn;
+    server api1:8000 max_fails=3 fail_timeout=30s;
+    server api2:8000 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+}
+
+upstream frontend_backend {
+    server frontend:3000;
+}
+
+server {
+    listen 80;
+    server_name example.com;
+
+    # 前端
+    location / {
+        proxy_pass http://frontend_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # API
+    location /api/ {
+        proxy_pass http://api_backend/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 超时配置
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+
+    # 健康检查
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
+}
+```
+
+## 常见问题与反模式
+
+### 问题 1：Redis 内存限制不生效
+
+**现象**：`maxmemory` 配置被覆盖。
+
+**根因**：Docker 内存限制可能导致 Redis 内存检测不准确。
+
+**解决方案**：
+
+```dockerfile
+# 在启动命令中明确指定
+redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+```
+
+### 问题 2：RabbitMQ 集群节点无法通信
+
+**现象**：`Mnesia(...)` 报错。
+
+**根因**：Erlang Cookie 不一致，或网络隔离。
+
+**解决方案**：
+
+```bash
+# 确保所有节点使用相同的 Erlang Cookie
+# 在 docker-compose 中设置相同的 RABBITMQ_ERLANG_COOKIE
+
+# 确保在同一网络
+networks:
+  - rabbitmq-net
+```
+
+### 问题 3：Kafka 分区分配错误
+
+**现象**：`ReplicaMANAGER` 报错。
+
+**根因**：容器重启后 IP 变化，分区与 broker 映射失效。
+
+**解决方案**：
+
+```bash
+# 生产环境使用 K8s StateFulSet
+# 使用固定的主机名
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092
+```
+
+### 问题 4：Nginx upstream 配置僵硬
+
+**现象**：添加新服务需要重启 Nginx。
+
+**根因**：没有使用动态配置。
+
+**解决方案**：
+
+```nginx
+# 使用 OpenResty/lua-nginx-module 实现动态 upstream
+# 或使用 Consul/etcd 发现服务
+```
+
+## 权衡矩阵
+
+| 中间件 | 单节点 | 集群模式 | 说明 |
+| --- | --- | --- | --- |
+| **Redis** | 适合缓存 | Sentinel/Cluster | Sentinel 主从，Cluster 分片 |
+| **RabbitMQ** | 开发测试 | 集群 + 镜像队列 | ha-mode=all |
+| **Kafka** | 不推荐 | KRaft/ZK | 至少 3 节点 |
+| **Nginx** | 够用 | Keepalived | 一般不需要集群 |
+
+## 延伸思考
+
+中间件容器化的核心挑战是**状态管理**和**高可用**。
+
+几个值得关注的方向：
+
+1. **Operator 模式**：Kubernetes Operator（如 Strimzi for Kafka、RabbitMQ Operator）可以自动化中间件的部署和管理，是生产环境推荐的方式。
+
+2. **服务发现**：容器化后，服务的 IP 可能变化。服务发现机制（如 Consul、CoreDNS）变得尤为重要。
+
+3. **监控与告警**：中间件是系统瓶颈，需要完善的监控。Redis 的 `INFO` 命令、RabbitMQ 的 Management API、Kafka 的 JMX 指标，都是监控数据来源。
+
+更深一层的问题是：**你的中间件真的需要高可用吗？**
+
+很多团队为「可能发生的故障」准备了复杂的高可用方案，但实际上这些故障从未发生。评估真正的业务需求，选择合适的高可用级别。
+
+对于开发测试环境，单节点足够。对于生产环境，高可用是必要的，但实现方式需要根据团队能力选择。Operator 模式是最好的选择，但需要 Kubernetes 环境。
