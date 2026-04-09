@@ -1,0 +1,794 @@
+---
+title: 防重放攻击
+description: 重放攻击的定义与危害、常见场景、防重放策略（Timestamp+Nonce/序列号/签名/一次性Token）、攻击检测与告警。
+---
+
+你可能见过这样的场景：用户通过网银转账，系统提示「转账成功」。但用户没有转账，账户里的钱却不翼而飞。
+
+这就是典型的重放攻击（Replay Attack）。攻击者在网络上截获了用户的合法转账请求，然后原封不动地「重放」一遍，骗过服务端完成转账。
+
+重放攻击不需要破解加密，不需要猜测密码，攻击者只需要做一件事：**复制请求并重复发送**。在 API 安全中，重放攻击是最容易被忽视、但危害极大的攻击手段之一。
+
+## 重放攻击的定义与危害
+
+重放攻击的核心是**攻击者截获并重用合法通信内容**。与窃听不同，重放攻击不要求解密请求内容，而是直接利用已截获的请求。
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Attacker
+    participant Server
+    
+    User->>Server: 转账请求（合法）<br/>签名: xxx, 金额: 10000元
+    Server-->>User: 转账成功
+    
+    Note over Attacker: 截获请求
+    Attacker->>Server: 转账请求（重放）<br/>签名: xxx, 金额: 10000元
+    Server-->>Attacker: 转账成功
+    
+    Note over User: 什么操作都没做<br/>但钱被转走了！
+```
+
+**危害场景**：
+
+1. **金融交易**：转账、支付、充值等操作被重复执行
+2. **认证流程**：登录请求被重放，导致重复认证或 Token 被复用
+3. **数据修改**：修改密码、修改配置等操作被重放
+4. **业务逻辑**：优惠券领取、抽奖等「一次性」操作被重复执行
+
+## 重放攻击的场景分析
+
+### 场景一：登录请求重放
+
+攻击者截获用户的登录请求：
+
+```http
+POST /api/v1/auth/login HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+X-Timestamp: 1712563200
+X-Nonce: abc123
+X-Signature: SHA256=xyz789
+
+{
+  "username": "alice",
+  "password": "SecurePass123",
+  "device_id": "device-uuid-123"
+}
+```
+
+即使密码被加密，攻击者仍然可以重放整个请求：
+
+```http
+POST /api/v1/auth/login HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+X-Timestamp: 1712563200
+X-Nonce: abc123
+X-Signature: SHA256=xyz789
+
+{
+  "username": "alice",
+  "password": "SecurePass123",
+  "device_id": "device-uuid-123"
+}
+```
+
+服务端返回的 Session 或 Token 被攻击者获取。
+
+### 场景二：支付请求重放
+
+```http
+POST /api/v1/payment HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+X-Timestamp: 1712563200
+X-Nonce: payment-xyz789
+X-Signature: SHA256=payment-signature
+
+{
+  "order_id": "ORD-2024-001",
+  "amount": 10000,
+  "currency": "CNY"
+}
+```
+
+如果服务端没有校验请求的唯一性，攻击者可以无限重放这个请求，用户账户被扣款 N 次。
+
+### 场景三：Token 使用重放
+
+即使使用的是短期 Token（如 JWT），攻击者截获后仍然可以在 Token 有效期内反复使用：
+
+```http
+GET /api/v1/user/profile HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+GET /api/v1/user/profile HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+GET /api/v1/user/profile HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+攻击者可以在短时间内大量访问 API，窃取用户数据或进行撞库攻击。
+
+## 防重放策略设计
+
+防重放的核心是**确保每个请求都是「新的」且「唯一的」**。常见的策略有四种：
+
+| 策略 | 原理 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| Timestamp + Nonce | 时间戳防过期，Nonce 防复用 | 实现简单，安全性高 | 需要存储 Nonce |
+| 序列号 | 请求带递增序号 | 无需存储，支持完整审计 | 需要双向状态同步 |
+| 签名 | 请求内容包含签名要素 | 防篡改 + 防重放 | 实现复杂 |
+| 一次性 Token | 每个请求使用唯一 Token | 简单直接 | 需要额外请求获取 Token |
+
+## Timestamp + Nonce 方案
+
+这是最常用的防重放方案，结合了时间窗口限制和一次性随机数。
+
+### 方案原理
+
+```mermaid
+flowchart TD
+    A[收到请求] --> B{检查 Timestamp}
+    B -->|在有效窗口内| C{检查 Nonce}
+    B -->|超出窗口| D[拒绝请求<br/>时间过期]
+    C -->|Nonce 未使用| E[处理请求<br/>记录 Nonce]
+    C -->|Nonce 已使用| F[拒绝请求<br/>重复请求]
+```
+
+### Timestamp 校验
+
+```java title="TimestampValidator.java"
+public class TimestampValidator {
+    
+    private final Duration maxTimeDrift;
+    
+    public TimestampValidator(Duration maxTimeDrift) {
+        // 允许前后5分钟的时钟漂移
+        this.maxTimeDrift = maxTimeDrift;
+    }
+    
+    public ValidationResult validateTimestamp(long timestamp) {
+        Instant requestTime = Instant.ofEpochSecond(timestamp);
+        Instant now = Instant.now();
+        
+        // 检查是否在允许的时间窗口内
+        Duration drift = Duration.between(requestTime, now).abs();
+        
+        if (drift.compareTo(maxTimeDrift) > 0) {
+            return ValidationResult.rejected(
+                "Timestamp is outside the acceptable window. " +
+                "Request time: " + requestTime + ", Current time: " + now);
+        }
+        
+        // 检查请求时间是否在未来（防止时钟偏差导致的误拒绝）
+        if (requestTime.isAfter(now.plus(maxTimeDrift))) {
+            return ValidationResult.rejected("Request timestamp is in the future");
+        }
+        
+        return ValidationResult.accepted();
+    }
+}
+```
+
+### Nonce 存储与校验
+
+```java title="NonceValidator.java"
+public class NonceValidator {
+    
+    private final RedisTemplate<String, String> redisTemplate;
+    private final Duration nonceExpiry;
+    
+    public NonceValidator(RedisTemplate<String, String> redisTemplate, 
+                          Duration nonceExpiry) {
+        this.redisTemplate = redisTemplate;
+        this.nonceExpiry = nonceExpiry;
+    }
+    
+    public ValidationResult validateNonce(String key, String nonce) {
+        String cacheKey = buildCacheKey(key, nonce);
+        
+        // 使用 SETNX 原子操作
+        // 如果 Key 不存在，设置为 1 并返回 true
+        // 如果 Key 已存在，返回 false
+        Boolean isNew = redisTemplate.opsForValue()
+            .setIfAbsent(cacheKey, "1", nonceExpiry);
+        
+        if (Boolean.TRUE.equals(isNew)) {
+            return ValidationResult.accepted();
+        } else {
+            return ValidationResult.rejected(
+                "Nonce has already been used. Possible replay attack.");
+        }
+    }
+    
+    private String buildCacheKey(String requestKey, String nonce) {
+        // 包含时间窗口信息，便于清理
+        long windowId = System.currentTimeMillis() / nonceExpiry.toMillis();
+        return String.format("nonce:%s:%d:%s", requestKey, windowId, nonce);
+    }
+}
+```
+
+### 完整的防重放过滤器
+
+```java title="AntiReplayFilter.java"
+public class AntiReplayFilter {
+    
+    private final TimestampValidator timestampValidator;
+    private final NonceValidator nonceValidator;
+    private final RequestSignatureValidator signatureValidator;
+    
+    public AntiReplayFilter(TimestampValidator timestampValidator,
+                          NonceValidator nonceValidator,
+                          RequestSignatureValidator signatureValidator) {
+        this.timestampValidator = timestampValidator;
+        this.nonceValidator = nonceValidator;
+        this.signatureValidator = signatureValidator;
+    }
+    
+    public ValidationResult validate(HttpRequest request, 
+                                     String requestSignature) {
+        // 1. 提取请求要素
+        long timestamp = request.getHeader("X-Timestamp", Long.class);
+        String nonce = request.getHeader("X-Nonce");
+        String requestKey = buildRequestKey(request);
+        
+        // 2. 校验时间戳
+        ValidationResult timestampResult = timestampValidator.validateTimestamp(timestamp);
+        if (!timestampResult.isAccepted()) {
+            log.warn("Anti-replay check failed: invalid timestamp. Request: {}", requestKey);
+            return timestampResult;
+        }
+        
+        // 3. 校验 Nonce
+        ValidationResult nonceResult = nonceValidator.validateNonce(requestKey, nonce);
+        if (!nonceResult.isAccepted()) {
+            log.warn("Anti-replay check failed: duplicate nonce. Request: {}", requestKey);
+            return nonceResult;
+        }
+        
+        // 4. 校验签名（如果配置了签名验证）
+        if (signatureValidator != null) {
+            ValidationResult signatureResult = signatureValidator.validate(
+                request, requestSignature);
+            if (!signatureResult.isAccepted()) {
+                // Nonce 已经被使用，需要回滚
+                nonceValidator.rollback(requestKey, nonce);
+                log.warn("Anti-replay check failed: invalid signature. Request: {}", requestKey);
+                return signatureResult;
+            }
+        }
+        
+        return ValidationResult.accepted();
+    }
+    
+    private String buildRequestKey(HttpRequest request) {
+        // 使用多个要素构建唯一 Key
+        return String.format("%s:%s:%s:%s",
+            request.getMethod(),
+            request.getPath(),
+            request.getHeader("X-Client-Id"),
+            request.getHeader("X-Request-Id"));
+    }
+}
+```
+
+## 序列号方案
+
+每个请求携带递增的序列号，服务端校验序列号的合法性和顺序。
+
+### 方案设计
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    
+    Client->>Server: 请求 #1, Seq: 1001
+    Server-->>Client: 响应 #1, Ack: 1001
+    
+    Client->>Server: 请求 #2, Seq: 1002
+    Server-->>Client: 响应 #2, Ack: 1002
+    
+    Note over Client,Server: 序列号连续递增
+    
+    Client->>Server: 请求 #5, Seq: 1005
+    Server-->>Client: 拒绝: 期望 1003
+    Note over Client,Server: 检测到序列号跳跃
+```
+
+### Java 实现
+
+```java title="SequenceValidator.java"
+public class SequenceValidator {
+    
+    private final Map<String, SequenceState> sequences = new ConcurrentHashMap<>();
+    private final int maxSequenceGap;
+    private final Duration sequenceExpiry;
+    
+    public SequenceValidator(int maxSequenceGap, Duration sequenceExpiry) {
+        this.maxSequenceGap = maxSequenceGap;
+        this.sequenceExpiry = sequenceExpiry;
+    }
+    
+    public ValidationResult validateSequence(String clientId, long sequenceNumber) {
+        SequenceState state = sequences.compute(clientId, (key, existing) -> {
+            if (existing == null) {
+                return new SequenceState(sequenceNumber);
+            }
+            
+            // 检查序列号是否递增
+            if (sequenceNumber <= existing.lastSequence) {
+                return existing; // 序列号重复或倒退
+            }
+            
+            // 检查序列号跳跃是否过大
+            long gap = sequenceNumber - existing.lastSequence;
+            if (gap > maxSequenceGap) {
+                // 可能存在中间请求被截获
+                return existing;
+            }
+            
+            return new SequenceState(sequenceNumber);
+        });
+        
+        // 检查结果
+        if (sequenceNumber <= state.lastSequence) {
+            return ValidationResult.rejected(
+                "Sequence number already used: " + sequenceNumber);
+        }
+        
+        if (sequenceNumber - state.lastSequence > maxSequenceGap) {
+            return ValidationResult.rejected(
+                "Sequence gap too large: " + (sequenceNumber - state.lastSequence));
+        }
+        
+        return ValidationResult.accepted();
+    }
+    
+    private static class SequenceState {
+        final long lastSequence;
+        final Instant lastUpdate;
+        
+        SequenceState(long lastSequence) {
+            this.lastSequence = lastSequence;
+            this.lastUpdate = Instant.now();
+        }
+    }
+}
+```
+
+**优点**：支持完整的请求审计，可以检测中间请求被截获的情况。**缺点**：需要双向状态同步，不适合无连接的 HTTP 场景。
+
+## 签名方案
+
+签名方案通过将请求要素纳入签名内容，使得每个请求的签名都是唯一的。
+
+### 签名内容构造
+
+```http
+# 请求要素
+Method: POST
+Path: /api/v1/payment
+Timestamp: 1712563200
+Nonce: abc123
+Body: {"amount":10000}
+
+# 签名内容（按约定顺序拼接）
+StringToSign = "POST\n/api/v1/payment\n1712563200\nabc123\n{\"amount\":10000}"
+
+# 签名
+Signature = HMAC-SHA256(SecretKey, StringToSign)
+```
+
+### 签名验证实现
+
+```java title="RequestSignatureValidator.java"
+public class RequestSignatureValidator {
+    
+    private final String secretKey;
+    private final String algorithm;
+    
+    public RequestSignatureValidator(String secretKey, String algorithm) {
+        this.secretKey = secretKey;
+        this.algorithm = algorithm;
+    }
+    
+    public ValidationResult validate(HttpRequest request, String providedSignature) {
+        try {
+            String expectedSignature = calculateSignature(request);
+            
+            // 使用恒定时间比较，防止时序攻击
+            if (!MessageDigest.isEqual(
+                    expectedSignature.getBytes(StandardCharsets.UTF_8),
+                    providedSignature.getBytes(StandardCharsets.UTF_8))) {
+                return ValidationResult.rejected("Signature mismatch");
+            }
+            
+            return ValidationResult.accepted();
+        } catch (Exception e) {
+            return ValidationResult.rejected("Signature validation failed: " + e.getMessage());
+        }
+    }
+    
+    private String calculateSignature(HttpRequest request) {
+        // 按约定顺序拼接签名内容
+        String stringToSign = String.join("\n",
+            request.getMethod(),
+            request.getPath(),
+            request.getHeader("X-Timestamp"),
+            request.getHeader("X-Nonce"),
+            request.getBody()
+        );
+        
+        // 计算 HMAC
+        Mac mac = Mac.getInstance(algorithm);
+        SecretKeySpec keySpec = new SecretKeySpec(
+            secretKey.getBytes(StandardCharsets.UTF_8), algorithm);
+        mac.init(keySpec);
+        
+        byte[] signatureBytes = mac.doFinal(
+            stringToSign.getBytes(StandardCharsets.UTF_8));
+        
+        return Base64.getEncoder().encodeToString(signatureBytes);
+    }
+}
+```
+
+:::warning 时序攻击
+签名比较必须使用恒定时间比较（`MessageDigest.isEqual`），否则攻击者可能通过测量响应时间猜测签名。
+:::
+
+## 一次性 Token 方案
+
+服务端为每个请求生成唯一的一次性 Token，Token 使用后立即失效。
+
+### 方案流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    
+    Note over Client: 步骤1：获取一次性 Token
+    Client->>Server: GET /api/v1/token
+    Server-->>Client: 返回 Token: ot-abc123 (有效期5秒)
+    
+    Note over Client: 步骤2：使用 Token 发起实际请求
+    Client->>Server: POST /api/v1/payment<br/>X-OneTime-Token: ot-abc123
+    Server->>Server: 验证 Token 有效
+    Server->>Server: 使用后立即删除 Token
+    Server-->>Client: 返回响应
+    
+    Note over Client: 步骤3：重放请求失败
+    Client->>Server: POST /api/v1/payment<br/>X-OneTime-Token: ot-abc123
+    Server-->>Client: 拒绝: Token 已使用
+```
+
+### Java 实现
+
+```java title="OneTimeTokenService.java"
+public class OneTimeTokenService {
+    
+    private final RedisTemplate<String, String> redisTemplate;
+    private final Duration tokenExpiry;
+    
+    public OneTimeTokenService(RedisTemplate<String, String> redisTemplate,
+                              Duration tokenExpiry) {
+        this.redisTemplate = redisTemplate;
+        this.tokenExpiry = tokenExpiry;
+    }
+    
+    // 步骤1：生成一次性 Token
+    public String generateToken(String userId, String action) {
+        String token = "ot-" + UUID.randomUUID().toString();
+        String key = buildKey(userId, action);
+        
+        // Token 与用户+操作绑定
+        redisTemplate.opsForValue().set(key, token, tokenExpiry);
+        
+        return token;
+    }
+    
+    // 步骤2：验证并消费 Token
+    public ValidationResult consumeToken(String userId, String action, 
+                                         String providedToken) {
+        String key = buildKey(userId, action);
+        String storedToken = redisTemplate.opsForValue().get(key);
+        
+        if (storedToken == null) {
+            return ValidationResult.rejected("Token expired or not found");
+        }
+        
+        if (!storedToken.equals(providedToken)) {
+            return ValidationResult.rejected("Invalid token");
+        }
+        
+        // 原子性删除 Token
+        Boolean deleted = redisTemplate.delete(key);
+        if (!Boolean.TRUE.equals(deleted)) {
+            // 并发情况，Token 已被其他请求消费
+            return ValidationResult.rejected("Token already consumed");
+        }
+        
+        return ValidationResult.accepted();
+    }
+    
+    private String buildKey(String userId, String action) {
+        return String.format("ott:%s:%s", userId, action);
+    }
+}
+```
+
+**优点**：实现简单，安全性高。**缺点**：需要额外的请求获取 Token，增加网络开销。
+
+## 各方案对比与适用场景
+
+| 方案 | 防重放强度 | 实现复杂度 | 网络开销 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| Timestamp + Nonce | 高 | 中 | 无额外请求 | 通用场景，推荐 |
+| 序列号 | 很高 | 高 | 无额外请求 | 双向通信、长连接 |
+| 签名 | 很高 | 高 | 无额外请求 | 高安全要求场景 |
+| 一次性 Token | 很高 | 低 | 额外请求 | 敏感操作（支付） |
+
+**推荐组合**：Timestamp + Nonce + 签名，适用于绝大多数场景。
+
+## 攻击检测与告警
+
+即使有防重放机制，也应该监控和检测重放攻击尝试：
+
+```java title="ReplayAttackDetector.java"
+public class ReplayAttackDetector {
+    
+    private final AlertService alertService;
+    private final RedisTemplate<String, String> redisTemplate;
+    
+    public void detectAndAlert(String clientId, String requestKey, 
+                               String nonce, long timestamp) {
+        // 检测 Nonce 重用
+        detectNonceReuse(clientId, nonce);
+        
+        // 检测时间窗口外的请求
+        detectTimestampAnomaly(clientId, timestamp);
+        
+        // 检测异常请求频率
+        detectRequestFrequency(clientId, requestKey);
+    }
+    
+    private void detectNonceReuse(String clientId, String nonce) {
+        String alertKey = String.format("alert:nonce_reuse:%s:%s", clientId, nonce);
+        
+        // 使用 SETNX 确保只告警一次
+        Boolean isFirst = redisTemplate.opsForValue()
+            .setIfAbsent(alertKey, "1", Duration.ofHours(1));
+        
+        if (Boolean.TRUE.equals(isFirst)) {
+            alertService.sendSecurityAlert(
+                SecurityAlertType.REPLAY_ATTACK_SUSPECTED,
+                Map.of(
+                    "client_id", clientId,
+                    "nonce", nonce,
+                    "description", "Nonce reuse detected - possible replay attack"
+                )
+            );
+        }
+    }
+    
+    private void detectTimestampAnomaly(String clientId, long timestamp) {
+        Instant requestTime = Instant.ofEpochSecond(timestamp);
+        Duration drift = Duration.between(requestTime, Instant.now()).abs();
+        
+        // 如果时间偏差超过 1 分钟，记录异常
+        if (drift.compareTo(Duration.ofMinutes(1)) > 0) {
+            String alertKey = String.format("alert:timestamp_anomaly:%s", clientId);
+            
+            Long count = redisTemplate.opsForValue().increment(alertKey);
+            redisTemplate.expire(alertKey, Duration.ofHours(1));
+            
+            // 连续异常时告警
+            if (count != null && count > 10) {
+                alertService.sendSecurityAlert(
+                    SecurityAlertType.TIMESTAMP_ANOMALY,
+                    Map.of(
+                        "client_id", clientId,
+                        "anomaly_count", count,
+                        "description", "Multiple timestamp anomalies detected"
+                    )
+                );
+            }
+        }
+    }
+    
+    private void detectRequestFrequency(String clientId, String requestKey) {
+        String freqKey = String.format("freq:%s", clientId);
+        
+        Long count = redisTemplate.opsForValue().increment(freqKey);
+        if (count == null) {
+            redisTemplate.opsForValue().set(freqKey, "1", Duration.ofMinutes(1));
+            return;
+        }
+        
+        // 设置过期
+        redisTemplate.expire(freqKey, Duration.ofMinutes(1));
+        
+        // 频率异常检测
+        if (count > 1000) { // 每分钟超过1000次请求
+            alertService.sendSecurityAlert(
+                SecurityAlertType.HIGH_REQUEST_FREQUENCY,
+                Map.of(
+                    "client_id", clientId,
+                    "request_count", count,
+                    "description", "Abnormally high request frequency"
+                )
+            );
+        }
+    }
+}
+```
+
+## 思考题
+
+**问题 1**：为什么 Timestamp + Nonce 方案比单独使用 Timestamp 或 Nonce 更安全？
+
+<details>
+<summary>参考答案</summary>
+
+**单独使用 Timestamp 的问题**：
+
+1. **攻击者可以在时间窗口内重放**。例如，如果允许前后 5 分钟的时间窗口，攻击者在 5 分钟内可以反复重放请求。
+2. **无法区分「真正的重复请求」和「合法的并发请求」**。
+
+**单独使用 Nonce 的问题**：
+
+1. **需要服务端存储所有已使用的 Nonce**，随着时间推移，存储量会越来越大。
+2. **无法防止「时间窗口外的重放」**。如果攻击者截获了请求，等待 Nonce 过期后重放，Nonce 验证会失效。
+
+**Timestamp + Nonce 组合的优势**：
+
+1. **双重防护**：即使攻击者截获了请求并快速重放，Nonce 检查会拒绝；如果等待 Nonce 过期再重放，Timestamp 检查会拒绝。
+2. **存储优化**：Nonce 只需要存储「时间窗口内的已使用 Nonce」，不需要永久存储。
+3. **职责分离**：Timestamp 解决「时间问题」，Nonce 解决「唯一性问题」。
+
+**最佳实践**：
+- 时间窗口：建议 1-5 分钟
+- Nonce 存储时间：与时间窗口相同或略长
+- 时间同步：使用 NTP 服务确保客户端和服务端时钟同步
+</details>
+
+**问题 2**：在分布式环境下，Nonce 验证如何保证高性能和一致性？
+
+<details>
+<summary>参考答案</summary>
+
+**分布式 Nonce 验证的挑战**：
+
+1. **存储一致性**：多个服务节点需要共享 Nonce 状态
+2. **性能要求**：每次请求都要验证 Nonce，不能成为瓶颈
+3. **存储容量**：高并发下 Nonce 数量会快速增长
+
+**解决方案**：
+
+**1. Redis 集中存储**：
+
+```lua
+-- 原子操作
+local result = redis.call('SET', key, '1', 'NX', 'PX', expiry_ms)
+if result then
+    return 1  -- 新 Nonce，允许
+else
+    return 0  -- 已存在，拒绝
+end
+```
+
+使用 Redis 的 `SET NX` 命令，原子性设置 Key，避免竞态条件。
+
+**2. 基于时间的 Key 设计**：
+
+```java
+// 按分钟分桶，减少存储
+String buildNonceKey(String clientId, String nonce) {
+    long windowId = System.currentTimeMillis() / 60000; // 按分钟分桶
+    return String.format("nonce:%s:%d:%s", clientId, windowId, nonce);
+}
+```
+
+每小时清理过期桶。
+
+**3. 布隆过滤器优化**：
+
+对于存储密集型场景，可以使用布隆过滤器做「预检查」，过滤掉大部分重复 Nonce，减少 Redis 查询：
+
+```java
+BloomFilter<String> nonceFilter = BloomFilter.create(
+    Funnels.stringFunnel(StandardCharsets.UTF_8),
+    1000000,  // 预期插入数
+    0.01      // 误判率
+);
+
+public boolean isNewNonce(String key) {
+    if (nonceFilter.mightContain(key)) {
+        // 可能存在，需要 Redis 确认
+        return redis.checkAndSet(key);
+    } else {
+        // 一定不存在，直接放行
+        nonceFilter.put(key);
+        return true;
+    }
+}
+```
+
+**4. 本地缓存 + Redis 双重检查**：
+
+```java
+// 本地缓存最近已验证的 Nonce
+LoadingCache<String, Boolean> localCache = Caffeine.newBuilder()
+    .maximumSize(10000)
+    .expireAfterWrite(Duration.ofMinutes(1))
+    .build();
+
+// 先检查本地缓存，再检查 Redis
+public boolean isNewNonce(String key) {
+    Boolean local = localCache.getIfPresent(key);
+    if (Boolean.TRUE.equals(local)) {
+        return false; // 本地缓存命中，直接拒绝
+    }
+    
+    if (redis.setIfAbsent(key, Duration.ofMinutes(5))) {
+        localCache.put(key, true);
+        return true;
+    }
+    return false;
+}
+```
+
+**权衡**：需要根据实际 QPS 选择方案。QPS < 10 万时，Redis SETNX 足够；QPS > 10 万时，需要本地缓存优化。
+</details>
+
+**问题 3**：HMAC 签名方案为什么能防重放？签名内容中包含哪些关键要素？
+
+<details>
+<summary>参考答案</summary>
+
+**HMAC 签名防重放的原理**：
+
+签名内容包含**时间戳和随机数**，而这两个要素每次请求都不同。即使攻击者截获了整个请求（包含签名），也无法修改签名内容（因为不知道密钥），更不能构造具有相同签名的不同请求。
+
+**签名内容中的关键要素**：
+
+1. **时间戳（Timestamp）**：
+   - 签名中包含时间戳
+   - 攻击者不能修改时间戳（否则签名不匹配）
+   - 攻击者不能使用旧请求（时间戳会过期）
+
+2. **随机数（Nonce）**：
+   - 签名中包含 Nonce
+   - 攻击者不能使用相同 Nonce 重新签名（因为不知道密钥）
+   - 攻击者不能修改 Nonce（否则签名不匹配）
+
+3. **请求方法与路径（Method + Path）**：
+   - 签名中包含请求方法和路径
+   - 攻击者不能将支付请求改为转账请求（方法/路径不同，签名不匹配）
+
+4. **请求体（Body）**：
+   - 签名中包含请求体哈希
+   - 攻击者不能修改金额等关键字段
+
+**签名内容的标准格式**：
+
+```
+StringToSign = HTTP_METHOD + "\n" +
+               REQUEST_PATH + "\n" +
+               TIMESTAMP + "\n" +
+               NONCE + "\n" +
+               BODY_HASH
+
+Signature = HMAC-SHA256(SECRET_KEY, StringToSign)
+```
+
+**攻击者面临的困境**：
+- 修改任何要素 → 签名不匹配 → 被拒绝
+- 使用相同请求 → Nonce 已使用 → 被拒绝
+- 等待时间过期 → Timestamp 超出窗口 → 被拒绝
+</details>

@@ -1,0 +1,565 @@
+---
+title: WAF 规则配置与绕过防护
+description: 深入解析WAF规则类型、规则编写语法、常见绕过技术及防护策略。
+---
+
+安全研究员 Mike 刚刚提交了他的最新发现：某知名电商网站的 WAF 可以被绕过。他使用的不是零日漏洞，而是一种巧妙构造的 HTTP 请求——服务器正常解析，WAF 却视而不见。
+
+这个发现揭示了一个重要事实：**WAF 不是绝对安全的防线，它是规则和算法的组合，必然存在盲点**。了解攻击者如何绕过 WAF，才能更好地配置防护规则。
+
+## WAF 规则类型
+
+### 1. 预定义规则（OWASP CRS）
+
+OWASP Core Rule Set（CRS）是开源的 WAF 规则集，提供开箱即用的攻击防护：
+
+```apache
+# ModSecurity CRS 示例
+SecRule REQUEST_URI|REQUEST_BODY|ARGS_NAMES|ARGS|XML:/* \
+  "@rx (?i)\bor\b.*\b(select|update|delete|insert|from|where)\b" \
+  "id:942100,\
+  phase:2,\
+  deny,\
+  status:403,\
+  msg:'SQL Injection Attack Detected',\
+  logdata:'Matched Data: %{MATCHED_VAR} found within %{VARIABLE_NAME}',\
+  severity:CRITICAL"
+```
+
+规则分类：
+
+| 文件 | 防护内容 |
+|------|---------|
+| `REQUEST-910-IP-REPUTATION.conf` | 已知恶意 IP |
+| `REQUEST-911-METHOD-ENFORCEMENT.conf` | HTTP 方法限制 |
+| `REQUEST-912-DOS-PROTECTION.conf` | DDoS/速率限制 |
+| `REQUEST-930-APPLICATION-ATTACK-LFI.conf` | 本地文件包含 |
+| `REQUEST-931-APPLICATION-ATTACK-RFI.conf` | 远程文件包含 |
+| `REQUEST-932-APPLICATION-ATTACK-RCE.conf` | 远程命令执行 |
+| `REQUEST-941-APPLICATION-ATTACK-XSS.conf` | 跨站脚本 |
+| `REQUEST-942-APPLICATION-ATTACK-SQLI.conf` | SQL 注入 |
+| `REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf` | 会话固定 |
+
+### 2. 自定义规则
+
+根据业务场景编写的特定规则：
+
+```yaml
+# 自定义 WAF 规则示例
+rules:
+  # 禁止访问管理后台
+  - name: "block-admin-access"
+    condition: "uri matches '/admin.*'"
+    action: block
+    exception:
+      - ip_in_range: ["10.0.0.0/8"]
+      - ip_in_range: ["172.16.0.0/12"]
+      
+  # 限制文件上传类型
+  - name: "restrict-upload-types"
+    condition: "uri matches '/upload' AND method POST"
+    condition: "request.file_extension NOT IN ['jpg', 'png', 'pdf']"
+    action: block
+    
+  # 敏感接口速率限制
+  - name: "login-rate-limit"
+    condition: "uri matches '/api/login'"
+    action: rate_limit
+    limit: 10
+    window: 60
+```
+
+### 3. 机器学习规则
+
+基于 ML 模型的自适应规则：
+
+```java
+// 简化示例：ML 驱动的异常检测
+public class WafMlEngine {
+    private final AnomalyDetector<SqliFeatures> sqlDetector;
+    private final AnomalyDetector<XssFeatures> xssDetector;
+    
+    public DetectionResult analyze(HttpRequest request) {
+        SqliFeatures features = extractSqlFeatures(request);
+        double anomalyScore = sqlDetector.score(features);
+        
+        if (anomalyScore > 0.85) {
+            return DetectionResult.builder()
+                .blocked(true)
+                .reason("ML: SQLi anomaly score " + anomalyScore)
+                .build();
+        }
+        
+        // 多层检测结合
+        if (ruleEngine.matches(request) && anomalyScore > 0.5) {
+            return DetectionResult.builder()
+                .blocked(true)
+                .reason("Hybrid: Rule + ML")
+                .build();
+        }
+        
+        return DetectionResult.builder().blocked(false).build();
+    }
+}
+```
+
+## 规则编写语法（ModSecurity CRS）
+
+ModSecurity 是最流行的开源 WAF 引擎，其规则语法是事实标准：
+
+```apache
+SecRule VARIABLES OPERATOR [ACTIONS]
+
+# 参数说明：
+# VARIABLES: 检查的位置（REQUEST_URI, ARGS, HEADERS, etc.）
+# OPERATOR: 匹配条件（@rx, @eq, @gt, etc.）
+# ACTIONS: 匹配后执行的操作（deny, pass, log, etc.）
+```
+
+### 常见变量
+
+| 变量 | 说明 |
+|------|------|
+| `REQUEST_URI` | 请求 URI |
+| `REQUEST_METHOD` | HTTP 方法 |
+| `ARGS` | 所有参数 |
+| `ARGS_GET` | URL 参数 |
+| `ARGS_POST` | POST 参数 |
+| `HEADERS:*` | HTTP 头部 |
+| `REQUEST_BODY` | 请求体 |
+| `TX:VAR` | 事务变量 |
+| `IP` | 客户端 IP |
+
+### 常见操作符
+
+| 操作符 | 说明 |
+|--------|------|
+| `@rx REGEX` | 正则表达式匹配 |
+| `@eq N` | 等于 |
+| `@gt N` | 大于 |
+| `@lt N` | 小于 |
+| `@contains` | 包含 |
+| `@startsWith` | 开头匹配 |
+| `@streq` | 字符串相等 |
+
+## 常见 WAF 绕过技术
+
+### 1. 编码绕过
+
+**URL 编码**
+
+```
+原始: SELECT * FROM users WHERE id=1
+编码: SELECT%20*%20FROM%20users%20WHERE%20id%3D1
+```
+
+WAF 如果没有正确解码，会将其视为正常请求。
+
+**双重 URL 编码**
+
+```
+单次编码: % -> %25
+输入: %27 (编码的 ')
+双重编码: %2527
+```
+
+WAF 解码一次后变成 `%27`，后端再次解码得到 `'。
+
+**Unicode/UTF-8 编码**
+
+```
+' -> \u0027 -> %c0%a7 (2-byte UTF-8)
+```
+
+### 2. 大小写混合
+
+SQL 关键字不区分大小写：
+
+```
+原始: UNION SELECT username, password FROM users
+混淆: uNiOn sElEcT username, password fRoM users
+```
+
+WAF 规则如果只检查小写版本，可能被绕过。
+
+### 3. 注释注入
+
+**内联注释**
+
+```sql
+UNION /* comment */ SELECT
+SELECT/*\*/\*/FROM users
+```
+
+注释可以打断关键字，让 WAF 无法匹配完整模式。
+
+**注释替代空格**
+
+```sql
+SELECT/**/username/**/FROM/**/users
+SELECT/**/username/**/FROM/**/users/**/WHERE/**/id=1
+```
+
+### 4. 分块传输编码（Chunked Transfer）
+
+HTTP 分块传输将请求分成多个块：
+
+```http
+POST /api/login HTTP/1.1
+Host: example.com
+Transfer-Encoding: chunked
+
+7
+user=ad
+9
+min&pass=
+11
+admin' OR 1=1--
+0
+
+```
+
+WAF 可能无法正确解析分块数据，导致检测绕过。
+
+### 5. HTTP/2 协议混淆
+
+**头部注入**
+
+```
+:method = POST
+:path = /api/login
+:scheme = https
+user-agent = test
+x-custom-header: malicious' payload
+```
+
+HTTP/2 的头部混淆可能绕过基于 HTTP/1.1 的 WAF。
+
+**HPACK 压缩混淆**
+
+HPACK 压缩的头部可能被 WAF 错误解析。
+
+## 绕过防护策略
+
+### 1. 多层解码
+
+WAF 应该对输入进行多层解码后再检测：
+
+```java
+public class WafDecoder {
+    public String normalizeInput(String input) {
+        // 第一层：URL 解码
+        String decoded = URLDecoder.decode(input, StandardCharsets.UTF_8);
+        
+        // 第二层：双重 URL 解码（多次循环直到不变）
+        while (true) {
+            String doubleDecoded = URLDecoder.decode(decoded, StandardCharsets.UTF_8);
+            if (doubleDecoded.equals(decoded)) break;
+            decoded = doubleDecoded;
+        }
+        
+        // Unicode/UTF-8 规范化
+        decoded = normalizeUnicode(decoded);
+        
+        // 大小写规范化（仅针对特定上下文）
+        // 注意：不要全局规范化，可能破坏正常请求
+        
+        return decoded;
+    }
+}
+```
+
+### 2. 正则表达式优化
+
+避免容易被绕过的简单正则：
+
+```yaml
+# 不好：容易被绕过
+- pattern: "union.*select"
+
+# 好：考虑绕过技术
+- pattern: "(?i)(\b(union\s+(all\s+)?select|select\s+.*\bfrom)\b)"
+  # \b 词边界，避免部分匹配
+  # (?i) 大小写不敏感
+  # \s+ 匹配各种空格形式
+```
+
+### 3. 语法感知检测
+
+不要只做字符串匹配，而是理解语义：
+
+```java
+public class SqliSemanticAnalyzer {
+    public boolean isSqlInjection(String input) {
+        // 解析 SQL 结构
+        try {
+            SqlParser parser = new SqlParser();
+            parser.parse(input);
+            // 如果能成功解析为有效 SQL，可能是注入
+            return isSuspiciousStructure(parser);
+        } catch (SqlSyntaxException e) {
+            // 无法解析，可能尝试注入
+            return containsDangerousPatterns(input);
+        }
+    }
+}
+```
+
+### 4. 异常处理机制
+
+```java
+public class WafRuleEngine {
+    private static final int MAX_EXECUTION_TIME_MS = 100;
+    private static final int MAX_DEPTH = 10;
+    
+    public DetectionResult process(HttpRequest request) {
+        // 异常情况下的安全策略
+        try {
+            return executeRules(request);
+        } catch (WafTimeoutException e) {
+            // 超时：拒绝请求（安全优先）
+            return DetectionResult.block("Rule execution timeout");
+        } catch (Exception e) {
+            // 其他异常：记录并拒绝
+            log.warn("WAF rule error", e);
+            return DetectionResult.block("WAF processing error");
+        }
+    }
+}
+```
+
+## 规则调优流程
+
+### 第一步：学习期
+
+- 以日志模式运行，记录所有告警
+- 收集正常业务流量的特征
+- 建立基线
+
+### 第二步：验证期
+
+- 逐步启用阻断
+- 观察误报情况
+- 记录误报案例
+
+### 第三步：优化期
+
+- 根据误报案例调整规则
+- 添加例外白名单
+- 精细化规则粒度
+
+### 第四步：运营期
+
+- 持续监控告警
+- 定期回顾规则效果
+- 及时响应新型攻击
+
+## 真实攻击案例分析
+
+### 案例：SolarWinds 攻击中的 WAF 绕过
+
+攻击者在最初的访问阶段，利用了 F5 BIG-IP WAF 的配置不当：
+
+- WAF 被设置为「宽松模式」
+- 攻击者通过编码和分块传输绕过检测
+- 攻击流量最终到达了 Orion 平台的登录接口
+
+**教训**：
+
+- WAF 规则需要定期审计
+- WAF 不能替代安全编码
+- 异常日志需要认真分析
+
+:::tip 关键洞察
+WAF 规则配置是一个持续优化的过程。了解绕过技术不是为了实施攻击，而是为了更好地防护。最佳实践是：多层防御（不依赖单一 WAF）、持续监控、定期审计、快速响应。
+:::
+
+## 思考题
+
+**问题 1**：WAF 规则更新后出现大规模误报，导致大量合法用户无法正常使用业务。作为安全工程师，应该如何在最短时间内恢复业务，同时保证安全性？
+
+<details>
+<summary>参考答案</summary>
+
+这是一个典型的 WAF 运营事故，需要快速响应：
+
+**立即响应（0-15 分钟）**
+
+1. **快速回滚**：如果可以一键回滚，先回滚到上一版规则
+2. **切换到检测模式**：将所有新规则从「阻断」改为「仅记录」，快速恢复业务
+3. **紧急白名单**：如果知道误报来源，立即添加白名单规则
+
+```yaml
+# 紧急白名单规则（优先级最高）
+emergency_rules:
+  - name: "emergency-whitelist"
+    priority: 1
+    condition: "true"  # 匹配所有
+    action: pass  # 跳过所有后续规则
+    # 明确这是临时的，必须在 24 小时内处理
+    expires: 24h
+```
+
+**问题分析（15-60 分钟）**
+
+1. 分析误报日志，确定误报模式
+2. 识别受影响的 API 端点和用户群体
+3. 区分「完全误报」和「部分误报」
+
+**规则修复（1-4 小时）**
+
+1. 针对误报模式编写精确规则
+2. 使用更具体的匹配条件（参数名、参数值范围）
+3. 添加必要的例外
+
+**验证与发布（4-8 小时）**
+
+1. 在测试环境验证修复
+2. 使用真实流量回放测试
+3. 灰度发布新规则
+4. 监控 24 小时内告警情况
+
+**复盘与改进**
+
+- 分析为什么测试阶段没有发现误报
+- 建立更完善的测试用例库
+- 改进发布流程，增加灰度验证步骤
+
+</details>
+
+**问题 2**：如何设计一个 WAF 规则测试框架，在规则发布前自动检测潜在的绕过方法和误报场景？
+
+<details>
+<summary>参考答案</summary>
+
+WAF 规则测试框架应该包括以下模块：
+
+**模块一：攻击载荷库**
+
+```yaml
+# bypass_attempts.yaml
+sql_injection_bypass:
+  - name: "url_encoding"
+    payloads:
+      - "' OR '1'='1"
+      - "%27%20OR%20%271%27%3D%271"
+      - "%2527%2520OR%2520%25271%2527%253D%25271"
+      
+  - name: "case_mutation"
+    payloads:
+      - "uNiOn sElEcT"
+      - "UN/**/ION SEL/**/ECT"
+      
+  - name: "null_byte"
+    payloads:
+      - "admin'%00"
+      - "admin'\u0000"
+```
+
+**模块二：正常请求库**
+
+```yaml
+# legitimate_requests.yaml
+search_functionality:
+  - name: "product_search"
+    request:
+      method: GET
+      path: "/api/search"
+      params:
+        q: "men's shirts"  # 包含引号的合法请求
+        category: "children's books"
+        
+  - name: "user_profile"
+    request:
+      method: POST
+      path: "/api/users"
+      body:
+        name: "O'Brien"
+        bio: "He said 'hello'"
+```
+
+**模块三：自动化测试执行**
+
+```java
+public class WafRuleTester {
+    public TestReport testRule(WafRule rule) {
+        TestReport report = new TestReport();
+        
+        // 测试 1：验证规则能阻止已知攻击
+        for (BypassPayload payload : bypassPayloads) {
+            boolean blocked = waf.testRequest(payload);
+            if (!blocked) {
+                report.addFailure("Bypass found: " + payload);
+            }
+        }
+        
+        // 测试 2：验证规则不会误报正常请求
+        for (LegitimateRequest request : legitimateRequests) {
+            boolean blocked = waf.testRequest(request);
+            if (blocked) {
+                report.addFalsePositive("False positive: " + request);
+            }
+        }
+        
+        return report;
+    }
+}
+```
+
+**模块四：模糊测试**
+
+```java
+public class WafFuzzer {
+    public List<String> generateMutations(String input) {
+        List<String> mutations = new ArrayList<>();
+        
+        // 编码变异
+        mutations.add(urlEncode(input));
+        mutations.add(doubleUrlEncode(input));
+        mutations.add(unicodeEncode(input));
+        
+        // 空格变异
+        mutations.add(replaceSpacesWithTabs(input));
+        mutations.add(replaceSpacesWithComments(input));
+        
+        // 大小写变异
+        if (looksLikeSql(input)) {
+            mutations.add(toMixedCase(input));
+        }
+        
+        // 组合变异
+        for (String m1 : mutations) {
+            for (String m2 : mutations) {
+                mutations.add(m1 + m2);
+            }
+        }
+        
+        return mutations;
+    }
+}
+```
+
+**CI/CD 集成**
+
+```yaml
+# .github/workflows/waf-test.yml
+name: WAF Rule Test
+on:
+  pull_request:
+    paths:
+      - 'waf-rules/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run WAF Tests
+        run: |
+          mvn test -Dwaf.test.rule=${{ github.event.path }}
+      - name: Report
+        if: failure()
+        run: echo "WAF rules have bypass or false positive issues"
+```
+
+</details>

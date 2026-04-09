@@ -1,0 +1,374 @@
+---
+title: Kube-bench 合规检查
+description: 深入解析 kube-bench 的使用方法、CIS Kubernetes Benchmark 检查项解读、常见失败项修复，以及 CI/CD 集成。
+---
+
+某公司通过了 SOC 2 Type II 认证，其中一项要求是证明 Kubernetes 集群符合 CIS（CIS Center for Internet Security）安全基准。他们手动检查了各项配置，花费了两周时间，报告提交后审计员发现检查不够全面。
+
+**手动检查 CIS 合规既耗时又不准确**。kube-bench 是 CIS 官方提供的自动化检查工具，能够全面评估 Kubernetes 配置与 CIS 基准的符合程度。
+
+## kube-bench 的作用
+
+kube-bench 是一个开源工具，用于检查 Kubernetes 是否符合 CIS Kubernetes Benchmark。
+
+**核心价值**：
+
+- 自动化 CIS 合规检查
+- 生成标准化的合规报告
+- 支持 CI/CD 流水线集成
+- 提供修复建议
+
+## kube-bench 的使用方法
+
+### 基本用法
+
+```bash title="使用 Docker 运行 kube-bench"
+# 运行所有检查
+docker run --rm -v $(pwd):/host aquasec/kube-bench:latest run
+
+# 运行特定版本的检查
+docker run --rm -v $(pwd):/host aquasec/kube-bench:latest run --version 1.7
+
+# 输出 JSON 格式
+docker run --rm -v $(pwd):/host aquasec/kube-bench:latest run --json
+```
+
+### 在 Kubernetes 中运行
+
+```yaml title="Kubernetes Job 方式运行"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-bench
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      hostPID: true
+      containers:
+        - name: kube-bench
+          image: aquasec/kube-bench:latest
+          command: ["kube-bench", "run"]
+          securityContext:
+            privileged: true
+      restartPolicy: Never
+  backoffLimit: 1
+```
+
+### 本地安装运行
+
+```bash title="本地安装"
+# 下载二进制
+curl -L https://github.com/aquasec/kube-bench/releases/download/v0.9.0/kube-bench_0.9.0_linux_amd64.tar.gz -o kube-bench.tar.gz
+tar -xzf kube-bench.tar.gz
+chmod +x kube-bench
+
+# 运行检查
+./kube-bench run
+```
+
+## 检查项解读
+
+### Master 组件检查
+
+Master 组件包括 API Server、etcd、Controller Manager、Scheduler。
+
+#### API Server 检查
+
+| ID | 检查项 | 风险 | 状态 |
+| --- | --- | --- | --- |
+| 1.1.1 | API Server 对匿名认证 | 高 | FAIL |
+| 1.1.2 | API Server 授权模式 | 高 | PASS |
+| 1.1.3 | API Server 证书过期时间 | 中 | PASS |
+| 1.1.4 | API Server 审计日志启用 | 高 | FAIL |
+| 1.1.5 | 事件操作审计 | 高 | FAIL |
+
+**常见失败项修复**：
+
+```bash title="修复匿名认证"
+# 在 API Server 配置中添加
+--anonymous-auth=false
+
+# 检查当前配置
+grep -i anonymous-auth /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+```yaml title="启用审计日志"
+apiVersion: audit.k8s.io/v1
+kind: AuditPolicy
+rules:
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["pods"]
+```
+
+#### etcd 检查
+
+| ID | 检查项 | 风险 |
+| --- | --- | --- |
+| 1.2.1 | etcd 数据目录权限 | 高 |
+| 1.2.2 | etcd 客户端认证 | 高 |
+| 1.2.3 | etcd 证书验证 | 高 |
+| 1.2.4 | etcd 加密 | 高 |
+
+**常见失败项修复**：
+
+```bash title="设置 etcd 目录权限"
+chmod 700 /var/lib/etcd
+chown etcd:etcd /var/lib/etcd
+```
+
+#### Controller Manager 检查
+
+| ID | 检查项 | 风险 |
+| --- | --- | --- |
+| 1.3.1 | Controller Manager 终止令牌 | 中 |
+| 1.3.2 | Controller Manager 绑定地址 | 中 |
+| 1.3.3 | Controller Manager 旋转证书 | 中 |
+
+**常见失败项修复**：
+
+```bash title="修复 Controller Manager 配置"
+# 添加配置
+--feature-gates=RotateKubeletServerCert=true
+--experimental-encryption-provider-config=/etc/kubernetes/policies/encryption-config.yaml
+```
+
+### Node 组件检查
+
+#### Kubelet 检查
+
+| ID | 检查项 | 风险 |
+| --- | --- | --- |
+| 4.1.1 | Kubelet 配置文件权限 | 高 |
+| 4.1.2 | Kubelet 配置文件所有者 | 高 |
+| 4.2.1 | Kubelet 匿名认证 | 高 |
+| 4.2.2 | Kubelet 授权模式 | 高 |
+| 4.2.3 | Kubelet 客户端证书轮转 | 中 |
+| 4.2.4 | Kubelet 端口绑定限制 | 中 |
+
+**常见失败项修复**：
+
+```yaml title="Kubelet 配置修复"
+# /var/lib/kubelet/config.yaml
+authentication:
+  anonymous:
+    enabled: false
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook
+```
+
+### 策略检查
+
+| ID | 检查项 | 风险 |
+| --- | --- | --- |
+| 5.1.1 | PSP 是否存在 | 高 |
+| 5.1.2 | Service Account 限制 | 中 |
+| 5.1.3 | 默认 ServiceAccount 使用限制 | 中 |
+| 5.2.1 | 网络策略是否存在 | 中 |
+| 5.2.2 | 强制只读根文件系统 | 中 |
+| 5.2.3 | 容器 Capabilities 限制 | 中 |
+
+## 常见失败项与修复建议
+
+### 高风险失败项
+
+```bash title="高风险失败项汇总"
+# 1. 匿名认证
+--anonymous-auth=false
+
+# 2. API Server 授权模式
+--authorization-mode=RBAC
+
+# 3. etcd 加密
+--encryption-provider-config=/etc/kubernetes/policies/encryption-config.yaml
+
+# 4. Kubelet 只读端口禁用
+--read-only-port=0
+```
+
+### 中风险失败项
+
+```bash title="中风险失败项汇总"
+# 1. 服务账号令牌挂载限制
+automountServiceAccountToken: false
+
+# 2. 默认命名空间限制
+limit deny from anywhere to pods -n default
+
+# 3. 容器资源限制
+resources:
+  limits:
+    memory: "128Mi"
+    cpu: "500m"
+  requests:
+    memory: "64Mi"
+    cpu: "250m"
+```
+
+### kube-harden 脚本
+
+```bash title="kube-harden 加固脚本"
+#!/bin/bash
+# kube-harden.sh
+
+echo "应用 CIS Kubernetes 基准加固..."
+
+# 1. API Server 加固
+cat > /etc/kubernetes/manifests/kube-apiserver.yaml <<EOF
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: kube-apiserver
+      command:
+        - kube-apiserver
+        - --anonymous-auth=false
+        - --authorization-mode=RBAC
+        - --audit-log-path=/var/log/kubernetes/audit.log
+        - --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+        - --encryption-provider-config=/etc/kubernetes/encryption-config.yaml
+EOF
+
+# 2. Kubelet 加固
+cat > /var/lib/kubelet/config.yaml <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  anonymous:
+    enabled: false
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook
+EOF
+
+echo "加固完成"
+```
+
+## kube-bench 的 CI/CD 集成
+
+### GitHub Actions
+
+```yaml title="GitHub Actions 集成"
+name: CIS Compliance Check
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * 0'  # 每周日凌晨
+
+jobs:
+  kube-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Run kube-bench
+        uses: aquasec/kube-bench-action@v2
+        with:
+          version: "1.7"
+          targetVersion: "1.7"
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kube-bench-report
+          path: report.json
+```
+
+### GitLab CI
+
+```yaml title="GitLab CI 集成"
+kube-bench:
+  stage: security
+  image: aquasec/kube-bench:latest
+  script:
+    - kube-bench run --json > report.json
+    - kube-bench upload --server https://your-grafana.com/api
+  artifacts:
+    reports:
+      json: report.json
+  only:
+    - main
+    - schedules
+```
+
+## 报告解读与优先级排序
+
+### 输出格式
+
+```json title="kube-bench 输出示例"
+{
+  "Controls": [
+    {
+      "ID": "1.1",
+      "Name": "Master Node Security Configuration",
+      "Tests": [
+        {
+          "ID": "1.1.1",
+          "Text": "Ensure that the --anonymous-auth argument is set to false",
+          "Status": "FAIL",
+          "Results": [
+            {
+              "Status": "FAIL",
+              "Test": "Ensure that the --anonymous-auth argument is set to false",
+              "Remediation": "Edit the API Server pod specification and set the below parameter."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 优先级排序
+
+| 优先级 | 类别 | 建议响应时间 |
+| --- | --- | --- |
+| Critical | 匿名认证、etcd 加密 | 立即修复 |
+| High | RBAC 授权、审计日志 | 24 小时内 |
+| Medium | 证书轮转、网络策略 | 1 周内 |
+| Low | 日志配置、非必须端口 | 1 个月内 |
+
+:::tip 持续合规建议
+建议将 kube-bench 集成到 CI/CD 流水线中，每周自动运行检查，持续监控合规状态。发现失败项后，及时修复并重新验证。
+:::
+
+## 总结与延伸思考
+
+kube-bench 是 Kubernetes CIS 合规检查的标准工具。通过自动化检查，可以快速发现配置不符合 CIS 基准的问题。
+
+关键实践：
+
+1. **从高风险失败项开始**：优先修复匿名认证、etcd 加密等高风险项
+2. **持续监控**：将 kube-bench 集成到 CI/CD，每周运行检查
+3. **文档化修复**：记录每个失败项的修复过程，便于审计
+
+注意：kube-bench 检查的是 CIS Kubernetes Benchmark，不是所有安全配置。完整的安全评估需要结合其他工具。
+
+### 思考题
+
+**问题 1**：为什么 kube-bench 检查通过不等于集群完全安全？
+<details>
+<summary>参考答案</summary>
+
+CIS Benchmark 定义的是最佳安全实践的子集，不是全部安全要求。kube-bench 通过只说明配置符合 CIS 基准，但不包括：1）应用层安全（如 SQL 注入）；2）网络层威胁（如恶意流量）；3）运行时攻击（如容器逃逸）；4）供应链安全（如镜像漏洞）。需要结合其他安全工具（CWPP、运行时监控等）实现全面安全。
+</details>
+
+**问题 2**：如何处理 kube-bench 中的「例外」情况（如业务确实需要某些配置）？
+<details>
+<summary>参考答案</summary>
+
+对于业务确实需要的配置，可以采用以下方式处理：1）记录例外：在安全文档中记录例外项，说明业务原因和缓解措施；2）缩小范围：尽可能收紧例外范围，如只在特定命名空间允许；3）额外监控：为例外项配置额外的监控和告警；4）定期审查：定期重新评估例外是否仍然必要；5）补偿控制：对于无法修复的问题，实施补偿控制（如额外的网络隔离）。
+</details>

@@ -1,0 +1,362 @@
+---
+title: JWT 签名与加密
+description: 深入解析 JWT 签名算法（HS/RS/ES 系列）与加密方案（JWE），涵盖 JWS 与 JWE 的区别、密钥管理策略以及各算法的适用场景。
+---
+
+2017 年，Auth0 披露了一个严重漏洞：攻击者利用 JWT 库对 `alg` 字段验证不严的缺陷，将算法从 RS256（公钥验证）改为 HS256（私钥验证），并使用公钥作为对称密钥伪造签名，成功绕过了大量使用 Auth0 的应用的身份验证。这一事件让「JWT 安全」这个话题从幕后走到台前。
+
+签名算法选错、密钥管理不当，加密缺失——这些问题在生产环境中比你想象的更常见。
+
+## 一、签名算法体系
+
+JWT 的签名算法分为三大类：
+
+### 1. 对称算法（HMAC）
+
+HMAC 系列使用同一个密钥进行签名和验证，速度快，适合单服务或信任网络内通信。
+
+| 算法 | 密钥长度 | 输出 |
+|---|---|---|
+| HS256 | 至少 256 位（32 字节） | HMAC-SHA256 |
+| HS384 | 至少 384 位（48 字节） | HMAC-SHA384 |
+| HS512 | 至少 512 位（64 字节） | HMAC-SHA512 |
+
+```java title="HmacJwtExample.java"
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.util.Base64;
+
+public class HmacJwtExample {
+
+    private static final String HS256 = "HmacSHA256";
+
+    public static String createHmacJwt(String header, String payload, String secret) throws Exception {
+        String signatureInput = header + "." + payload;
+
+        Mac mac = Mac.getInstance(HS256);
+        SecretKeySpec secretKey = new SecretKeySpec(secret.getBytes(), HS256);
+        mac.init(secretKey);
+
+        byte[] signatureBytes = mac.doFinal(signatureInput.getBytes());
+        String signature = Base64.getUrlEncoder().withoutPadding().encodeToString(signatureBytes);
+
+        return signatureInput + "." + signature;
+    }
+
+    public static boolean verifyHmacJwt(String token, String secret) throws Exception {
+        String[] parts = token.split("\\.");
+        String signatureInput = parts[0] + "." + parts[1];
+        String receivedSignature = parts[2];
+
+        Mac mac = Mac.getInstance(HS256);
+        SecretKeySpec secretKey = new SecretKeySpec(secret.getBytes(), HS256);
+        mac.init(secretKey);
+
+        byte[] expectedBytes = mac.doFinal(signatureInput.getBytes());
+        String expectedSignature = Base64.getUrlEncoder().withoutPadding().encodeToString(expectedBytes);
+
+        // 使用恒定时间比较防止时序攻击
+        return constantTimeEquals(expectedSignature, receivedSignature);
+    }
+
+    private static boolean constantTimeEquals(String a, String b) {
+        if (a.length() != b.length()) return false;
+        int result = 0;
+        for (int i = 0; i < a.length(); i++) {
+            result |= a.charAt(i) ^ b.charAt(i);
+        }
+        return result == 0;
+    }
+}
+```
+
+**HS256 的核心问题**：密钥需要在所有验证方之间共享。如果服务 A 泄露了密钥，攻击者可以用它伪造任何 Token，服务 B 也会接受。
+
+### 2. 非对称算法（RSA）
+
+RSA 系列使用公钥验证、私钥签名，适合跨服务或开放环境。
+
+| 算法 | 密钥长度 | 说明 |
+|---|---|---|
+| RS256 | 2048+ 位 | RSA + SHA-256 |
+| RS384 | 2048+ 位 | RSA + SHA-384 |
+| RS512 | 4096+ 位 | RSA + SHA-512 |
+
+```java title="RsaJwtExample.java"
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
+
+public class RsaJwtExample {
+
+    public static String signWithRsa(String header, String payload, PrivateKey privateKey) throws Exception {
+        String signatureInput = header + "." + payload;
+
+        Signature signer = Signature.getInstance("SHA256withRSA");
+        signer.initSign(privateKey);
+        signer.update(signatureInput.getBytes());
+
+        byte[] signatureBytes = signer.sign();
+        return signatureInput + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(signatureBytes);
+    }
+
+    public static boolean verifyWithRsa(String token, PublicKey publicKey) throws Exception {
+        String[] parts = token.split("\\.");
+        String signatureInput = parts[0] + "." + parts[1];
+        String receivedSignature = parts[2];
+
+        Signature verifier = Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(publicKey);
+        verifier.update(signatureInput.getBytes());
+
+        byte[] signatureBytes = Base64.getUrlDecoder().decode(receivedSignature);
+        return verifier.verify(signatureBytes);
+    }
+}
+```
+
+**RS256 的优势**：签名私钥仅在签发方保管，验证方只需持有公钥。服务 A 泄露私钥不会影响服务 B 的验证。
+
+### 3. 椭圆曲线算法（ECDSA）
+
+ES 系列使用椭圆曲线密码学，相比 RSA 密钥更短、性能更好、安全强度相当。
+
+| 算法 | 曲线 | 说明 |
+|---|---|---|
+| ES256 | P-256 | 256 位安全 |
+| ES384 | P-384 | 384 位安全 |
+| ES512 | P-521 | 521 位安全 |
+
+```java title="EcdsaJwtExample.java"
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.Signature;
+
+public class EcdsaJwtExample {
+
+    public static String signWithEcdsa(String header, String payload, PrivateKey privateKey) throws Exception {
+        String signatureInput = header + "." + payload;
+
+        Signature signer = Signature.getInstance("SHA256withECDSA");
+        signer.initSign(privateKey);
+        signer.update(signatureInput.getBytes());
+
+        byte[] signatureBytes = signer.sign();
+        return signatureInput + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(signatureBytes);
+    }
+
+    public static boolean verifyWithEcdsa(String token, PublicKey publicKey) throws Exception {
+        String[] parts = token.split("\\.");
+        String signatureInput = parts[0] + "." + parts[1];
+        String receivedSignature = parts[2];
+
+        Signature verifier = Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(publicKey);
+        verifier.update(signatureInput.getBytes());
+
+        byte[] signatureBytes = Base64.getUrlDecoder().decode(receivedSignature);
+        return verifier.verify(signatureBytes);
+    }
+}
+```
+
+## 二、JWS 与 JWE
+
+### JWS（JSON Web Signature）
+
+JWS 是带签名的 JWT，解决的是「消息完整性」和「身份认证」问题：
+
+```
+Header.Payload.Signature
+```
+
+标准 JWS 的 `alg` 值包括：`HS256`、`HS384`、`HS512`、`RS256`、`RS384`、`RS512`、`ES256`、`ES384`、`ES512`、`PS256`、`PS384`、`PS512`、`none`。
+
+### JWE（JSON Web Encryption）
+
+JWE 是加密的 JWT，解决的是「保密性」问题。即使 Token 被截获，攻击者也无法读取内容：
+
+```
+EncryptedKey.IV.Ciphertext.Tag
+```
+
+JWE 结构分为五部分，使用 `alg` 声明密钥加密算法，使用 `enc` 声明内容加密算法：
+
+```json
+{
+  "alg": "RSA-OAEP-256",
+  "enc": "A256-GCM"
+}
+```
+
+**典型场景**：Token 中包含敏感信息（如用户薪资、医疗记录）时，使用 JWE 加密 Payload。
+
+### 签名与加密的组合
+
+| 方案 | 适用场景 | 安全性 |
+|---|---|---|
+| JWS only | 内部服务间认证 | 防止篡改，但不保密 |
+| JWE only | 传输敏感数据 | 保密，但不验证来源 |
+| Sign then Encrypt | 高安全要求 | 先签名验证身份，再加密保护内容 |
+| Encrypt then Sign | 可选 | 先加密，再签名防止密文篡改 |
+
+推荐使用 **Sign then Encrypt**（先签名后加密），因为验证方可以先确认签名者身份，再决定是否解密。
+
+## 三、密钥管理策略
+
+### 密钥分层
+
+不要所有服务共用同一密钥。推荐按用途分层：
+
+```
+根密钥（Root Key）
+  └── 派生密钥（Derived Keys）
+        ├── 签发密钥（Signing Keys）
+        ├── 验证密钥（Verification Keys）
+        └── 加密密钥（Encryption Keys）
+```
+
+### 密钥轮转
+
+定期轮转密钥是必须的。常见策略：
+
+**策略一：双密钥版本**。在验证时同时接受新旧两个密钥的签名。新 Token 使用新密钥签发，旧 Token 在验证时仍能用旧密钥验证，直到过期。
+
+```java title="MultiKeyVerification.java"
+public class MultiKeyVerifier {
+    private final Map<String, PublicKey> validKeys = new HashMap<>();
+
+    public MultiKeyVerifier() {
+        // 加载当前有效密钥
+        validKeys.put("v1", loadPublicKey("v1"));
+        validKeys.put("v2", loadPublicKey("v2"));
+    }
+
+    public boolean verify(String token) {
+        String[] parts = token.split("\\.");
+        String kid = extractKid(parts[0]); // 从 Header 获取密钥 ID
+
+        PublicKey key = validKeys.get(kid);
+        if (key == null) return false;
+
+        return verifySignature(token, key);
+    }
+}
+```
+
+**策略二：kid（Key ID）声明**。在 JWT Header 中包含 `kid`，验证方根据 `kid` 查找对应的密钥。
+
+```json
+{
+  "alg": "RS256",
+  "kid": "key-version-2024",
+  "typ": "JWT"
+}
+```
+
+### 密钥存储
+
+| 存储方式 | 适用场景 | 安全性 |
+|---|---|---|
+| 环境变量 | 开发/测试环境 | 低 |
+| 配置中心（Vault、Consul） | 生产环境 | 中 |
+| 云 KMS | 云原生环境 | 高 |
+| HSM（硬件安全模块） | 金融/高安全场景 | 最高 |
+
+## 四、算法选择决策矩阵
+
+| 场景 | 推荐算法 | 理由 |
+|---|---|---|
+| 微服务内部通信 | HS256 | 高性能，密钥可共享在信任网络 |
+| 跨服务认证（多租户） | RS256/ES256 | 签发方保管私钥，验证方只需公钥 |
+| API 开放平台 | RS256/ES256 | 避免客户端泄露对称密钥 |
+| 传输敏感数据 | RSA-OAEP + A256-GCM | JWE 加密，保护数据机密性 |
+| 移动端 + 后端 | ES256 | 密钥短，签名验签性能好 |
+| 金融/合规场景 | RS256/ES256 + HSM | 高安全等级要求 |
+
+## 五、常见安全陷阱
+
+**陷阱一：使用 `none` 算法**。某些库默认接受 `none` 算法，攻击者可以直接将 Header 改为 `{"alg":"none"}`，Payload 不签名或置空签名，从而伪造任意 Token。
+
+**陷阱二：只验证签名，不验证其他 Claims**。即使签名正确，也要验证 `exp`、`nbf`、`aud` 等 Claims，防止重放攻击和过期 Token。
+
+**陷阱三：硬编码密钥**。密钥不应该写在代码里。生产环境必须使用密钥管理服务。
+
+**陷阱四：混淆签名与加密**。签名不等于加密，Payload 的 Base64 内容可被直接解码查看。
+
+---
+
+## 思考题
+
+**问题 1**：某系统使用 HS256 签名，现在需要从单服务扩展为多服务架构，应该如何迁移到非对称签名？
+
+<details>
+<summary>参考答案</summary>
+
+迁移方案分为以下步骤：
+
+1. **生成密钥对**：在认证服务生成 RSA 或 ECDSA 密钥对。
+
+2. **双轨并行**：在过渡期内，验证逻辑同时接受 HS256 和 RS256/ES256 签名的 Token。
+
+3. **分发公钥**：将公钥配置到各资源服务器，可以使用 JWKS（JSON Web Key Set）端点统一分发。
+
+4. **逐步切换**：逐步更新各服务，只接受 RS256/ES256，废弃 HS256。
+
+5. **完全迁移**：确认所有服务都已切换后，删除 HS256 密钥。
+
+```json title="JWKS 端点响应示例"
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "kid": "2024-key",
+      "crv": "P-256",
+      "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+      "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+      "use": "sig",
+      "alg": "ES256"
+    }
+  ]
+}
+```
+
+</details>
+
+**问题 2**：如果需要验证 Token 是否在某个时间点之前被签发（防止回溯攻击），JWT 的哪个 Claim 可以实现这个需求？验证时需要注意什么？
+
+<details>
+<summary>参考答案</summary>
+
+可以使用 **`nbf`（Not Before）** Claim。它声明 Token 在指定时间之前不应被接受。
+
+验证逻辑：
+
+```java
+if (nbfClaim != null) {
+    Date notBefore = nbfClaim.asDate();
+    Date currentTime = new Date();
+
+    // 需要留有一定的时钟偏差容限（通常 30-60 秒）
+    long clockSkewSeconds = 30;
+    Date adjustedTime = new Date(currentTime.getTime() - clockSkewSeconds * 1000);
+
+    if (adjustedTime.before(notBefore)) {
+        throw new JwtException("Token not yet valid");
+    }
+}
+```
+
+**注意事项**：
+
+1. **时钟偏差**：必须留有一定的容限时间，防止各服务器时钟不同步导致的误判。
+
+2. **与 `exp` 的关系**：`nbf` 通常小于等于 `exp`。
+
+3. **配合重放保护**：`nbf` 只能防止「签发时间」回溯，配合 `jti` 和数据库记录才能防止完整的重放攻击。
+
+</details>

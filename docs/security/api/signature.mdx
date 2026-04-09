@@ -1,0 +1,800 @@
+---
+title: 签名机制设计
+description: 请求签名的必要性、HMAC与RSA签名方案、签名内容构造、密钥管理策略、签名与TLS的关系。
+---
+
+HTTP 请求在传输过程中可能被截获、篡改、重放。即使使用了 HTTPS 加密，客户端和服务器之间的某些中间节点仍可能记录日志，或者在某些场景下 HTTPS 并不能完全保护请求内容。
+
+签名机制是 API 安全的另一道防线。它确保：
+
+1. **防篡改**：请求内容一旦被修改，签名验证失败
+2. **防伪造**：只有持有正确密钥的客户端才能生成有效签名
+3. **防重放**：结合时间戳和 Nonce，同一个请求不能被重复发送
+
+签名机制不是 HTTPS 的替代品，而是 HTTPS 的补充。HTTPS 保护传输层，签名保护应用层。
+
+## 签名方案的必要性
+
+### HTTPS 的局限性
+
+HTTPS 提供了传输层加密，但存在以下局限：
+
+1. **客户端证书验证不完整**：很多 API 服务只验证服务端证书，不验证客户端证书。这意味着任何持有正确域名的证书的主体，都可以「伪装」成服务端。
+
+2. **TLS 卸载点之后**：请求经过负载均衡、API 网关、WAF 等组件时，可能会被解密后重新加密，这些节点可以看到明文请求。
+
+3. **日志泄露**：请求经过的每一个节点都可能记录日志，包括 URL、Header、Body。
+
+4. **业务层签名**：HTTPS 只保护传输层，签名可以延伸到应用层，确保即使请求被合法解密（如网关），其内容也没有被篡改。
+
+### 签名 vs HTTPS
+
+| 维度 | HTTPS | 请求签名 |
+| --- | --- | --- |
+| **保护层次** | 传输层 | 应用层 |
+| **防篡改** | 部分（中间人攻击仍可能） | 完全（签名内容不可篡改） |
+| **防伪造** | 无 | 完全 |
+| **防重放** | 无 | 完全（结合 Timestamp/Nonce） |
+| **性能开销** | TLS 握手开销 | 签名计算开销 |
+| **适用场景** | 所有 HTTP 通信 | 高安全要求场景 |
+
+## 签名方案的设计要素
+
+一个完整的签名方案需要考虑以下要素：
+
+### 1. 签名内容
+
+签名应该覆盖请求中所有可能被篡改的部分：
+
+```http
+# 签名内容通常包括
+StringToSign = HTTP_METHOD + "\n" +
+               REQUEST_URI + "\n" +
+               TIMESTAMP + "\n" +
+               NONCE + "\n" +
+               CONTENT_HASH
+```
+
+| 要素 | 说明 | 防篡改范围 |
+| --- | --- | --- |
+| HTTP Method | GET/POST/PUT/DELETE | 防止方法被修改 |
+| Request URI | 路径和查询参数 | 防止 URL 被修改 |
+| Timestamp | 时间戳 | 防止重放 |
+| Nonce | 随机数 | 防止重放 |
+| Content Hash | 请求体哈希 | 防止 Body 被修改 |
+
+### 2. 签名算法
+
+```mermaid
+flowchart LR
+    subgraph 签名算法选择
+        HMAC[HMAC 签名] --> |共享密钥| HMAC_Scenarios[对称加密场景]
+        RSA[RSA 签名] --> |公私钥对| RSA_Scenarios[需要验证签名者身份]
+        ECDSA[ECDSA 签名] --> |椭圆曲线| ECDSA_Scenarios[高性能场景]
+    end
+```
+
+| 算法 | 密钥类型 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| HMAC-SHA256 | 对称密钥 | 计算快、实现简单 | 密钥分发困难 | 服务端间通信 |
+| RSA-SHA256 | 非对称密钥对 | 密钥分发简单 | 计算慢 | 开放平台 |
+| ECDSA | 椭圆曲线 | 性能高、安全性强 | 实现复杂 | 移动端/IoT |
+
+### 3. 密钥管理
+
+签名密钥的安全管理是签名方案的核心：
+
+- **存储安全**：密钥必须加密存储或使用 HSM
+- **传输安全**：密钥分发必须通过安全通道
+- **轮转机制**：定期轮转密钥，支持平滑过渡
+- **撤销机制**：密钥泄露后能快速撤销
+
+## HMAC 签名方案
+
+HMAC（Hash-based Message Authentication Code）是最常用的签名算法，使用对称密钥。
+
+### HMAC 签名原理
+
+```mermaid
+flowchart TD
+    subgraph 签名过程
+        Content[签名内容] --> Hash1["HMAC-SHA256(Content, Key)"]
+        Key1[共享密钥] --> Hash1
+        Hash1 --> Signature[签名值]
+    end
+    
+    subgraph 验证过程
+        Signature2[签名值] --> Compare
+        Content2[签名内容] --> Hash2["HMAC-SHA256(Content2, Key)"]
+        Key2[共享密钥] --> Hash2
+        Hash2 --> Compare{签名相等?}
+        Compare -->|是| Valid[验证通过]
+        Compare -->|否| Invalid[验证失败]
+    end
+```
+
+### HMAC 签名实现
+
+```java title="HmacSignatureService.java"
+public class HmacSignatureService {
+    
+    private static final String ALGORITHM = "HmacSHA256";
+    private static final Charset UTF_8 = StandardCharsets.UTF_8;
+    
+    private final SecretKey secretKey;
+    
+    public HmacSignatureService(String secret) {
+        byte[] keyBytes = Base64.getDecoder().decode(secret);
+        this.secretKey = new SecretKeySpec(keyBytes, ALGORITHM);
+    }
+    
+    public String sign(String content) {
+        try {
+            Mac mac = Mac.getInstance(ALGORITHM);
+            mac.init(secretKey);
+            byte[] signatureBytes = mac.doFinal(content.getBytes(UTF_8));
+            return Base64.getEncoder().encodeToString(signatureBytes);
+        } catch (NoSuchAlgorithmException | InvalidKeyException e) {
+            throw new SignatureException("Failed to generate signature", e);
+        }
+    }
+    
+    public boolean verify(String content, String signature) {
+        String expectedSignature = sign(content);
+        // 使用恒定时间比较
+        return MessageDigest.isEqual(
+            expectedSignature.getBytes(UTF_8),
+            signature.getBytes(UTF_8)
+        );
+    }
+}
+```
+
+### HMAC 签名内容构造
+
+```java title="SignatureContentBuilder.java"
+public class SignatureContentBuilder {
+    
+    public String build(RequestContext context) {
+        List<String> parts = new ArrayList<>();
+        
+        // 1. HTTP Method
+        parts.add(context.getMethod());
+        
+        // 2. Request Path（不含查询参数）
+        parts.add(context.getPath());
+        
+        // 3. 时间戳
+        parts.add(String.valueOf(context.getTimestamp()));
+        
+        // 4. Nonce
+        parts.add(context.getNonce());
+        
+        // 5. 请求体哈希（如果有）
+        if (context.getBody() != null && !context.getBody().isEmpty()) {
+            parts.add(hashBody(context.getBody()));
+        }
+        
+        // 按约定顺序用换行符连接
+        return String.join("\n", parts);
+    }
+    
+    private String hashBody(String body) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(body.getBytes(UTF_8));
+            return Base64.getEncoder().encodeToString(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new SignatureException("SHA-256 not available", e);
+        }
+    }
+}
+```
+
+### 完整的签名验证流程
+
+```java title="SignatureValidationFilter.java"
+public class SignatureValidationFilter {
+    
+    private final HmacSignatureService signatureService;
+    private final TimestampValidator timestampValidator;
+    private final NonceValidator nonceValidator;
+    
+    public ValidationResult validate(HttpRequest request, String signature) {
+        // 1. 提取签名要素
+        String method = request.getMethod();
+        String path = request.getPath();
+        long timestamp = Long.parseLong(request.getHeader("X-Timestamp"));
+        String nonce = request.getHeader("X-Nonce");
+        String body = request.getBody();
+        
+        // 2. 验证时间戳
+        ValidationResult timestampResult = timestampValidator.validate(timestamp);
+        if (!timestampResult.isAccepted()) {
+            return timestampResult;
+        }
+        
+        // 3. 验证 Nonce
+        String nonceKey = buildNonceKey(request);
+        ValidationResult nonceResult = nonceValidator.validate(nonceKey, nonce);
+        if (!nonceResult.isAccepted()) {
+            return nonceResult;
+        }
+        
+        // 4. 构造签名内容
+        String content = SignatureContentBuilder.builder()
+            .method(method)
+            .path(path)
+            .timestamp(timestamp)
+            .nonce(nonce)
+            .body(body)
+            .build();
+        
+        // 5. 验证签名
+        if (!signatureService.verify(content, signature)) {
+            nonceValidator.rollback(nonceKey, nonce); // 回滚 Nonce
+            return ValidationResult.rejected("Signature mismatch");
+        }
+        
+        return ValidationResult.accepted();
+    }
+    
+    private String buildNonceKey(HttpRequest request) {
+        return String.format("%s:%s:%s",
+            request.getHeader("X-Client-Id"),
+            request.getPath(),
+            nonce);
+    }
+}
+```
+
+## RSA 签名方案
+
+RSA 签名使用非对称密钥，签名者使用私钥签名，验证者使用公钥验证。适用于开放平台等需要验证签名者身份的场景。
+
+### RSA 签名原理
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    
+    Note over Client: 持有私钥
+    Client->>Client: 用私钥对签名内容加密<br/>= 生成签名
+    
+    Client->>Server: 发送：签名内容 + 签名值
+    Note over Server: 持有公钥
+    Server->>Server: 用公钥解密签名值<br/>= 得到签名内容原文
+    
+    Server->>Server: 比较解密结果与实际内容
+    Server-->>Client: 匹配 ✓ / 不匹配 ✗
+```
+
+### RSA 签名实现
+
+```java title="RsaSignatureService.java"
+public class RsaSignatureService {
+    
+    private static final String ALGORITHM = "SHA256withRSA";
+    private static final Charset UTF_8 = StandardCharsets.UTF_8;
+    
+    private final PrivateKey privateKey;
+    private final PublicKey publicKey;
+    
+    public RsaSignatureService(String privateKeyPem, String publicKeyPem) {
+        this.privateKey = parsePrivateKey(privateKeyPem);
+        this.publicKey = parsePublicKey(publicKeyPem);
+    }
+    
+    public String sign(String content) {
+        try {
+            Signature signature = Signature.getInstance(ALGORITHM);
+            signature.initSign(privateKey);
+            signature.update(content.getBytes(UTF_8));
+            byte[] signatureBytes = signature.sign();
+            return Base64.getEncoder().encodeToString(signatureBytes);
+        } catch (Exception e) {
+            throw new SignatureException("Failed to sign", e);
+        }
+    }
+    
+    public boolean verify(String content, String signatureBase64) {
+        try {
+            Signature signature = Signature.getInstance(ALGORITHM);
+            signature.initVerify(publicKey);
+            signature.update(content.getBytes(UTF_8));
+            byte[] signatureBytes = Base64.getDecoder().decode(signatureBase64);
+            return signature.verify(signatureBytes);
+        } catch (Exception e) {
+            throw new SignatureException("Failed to verify signature", e);
+        }
+    }
+    
+    private PrivateKey parsePrivateKey(String pem) throws Exception {
+        String base64 = pem
+            .replace("-----BEGIN PRIVATE KEY-----", "")
+            .replace("-----END PRIVATE KEY-----", "")
+            .replaceAll("\\s", "");
+        
+        byte[] keyBytes = Base64.getDecoder().decode(base64);
+        PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(keyBytes);
+        KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+        return keyFactory.generatePrivate(keySpec);
+    }
+    
+    private PublicKey parsePublicKey(String pem) throws Exception {
+        String base64 = pem
+            .replace("-----BEGIN PUBLIC KEY-----", "")
+            .replace("-----END PUBLIC KEY-----", "")
+            .replaceAll("\\s", "");
+        
+        byte[] keyBytes = Base64.getDecoder().decode(base64);
+        X509EncodedKeySpec keySpec = new X509EncodedKeySpec(keyBytes);
+        KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+        return keyFactory.generatePublic(keySpec);
+    }
+}
+```
+
+### 签名请求的发送与验证
+
+```http
+# 客户端请求
+POST /api/v1/payment HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+X-Client-Id: client-123
+X-Timestamp: 1712563200
+X-Nonce: 3f2a8c9d-4e1b-4f5a-8c3d-9e2f1a3b4c5d
+X-Signature: RS256=cGF5b2FkX3Rlc3Q...
+
+{
+  "amount": 10000,
+  "currency": "CNY"
+}
+
+# 签名内容构造
+StringToSign = """POST
+/api/v1/payment
+1712563200
+3f2a8c9d-4e1b-4f5a-8c3d-9e2f1a3b4c5d
+{"amount":10000,"currency":"CNY"}"""
+
+Signature = Base64(RSA-SHA256(PrivateKey, StringToSign))
+```
+
+## 签名与 TLS 的关系
+
+签名不是 TLS 的替代品，而是补充：
+
+```mermaid
+flowchart TD
+    subgraph 传输层["传输层安全 (TLS)"]
+        TLS1[端到端加密]
+        TLS2[身份验证（证书）]
+        TLS3[完整性校验（MAC）]
+    end
+    
+    subgraph 应用层["应用层签名"]
+        Sign1[请求签名]
+        Sign2[响应签名]
+        Sign3[防重放（Timestamp + Nonce）]
+    end
+    
+    Client --> TLS1
+    TLS1 --> Server
+    Client --> Sign1
+    Sign1 --> Server
+    Server --> Sign2
+    Sign2 --> Client
+```
+
+| 场景 | TLS 足够 | 需要签名 |
+| --- | --- | --- |
+| 服务端到服务端 API（内网） | ✓ | 通常不需要 |
+| 服务端到服务端 API（公网） | ✓ | 推荐 |
+| 开放平台（面向第三方） | ✓ | 必须 |
+| 金融交易、支付 | ✓ | 必须 |
+| 需要验证请求者身份 | 部分 | ✓ |
+
+## 密钥管理策略
+
+签名密钥的安全管理是签名方案的核心。
+
+### 密钥存储
+
+```java title="SecureKeyStorage.java"
+public class SecureKeyStorage {
+    
+    private final String encryptionKeyRef;
+    
+    // 加密存储签名密钥
+    public void storeSigningKey(String clientId, String encryptedKey, 
+                               Map<String, String> metadata) {
+        // 使用信封加密
+        String encryptionKey = getOrCreateEncryptionKey();
+        
+        // 生成数据加密密钥（DEK）
+        String dek = generateDataEncryptionKey();
+        
+        // 用 DEK 加密签名密钥
+        String encryptedSigningKey = aesEncrypt(signingKey, dek);
+        
+        // 用主密钥（encryptionKey）加密 DEK
+        String encryptedDek = aesEncrypt(dek, encryptionKey);
+        
+        // 存储加密的 DEK 和签名密钥
+        store(clientId, encryptedSigningKey, encryptedDek, metadata);
+    }
+    
+    // 解密获取签名密钥
+    public SecretKey retrieveSigningKey(String clientId) {
+        EncryptedData data = load(clientId);
+        
+        String encryptionKey = getOrCreateEncryptionKey();
+        
+        // 解密 DEK
+        String dek = aesDecrypt(data.encryptedDek, encryptionKey);
+        
+        // 用 DEK 解密签名密钥
+        String signingKey = aesDecrypt(data.encryptedSigningKey, dek);
+        
+        return new SecretKeySpec(signingKey.getBytes(), "HmacSHA256");
+    }
+    
+    private String getOrCreateEncryptionKey() {
+        // 从 KMS 或 HSM 获取主密钥
+        return kmsClient.getKey(encryptionKeyRef);
+    }
+}
+```
+
+### 密钥轮转
+
+```java title="KeyRotationService.java"
+public class KeyRotationService {
+    
+    private final KeyStorage keyStorage;
+    private final Duration gracePeriod;
+    
+    // 创建新密钥版本
+    public KeyVersion createNewVersion(String clientId) {
+        String newKey = generateKey();
+        int newVersion = keyStorage.getLatestVersion(clientId) + 1;
+        
+        keyStorage.store(clientId, newKey, newVersion, "pending");
+        
+        return new KeyVersion(newKey, newVersion);
+    }
+    
+    // 激活新密钥
+    public void activateVersion(String clientId, int version) {
+        keyStorage.setActiveVersion(clientId, version);
+        
+        // 发送通知给客户端
+        notifyClient(clientId, "New signing key version available", version);
+    }
+    
+    // 验证时支持多版本
+    public boolean verifyWithAnyVersion(String content, String signature, 
+                                       String clientId) {
+        List<Integer> versions = keyStorage.getValidVersions(clientId);
+        
+        for (int version : versions) {
+            try {
+                SecretKey key = keyStorage.getKey(clientId, version);
+                if (verify(content, signature, key)) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+                // 当前版本验证失败，尝试其他版本
+            }
+        }
+        return false;
+    }
+    
+    // 撤销旧密钥
+    public void revokeVersion(String clientId, int version) {
+        keyStorage.setRevoked(clientId, version);
+    }
+}
+```
+
+### AWS KMS 集成示例
+
+```java title="KmsKeyService.java"
+public class KmsKeyService {
+    
+    private final AWSKMS kmsClient;
+    private final String keyId;
+    
+    public String sign(String content, String keyId) {
+        SignRequest request = SignRequest.builder()
+            .message(SdkBytes.fromUtf8String(content))
+            .messageType(MessageType.RAW)
+            .signingAlgorithm(SigningAlgorithmSpec.RSASSA_PKCS1_V1_5_SHA_256)
+            .keyId(keyId)
+            .build();
+        
+        SignResult result = kmsClient.sign(request);
+        return Base64.getEncoder().encodeToString(result.signature().asByteArray());
+    }
+    
+    public boolean verify(String content, String signature, String keyId) {
+        VerifyRequest request = VerifyRequest.builder()
+            .message(SdkBytes.fromUtf8String(content))
+            .signature(SdkBytes.fromUtf8String(Base64.getDecoder().decode(signature)))
+            .messageType(MessageType.RAW)
+            .signingAlgorithm(SigningAlgorithmSpec.RSASSA_PKCS1_V1_5_SHA_256)
+            .keyId(keyId)
+            .build();
+        
+        return kmsClient.verify(request).signatureValid();
+    }
+}
+```
+
+## 最佳实践清单
+
+:::tip 签名设计最佳实践
+- 签名内容包含所有可能被篡改的要素
+- 使用 HMAC-SHA256 或 RSA-SHA256 算法
+- 签名比较使用恒定时间函数
+- 签名密钥定期轮转
+- 密钥加密存储，不明文保存
+- 日志中不记录签名内容
+- 验证失败返回统一的错误信息
+- 监控签名验证失败率
+- 支持密钥多版本验证，平滑过渡
+:::
+
+## 思考题
+
+**问题 1**：为什么签名比较必须使用恒定时间比较？有哪些恒定时间比较的实现方式？
+
+<details>
+<summary>参考答案</summary>
+
+**时序攻击的原理**：
+
+普通的字符串比较（`equals`）会在第一个不匹配的字符处立即返回。这意味着：
+
+```java
+// 伪代码
+public boolean equals(String a, String b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+        if (a[i] != b[i]) return false; // 第一个不匹配立即返回
+    }
+    return true;
+}
+```
+
+如果签名有 32 字节，攻击者可以逐字节猜测：
+
+1. 猜测第一个字节，记录响应时间
+2. 如果响应时间略长（比较了第二个字节），说明第一个字节猜对了
+3. 重复上述过程，直到所有字节都猜对
+
+虽然每次的时间差很小（纳秒级），但在大量尝试下可以统计出差异。
+
+**恒定时间比较的实现**：
+
+```java
+// Java
+public static boolean constantTimeEquals(byte[] a, byte[] b) {
+    if (a.length != b.length) {
+        return false;
+    }
+    int result = 0;
+    for (int i = 0; i < a.length; i++) {
+        result |= a[i] ^ b[i]; // 异或操作，不短路
+    }
+    return result == 0;
+}
+
+// 或使用 Java 自带的工具类
+MessageDigest.isEqual(a, b);
+```
+
+```go
+// Go
+func ConstantTimeCompare(a, b string) bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var result byte
+    for i := 0; i < len(a); i++ {
+        result |= a[i] ^ b[i]
+    }
+    return result == 0
+}
+```
+
+**最佳实践**：不要自己实现恒定时间比较，使用标准库提供的工具。
+</details>
+
+**问题 2**：在开放平台场景下，HMAC 和 RSA 签名各有什么优缺点？如何选择？
+
+<details>
+<summary>参考答案</summary>
+
+**HMAC 签名**：
+
+| 优点 | 缺点 |
+| --- | --- |
+| 计算速度快（比 RSA 快 100-1000 倍） | 密钥分发困难（需要安全通道） |
+| 实现简单 | 服务端需要存储所有客户端的密钥 |
+| 签名长度短 | 客户端泄露密钥后难以追溯签名者身份 |
+
+**RSA 签名**：
+
+| 优点 | 缺点 |
+| --- | --- |
+| 公钥可以公开分发 | 计算速度慢 |
+| 可以验证签名者身份（谁签的） | 签名长度长（256 字节 vs 32 字节 HMAC） |
+| 适合开放平台 | 实现复杂度高 |
+
+**选型建议**：
+
+| 场景 | 推荐方案 | 理由 |
+| --- | --- | --- |
+| **开放平台（多开发者）** | RSA | 开发者只需保存私钥，公钥在平台注册即可 |
+| **企业内部服务间** | HMAC | 性能优先，密钥分发可控 |
+| **移动 App** | HMAC | App 包可以嵌入密钥，HMAC 更快 |
+| **IoT 设备** | HMAC/ECDSA | 设备资源有限，ECDSA 性能/安全平衡 |
+| **高安全金融场景** | RSA + HMAC | 用 RSA 签名 HMAC 密钥，双重保护 |
+
+**混合方案**：
+
+```http
+# 方案：RSA 签名 + HMAC 传输密钥
+1. 平台用 RSA 公钥加密 HMAC 密钥分发给客户端
+2. 客户端用 HMAC 密钥签名请求
+3. 服务端用 RSA 公钥解密获取 HMAC 密钥
+4. 服务端用 HMAC 密钥验证签名
+```
+
+这种方案结合了 RSA 的密钥分发优势和 HMAC 的性能优势。
+</details>
+
+**问题 3**：如何设计一个支持平滑密钥轮转的签名验证系统？
+
+<details>
+<summary>参考答案</summary>
+
+**密钥轮转的核心挑战**：
+
+1. **版本标识**：需要标识当前请求使用的是哪个版本的密钥
+2. **新旧共存**：轮转期间，新旧密钥都需要验证
+3. **过渡期管理**：何时激活新密钥、何时废弃旧密钥
+4. **平滑过渡**：客户端需要时间更新密钥，不能「一刀切」
+
+**设计方案**：
+
+```java title="KeyRotationManager.java"
+public class KeyRotationManager {
+    
+    private final Map<String, ClientKeySet> clientKeys = new ConcurrentHashMap<>();
+    private final Duration gracePeriod;
+    
+    // 客户端密钥集
+    static class ClientKeySet {
+        final Map<Integer, SecretKey> allKeys;  // 所有版本
+        volatile int activeVersion;               // 当前活跃版本
+        volatile Instant activatedAt;            // 激活时间
+        
+        SecretKey getActiveKey() {
+            return allKeys.get(activeVersion);
+        }
+    }
+    
+    // 验证签名（支持多版本）
+    public ValidationResult verify(String clientId, String content, 
+                                   String signature, int keyVersion) {
+        ClientKeySet keySet = clientKeys.get(clientId);
+        if (keySet == null) {
+            return ValidationResult.rejected("Unknown client");
+        }
+        
+        // 优先使用请求中指定的版本
+        if (keyVersion > 0 && keySet.allKeys.containsKey(keyVersion)) {
+            return verifyWithKey(content, signature, keySet.allKeys.get(keyVersion));
+        }
+        
+        // 尝试当前活跃版本
+        if (verifyWithKey(content, signature, keySet.getActiveKey())) {
+            return ValidationResult.accepted();
+        }
+        
+        // 尝试所有版本（轮转期间兼容）
+        for (Map.Entry<Integer, SecretKey> entry : keySet.allKeys.entrySet()) {
+            if (entry.getKey() == keySet.activeVersion) continue;
+            if (isKeyInGracePeriod(keySet, entry.getKey())) {
+                if (verifyWithKey(content, signature, entry.getValue())) {
+                    return ValidationResult.accepted();
+                }
+            }
+        }
+        
+        return ValidationResult.rejected("Signature verification failed");
+    }
+    
+    // 检查密钥是否在宽限期内
+    private boolean isKeyInGracePeriod(ClientKeySet keySet, int version) {
+        // 每个旧密钥有 7 天宽限期
+        Instant versionActivatedAt = keySet.activatedAt; // 简化处理
+        return Duration.between(versionActivatedAt, Instant.now())
+            .compareTo(gracePeriod) < 0;
+    }
+    
+    // 轮转密钥
+    public void rotateKey(String clientId) {
+        ClientKeySet keySet = clientKeys.get(clientId);
+        int newVersion = keySet.activeVersion + 1;
+        
+        // 生成新密钥
+        SecretKey newKey = generateKey();
+        keySet.allKeys.put(newVersion, newKey);
+        
+        // 发送通知
+        notifyClientNewKey(clientId, newKey, newVersion);
+    }
+    
+    // 废弃旧密钥
+    public void retireOldKey(String clientId, int version) {
+        ClientKeySet keySet = clientKeys.get(clientId);
+        keySet.allKeys.remove(version);
+        
+        // 发送通知
+        notifyClientKeyRetired(clientId, version);
+    }
+}
+```
+
+**客户端轮转策略**：
+
+```java title="ClientKeyRotationClient.java"
+public class ClientKeyRotationClient {
+    
+    private volatile String currentKey;
+    private volatile String pendingKey;
+    private final ApiClient apiClient;
+    
+    // 获取新密钥
+    public void pollNewKey() {
+        try {
+            KeyInfo info = apiClient.getKeyInfo();
+            if (info.hasNewKey()) {
+                this.pendingKey = info.getNewKey();
+            }
+        } catch (Exception e) {
+            // 记录日志，使用当前密钥继续
+        }
+    }
+    
+    // 使用密钥签名
+    public String sign(String content) {
+        String keyToUse = pendingKey != null ? pendingKey : currentKey;
+        
+        // 签名后如果有待激活密钥，切换
+        if (pendingKey != null) {
+            this.currentKey = pendingKey;
+            this.pendingKey = null;
+        }
+        
+        return hmacSign(content, keyToUse);
+    }
+}
+```
+
+**时间线**：
+
+```
+Day 0: 服务端生成新密钥 V2，但不激活
+Day 0: 服务端通知客户端「有新密钥可用」
+Day 1: 客户端开始使用 V2 密钥
+Day 3: 服务端激活 V2 为活跃版本
+Day 10: V1 宽限期结束，废弃 V1
+```
+</details>

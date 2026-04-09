@@ -1,0 +1,200 @@
+---
+title: JWT 深度解析
+description: 深入剖析 JSON Web Token 的结构、认证流程与应用场景，涵盖 Header、Payload、Signature 的 Base64URL 编码原理，以及 Claims 类型和最佳实践。
+---
+
+凌晨 2 点，你刚完成一次系统重构，把传统的 Session 认证换成了 JWT。接口响应时间从 50ms 降到了 15ms，水平扩展变得异常简单——因为不再需要共享 Session 存储。但三个月后，你收到安全团队的告警：攻击者通过 XSS 窃取了用户 Token，以管理员身份登录了后台。这不是 JWT 本身的错，但足以说明：JWT 远比「签发和验证」复杂得多。
+
+## 一、JWT 的结构
+
+一个标准的 JWT 看起来像这样：
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+这三个用 `.` 分隔的部分分别是 **Header**、**Payload**、**Signature**。每部分都经过 Base64URL 编码，与标准 Base64 的区别在于：用 `-` 替换 `+`，用 `_` 替换 `/`，末尾不填充 `=`。
+
+### Header（头部）
+
+```json
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+```
+
+`alg` 声明签名算法，`typ` 声明令牌类型。头部本身也要经过 Base64URL 编码，形成 JWT 的第一段。
+
+### Payload（载荷）
+
+```json
+{
+  "sub": "1234567890",
+  "name": "John Doe",
+  "iat": 1516239022,
+  "exp": 1516242622
+}
+```
+
+载荷包含 Claims（声明）。Claims 分为三类：
+
+**Registered Claims（注册声明）**——预定义的推荐声明，不是强制要求，但被广泛采用：
+
+| Claim | 含义 |
+|---|---|
+| `iss` | 签发者（Issuer） |
+| `sub` | 主题（Subject），通常是用户唯一标识 |
+| `aud` | 受众（Audience），指定令牌的预期接收方 |
+| `exp` | 过期时间（Expiration Time） |
+| `nbf` | 生效时间（Not Before） |
+| `iat` | 签发时间（Issued At） |
+| `jti` | JWT ID，唯一标识符 |
+
+**Public Claims（公共声明）**——可以自定义，但应避免与 IANA JSON Web Token Registry 冲突。使用 URI 格式命名以防止冲突：
+
+```json
+{
+  "https://example.com/user_role": "admin"
+}
+```
+
+**Private Claims（私有声明）**——仅在特定上下文中使用的自定义声明，供通信双方约定使用：
+
+```json
+{
+  "department": "engineering",
+  "permissions": ["read", "write"]
+}
+```
+
+### Signature（签名）
+
+签名的作用是验证消息完整性。以 `HS256` 为例：
+
+```java title="JwtSignature.java"
+public class JwtSignature {
+    public static void main(String[] args) {
+        // 头部和载荷分别 Base64URL 编码后，用 "." 连接
+        String header = Base64URL.encode("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+        String payload = Base64URL.encode("{\"sub\":\"1234567890\",\"name\":\"John Doe\"}");
+
+        String signatureInput = header + "." + payload; // [!code highlight]
+
+        // 使用密钥对 signatureInput 进行 HMAC-SHA256 签名
+        String secret = "your-256-bit-secret";
+        String signature = HMAC_SHA256(signatureInput, secret); // [!code highlight]
+    }
+}
+```
+
+签名 = HMAC( Base64URL(header) + "." + Base64URL(payload), secret)
+
+只有持有正确密钥的接收方才能验证签名真实性。
+
+## 二、JWT 的认证流程
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant App as 应用客户端
+    participant Auth as 认证服务器
+    participant API as 资源服务器
+
+    User->>App: 输入用户名/密码
+    App->>Auth: 发送凭证
+    Auth->>Auth: 验证凭证
+    Auth->>App: 返回 JWT Access Token + Refresh Token
+    App->>API: 请求资源，携带 JWT
+    API->>API: 验证签名 + 检查 exp/nbf/aud
+    API-->>App: 返回受保护资源
+```
+
+### 完整流程分解
+
+1. **用户登录**：客户端将用户名密码发送到认证服务器。
+2. **签发 Token**：认证服务器验证通过后，生成 Access Token（短期，通常 15 分钟到 1 小时）和 Refresh Token（长期，通常数天到数周）。
+3. **携带 Token**：客户端在后续请求的 `Authorization: Bearer <token>` 头部中携带 Access Token。
+4. **验证 Token**：资源服务器解码 JWT，验证签名、检查过期时间和其他 Claims。
+5. **刷新 Token**：Access Token 过期后，使用 Refresh Token 获取新的 Access Token，无需用户重新登录。
+
+## 三、JWT 与 Session 的核心差异
+
+| 维度 | Session 认证 | JWT 认证 |
+|---|---|---|
+| 状态管理 | 有状态（服务端存储） | 无状态（令牌包含所有信息） |
+| 扩展性 | 需要 Session 共享存储（Redis） | 天然支持水平扩展 |
+| 性能 | 每次请求需查询 Session | 仅需签名验证，无 I/O |
+| 撤销能力 | 支持（删除 Session 即可） | 默认不支持（需配合黑名单） |
+| 数据大小 | 小（Session ID） | 较大（完整 Claims） |
+| 适用场景 | 需要强制注销、频繁变更权限 | 无状态 API、微服务架构 |
+
+## 四、JWT 的局限性
+
+很多开发者把 JWT 当作「银弹」，认为它解决了所有认证问题。但 JWT 有几个关键局限性：
+
+**Token 撤销困难**。一旦签发，在过期前无法单方面撤销。这意味着即使用户账号被盗，你也只能等到 Token 过期才能阻止访问。解决方案包括：维护 Token 黑名单（牺牲无状态性）、使用短过期时间 + Refresh Token 机制、或将 Token 版本号存入数据库。
+
+**Token 体积问题**。每个请求都需要携带 Token，过大的 Token 会增加网络开销。对于移动端或弱网络环境，这是不可忽视的成本。
+
+**敏感信息泄露**。Base64URL 编码不等于加密，Payload 部分只是编码，任何人都能解码看到内容。因此不要将密码、银行卡号等敏感信息放入 JWT Payload。
+
+**无法强制修改已签发 Token**。如果用户权限变更（如被降权），已签发的 Token 仍然携带旧权限，只能等待过期或引入额外的撤销机制。
+
+## 五、最佳实践建议
+
+**1. 选择合适的算法**。不要使用 `none` 算法（曾被广泛攻击）。生产环境推荐 RS256（RSA 签名）或 ES256（ECDSA 签名），避免使用对称算法（HS256）做跨服务验证。
+
+**2. 设置合理的过期时间**。Access Token 建议 15 分钟到 1 小时，Refresh Token 可以设置更长的有效期但需严格保护。
+
+**3. 保护好签名密钥**。HS256 的密钥如果泄露，攻击者可以伪造任意 Token。使用安全的密钥管理服务（KMS）或环境变量存储密钥。
+
+**4. 验证所有 Claims**。除了签名，还需验证 `exp`（过期时间）、`nbf`（生效时间）、`aud`（受众）等关键 Claims。
+
+**5. 使用 HTTPS**。JWT 在传输过程中必须加密，否则 Token 会被窃取。
+
+## 六、JWT 的实际应用场景
+
+**场景一：API 认证**。微服务间调用、RESTful API 认证、Mobile App 后端通信。这是 JWT 最常见的用途。
+
+**场景二：信息交换**。因为 JWT 的签名可以验证发送者身份，适合在两个服务之间安全传递已签名的信息。
+
+**场景三：授权**。OAuth 2.0 的 Access Token 常常使用 JWT 格式，携带用户的权限信息。
+
+---
+
+## 思考题
+
+**问题 1**：如果需要实现「用户修改密码后，立即使所有已签发的 Token 失效」，使用 JWT 应该如何设计？
+
+<details>
+<summary>参考答案</summary>
+
+有几种常用方案：
+
+1. **在 Payload 中加入 tokenVersion**：在用户表中维护 `token_version` 字段，每次签发 Token 时将当前版本写入 `token_version` Claim。修改密码时递增版本号，验证时检查 Token 中的版本与数据库中的版本是否一致。
+
+2. **维护 Token 黑名单**：将已签发的 Token ID（`jti`）存入 Redis，设置过期时间为 Token 剩余有效期。验证时检查黑名单。
+
+3. **使用 Refresh Token 家族**：签发短期的 Access Token 和长期的 Refresh Token。修改密码后使 Refresh Token 失效，用户需要重新登录获取新的 Refresh Token。
+
+方案一最常用，平衡了安全性和性能。
+</details>
+
+**问题 2**：为什么说在 Cookie 中存储 JWT 比在 localStorage 更安全？
+
+<details>
+<summary>参考答案</summary>
+
+实际上两种方案都有安全风险，但侧重点不同：
+
+**Cookie 方案的优势**：Cookie 可以设置 `HttpOnly` 属性，防止 JavaScript 读取，从而避免 XSS 攻击直接获取 Token。同时可以设置 `Secure` 属性，确保只在 HTTPS 连接中传输。
+
+**Cookie 方案的劣势**：容易受到 CSRF 攻击。攻击者可以诱导用户访问恶意网站，自动发送携带 Cookie 的请求。
+
+**localStorage 方案的优势**：不受 CSRF 影响。
+
+**localStorage 方案劣势**：无法设置 `HttpOnly`，一旦发生 XSS 攻击，Token 直接被窃取。
+
+**最佳实践**：高安全性场景使用 Cookie + CSRF Token；普通场景可以使用 HttpOnly Cookie 或 localStorage + XSS 防护。无论哪种方案，都必须使用 HTTPS。
+</details>

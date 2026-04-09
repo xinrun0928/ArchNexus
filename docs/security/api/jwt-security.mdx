@@ -1,0 +1,644 @@
+---
+title: JWT 安全使用指南
+description: JWT在API安全中的使用场景、安全风险与防护措施、JWT验证最佳实践、JWK Set与公钥分发、Java实现示例。
+---
+
+一个 JWT token 看起来是这样的：
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+三个点分隔的 Base64 编码字符串，任何人都能解码出其中的内容。**JWT 的核心安全假设是：即使攻击者能读取 Token 内容，也无法伪造有效签名**。但这个假设成立的前提是：签名密钥足够安全、验证逻辑完全正确、Token 管理规范得当。
+
+现实情况是，大多数 JWT 安全事件都源于这三个环节的疏漏。2019 年，Auth0 披露多个服务因 JWT 签名验证缺陷导致认证绕过；2020 年，Stripe 的 API 因 JWT 验证漏洞被利用；2022 年，大量服务因「none」算法攻击被攻破。这些事件都有一个共同特点：**问题不在于 JWT 协议本身，而在于实现者的错误理解和使用**。
+
+## JWT 在 API 安全中的使用场景
+
+JWT 的自包含特性使其成为 API 认证的理想选择。在分布式系统中，JWT 可以避免每次请求都查询认证服务器，减少网络延迟和数据库压力。
+
+### 场景一：用户认证
+
+```http
+# 用户登录后获取 JWT
+POST /api/v1/auth/login
+Content-Type: application/json
+
+{ "username": "alice", "password": "..." }
+
+# 响应
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expires_in": 3600
+}
+
+# 后续 API 请求携带 JWT
+GET /api/v1/orders
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+### 场景二：微服务间认证
+
+```http
+# 服务 A 调用服务 B
+GET /internal/v1/user-profile
+X-Internal-Token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+X-Service-Name: order-service
+X-Trace-Id: abc123
+```
+
+服务间 JWT 通常包含服务标识和权限声明，不需要用户上下文。
+
+### 场景三：临时访问凭证
+
+JWT 可以作为一次性访问凭证，用于邮件验证、密码重置等场景：
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyQGV4YW1wbGUuY29tIiwicHVycG9zZSI6InBhc3N3b3JkLXJlc2V0IiwiZXhwIjoxNzEyNTY3ODkwfQ.xxx
+```
+
+这个 Token 只能用于密码重置，其他 API 调用都会被拒绝。
+
+## JWT 的安全风险与防护
+
+### 风险一：算法篡改（Algorithm Confusion）
+
+JWT 支持多种签名算法，攻击者可能尝试将算法从 `RS256`（非对称）改为 `HS256`（对称），然后用自己的密钥签名。
+
+```http
+# 原始 Token Header
+{
+  "alg": "RS256",  // 使用公钥验证
+  "typ": "JWT"
+}
+
+# 篡改后的 Token Header
+{
+  "alg": "HS256",  // 改为对称算法
+  "typ": "JWT"
+}
+```
+
+如果服务端使用**接收到的 Header 中的算法**来选择验证密钥，而验证密钥恰好是用于开发环境的共享密钥（`HS256` 用同一个密钥签名和验证），攻击者就能伪造任意 Token。
+
+**防护措施**：服务端**必须硬编码期望的算法**，而不是信任 Header 中的 `alg` 字段：
+
+```java title="JwtValidator.java"
+public class JwtValidator {
+    // 硬编码期望的算法，不信任 Header 中的 alg
+    private static final String EXPECTED_ALGORITHM = "RS256";
+    
+    public Claims validateToken(String token, PublicKey publicKey) {
+        try {
+            // 解析 Header
+            JwtParser parser = Jwts.parser();
+            
+            // 明确指定验证算法
+            Jwt<Header, Claims> jwt = parser
+                .verifyWith(publicKey)  // 只接受 RS256 用公钥验证
+                .build()
+                .parseSignedClaims(token);
+            
+            Header header = jwt.getHeader();
+            
+            // 二次校验：确保 Header 中的算法匹配
+            if (!EXPECTED_ALGORITHM.equals(header.getAlgorithm())) {
+                throw new SecurityException("Unexpected algorithm");
+            }
+            
+            return jwt.getPayload();
+        } catch (JwtException e) {
+            throw new TokenValidationException("Invalid token", e);
+        }
+    }
+}
+```
+
+### 风险二：「none」算法攻击
+
+JWT 支持 `alg: none`，表示不签名。如果服务端错误地处理这种情况，攻击者可以构造「已签名」的未签名 Token：
+
+```json
+# 恶意 Token
+{
+  "alg": "none",
+  "typ": "JWT"
+}
+.
+{
+  "sub": "admin",
+  "role": "admin",
+  "iat": 1712563200
+}
+.
+# 空签名
+```
+
+**防护措施**：
+
+1. 验证签名时，如果发现 `alg: none`，直接拒绝：
+```java
+if ("none".equalsIgnoreCase(header.getAlgorithm())) {
+    throw new SecurityException("Algorithm 'none' is not allowed");
+}
+```
+
+2. 维护一个允许的算法白名单：
+```java
+private static final Set<String> ALLOWED_ALGORITHMS = 
+    Set.of("RS256", "RS384", "RS512", "ES256", "ES384", "ES512");
+```
+
+### 风险三：敏感信息泄露
+
+JWT 的 Payload 是 Base64 编码的明文，任何人都能解码。如果 Payload 中包含敏感信息，会被攻击者直接读取。
+
+```javascript
+// 解码 JWT Payload（任何人都能做到）
+const payload = atob('eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiZW1haWwijoiYWxpY2VAZXhhbXBsZS5jb20iLCJzcWwiOiIxMjM0NTY3ODkwIn0=');
+console.log(JSON.parse(payload));
+// 输出：{sub: '1234567890', name: 'John Doe', email: 'alice@example.com', sql: '1234567890'}
+```
+
+**防护措施**：
+
+1. **不要在 JWT Payload 中存放敏感信息**：用户 ID 可以存放，但密码、信用卡号、完整地址等不应该放。
+2. **使用加密的 JWT（JWE）**：如果确实需要传输敏感数据，使用 JWE 而不是 JWS。
+3. **传输层加密**：确保所有 API 调用通过 HTTPS，防止 Token 在传输过程中被截获。
+
+### 风险四：Token 过期时间过长
+
+如果 Access Token 的有效期设置过长，攻击者有更大的时间窗口利用泄露的 Token。
+
+**防护措施**：
+
+| Token 类型 | 推荐有效期 | 理由 |
+| --- | --- | --- |
+| Access Token | 15 分钟 - 1 小时 | 短期有效，减少泄露窗口 |
+| Refresh Token | 7 - 30 天 | 长期有效，但需要配合其他安全措施 |
+| 一次性 Token | 5 - 15 分钟 | 邮件验证、密码重置等场景 |
+
+### 风险五：缺乏撤销机制
+
+JWT 是无状态的，签发后无法撤销。即使服务端检测到 Token 泄露，也无法让该 Token 立即失效。
+
+**防护措施**：
+
+1. **短期 Token**：Access Token 有效期短，泄露后等待过期即可。
+2. **Token 黑名单**：将已撤销 Token 的 ID 存入 Redis 或数据库，验证时检查黑名单。适用于 Refresh Token 或需要立即撤销的场景。
+3. **Token ID（jti）**：为每个 Token 分配唯一 ID，便于精确撤销。
+
+```java title="JwtBlacklistService.java"
+public class JwtBlacklistService {
+    
+    private final RedisTemplate<String, String> redisTemplate;
+    
+    public void revokeToken(String jti, Instant expiry) {
+        // 计算 TTL，确保黑名单在 Token 过期后自动清理
+        long ttlSeconds = Duration.between(Instant.now(), expiry).getSeconds();
+        if (ttlSeconds > 0) {
+            redisTemplate.opsForValue().set(
+                "jwt:revoked:" + jti, 
+                "1", 
+                Duration.ofSeconds(ttlSeconds)
+            );
+        }
+    }
+    
+    public boolean isRevoked(String jti) {
+        return Boolean.TRUE.equals(
+            redisTemplate.hasKey("jwt:revoked:" + jti)
+        );
+    }
+}
+```
+
+## JWT 验证的最佳实践
+
+### 1. 验证完整的声明
+
+```java title="JwtClaimsValidator.java"
+public class JwtClaimsValidator {
+    
+    public void validateAllClaims(Claims claims, ValidationContext context) {
+        validateIssuer(claims, context.getExpectedIssuer());
+        validateAudience(claims, context.getExpectedAudience());
+        validateExpiration(claims);
+        validateNotBefore(claims);
+        validateIssuedAt(claims);
+        validateSubject(claims);
+        validateCustomClaims(claims, context);
+    }
+    
+    private void validateExpiration(Claims claims) {
+        Instant expiration = claims.getExpiration().toInstant();
+        if (Instant.now().isAfter(expiration)) {
+            throw new TokenExpiredException("Token has expired");
+        }
+        
+        // 额外检查：Token 是否过早（防止时钟漂移攻击）
+        Instant issuedAt = claims.getIssuedAt().toInstant();
+        if (Instant.now().isBefore(issuedAt.minusSeconds(60))) {
+            throw new SecurityException("Token issued time is in the future");
+        }
+    }
+    
+    private void validateIssuer(Claims claims, String expectedIssuer) {
+        String issuer = claims.getIssuer();
+        if (issuer == null || !issuer.equals(expectedIssuer)) {
+            throw new SecurityException("Invalid issuer");
+        }
+    }
+    
+    private void validateAudience(Claims claims, String expectedAudience) {
+        List<String> audience = claims.getAudience();
+        if (audience == null || !audience.contains(expectedAudience)) {
+            throw new SecurityException("Invalid audience");
+        }
+    }
+}
+```
+
+### 2. 使用安全的密钥
+
+```java title="JwtKeyProvider.java"
+public class JwtKeyProvider {
+    
+    // 密钥必须 >= 256 位
+    private static final int MINIMUM_KEY_SIZE = 256;
+    
+    public SecretKey generateSigningKey() {
+        KeyGenerator keyGen = KeyGenerator.getInstance("HmacSHA256");
+        keyGen.init(MINIMUM_KEY_SIZE, new SecureRandom());
+        return keyGen.generateKey();
+    }
+    
+    public KeyPair generateRsaKeyPair() {
+        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+        keyGen.initialize(2048, new SecureRandom()); // 最小 2048 位
+        return keyGen.generateKeyPair();
+    }
+    
+    public KeyPair generateEcKeyPair() {
+        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("EC");
+        keyGen.initialize(256, new SecureRandom()); // P-256 曲线
+        return keyGen.generateKeyPair();
+    }
+}
+```
+
+:::danger 禁止使用的密钥
+- 不要使用小于 256 位的 HMAC 密钥
+- 不要使用 RSA 密钥小于 2048 位
+- 不要使用已知的弱密钥
+- 不要硬编码密钥在代码中
+:::
+
+## JWK Set 与公钥分发
+
+在分布式系统中，多个服务需要验证 JWT 签名。如果每个服务都存储一份公钥，密钥轮转时需要更新所有服务。JWK Set 提供了一种集中式公钥分发方案。
+
+### JWK Set 的结构
+
+```json title="jwks.json"
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "kid": "key-2024-01",
+      "alg": "RS256",
+      "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+      "e": "AQAB"
+    },
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "kid": "key-2023-06",
+      "alg": "RS256",
+      "n": "...",
+      "e": "AQAB"
+    }
+  ]
+}
+```
+
+### 获取并缓存 JWKS
+
+```java title="JwksClient.java"
+public class JwksClient implements Runnable {
+    
+    private final String jwksUrl;
+    private final Cache<String, PublicKey> keyCache;
+    private final ScheduledExecutorService scheduler;
+    
+    public JwksClient(String jwksUrl) {
+        this.jwksUrl = jwksUrl;
+        this.keyCache = Caffeine.newBuilder()
+            .maximumSize(100)
+            .expireAfterWrite(Duration.ofHours(1))
+            .build();
+        
+        this.scheduler = Executors.newSingleThreadScheduledExecutor();
+        
+        // 定期刷新 JWKS
+        scheduler.scheduleAtFixedRate(this, 1, 1, TimeUnit.HOURS);
+    }
+    
+    @Override
+    public void run() {
+        try {
+            refreshJwks();
+        } catch (Exception e) {
+            logger.warn("Failed to refresh JWKS", e);
+        }
+    }
+    
+    public PublicKey getPublicKey(String kid) {
+        PublicKey key = keyCache.getIfPresent(kid);
+        if (key == null) {
+            // 缓存未命中，尝试刷新
+            refreshJwks();
+            key = keyCache.getIfPresent(kid);
+        }
+        if (key == null) {
+            throw new KeyNotFoundException("Public key not found: " + kid);
+        }
+        return key;
+    }
+    
+    private void refreshJwks() {
+        try {
+            String response = httpClient.get(jwksUrl);
+            JsonWebKeySet jwks = JsonWebKeySet.parse(response);
+            
+            Map<String, PublicKey> newKeys = new HashMap<>();
+            for (JWK jwk : jwks.getKeys()) {
+                if ("sig".equals(jwk.getUse())) {
+                    PublicKey publicKey = jwk.toPublicKey();
+                    newKeys.put(jwk.getKeyId(), publicKey);
+                }
+            }
+            
+            keyCache.invalidateAll();
+            keyCache.putAll(newKeys);
+            logger.info("JWKS refreshed, {} keys loaded", newKeys.size());
+        } catch (Exception e) {
+            logger.error("Failed to parse JWKS", e);
+        }
+    }
+}
+```
+
+## API 网关的 JWT 验证
+
+在微服务架构中，API 网关通常负责 JWT 验证，将验证通过的用户信息传递给后端服务。
+
+```yaml title="Kong JWT Plugin Configuration"
+# JWT 插件配置示例
+plugins:
+  - name: jwt
+    config:
+      # 密钥来源
+      key_claim_name: "kid"
+      claims_to_verify:
+        - exp
+        - nbf
+      # 签名算法白名单
+      supported_algorithms:
+        - RS256
+        - ES256
+      # 令牌位置
+      token_prefix: "Bearer "
+      # 是否验证 issuer
+      verify_claims:
+        - iss: "https://auth.example.com"
+```
+
+```yaml title="APISIX JWT Plugin Configuration"
+routes:
+  - uri: /api/*
+    plugins:
+      jwt-auth:
+        key: "user-key"
+        # 公钥（RS256）
+        public_key: |
+          -----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...
+          -----END PUBLIC KEY-----
+        # 或者使用算法
+        algorithm: RS256
+        # Token 过期验证
+        exp: 3600
+        # 签名验证失败时不转发到上游
+        run_on_preflight: true
+```
+
+## Java 实现 JWT 验证
+
+### 依赖配置
+
+```xml title="pom.xml"
+<dependencies>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-api</artifactId>
+        <version>0.12.5</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-impl</artifactId>
+        <version>0.12.5</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-jackson</artifactId>
+        <version>0.12.5</version>
+        <scope>runtime</scope>
+    </dependency>
+</dependencies>
+```
+
+### 完整的 JWT 验证服务
+
+```java title="JwtVerificationService.java"
+public class JwtVerificationService {
+    
+    private final String expectedIssuer;
+    private final String expectedAudience;
+    private final Set<String> allowedAlgorithms;
+    private final PublicKey publicKey;
+    private final JwtBlacklistService blacklistService;
+    
+    public JwtVerificationService(JwtConfig config) {
+        this.expectedIssuer = config.getIssuer();
+        this.expectedAudience = config.getAudience();
+        this.allowedAlgorithms = Set.of("RS256", "RS384", "RS512");
+        this.publicKey = loadPublicKey(config.getPublicKeyPath());
+        this.blacklistService = new JwtBlacklistService(config.getRedisConfig());
+    }
+    
+    public AuthenticationContext verify(String token) {
+        try {
+            // 步骤1：解析 Header 并验证算法
+            JwtParser parser = Jwts.parser()
+                .verifyWith(publicKey);
+            
+            Jwt<Header, Claims> jwt = parser.build()
+                .parseSignedClaims(token);
+            
+            Header header = jwt.getHeader();
+            validateAlgorithm(header.getAlgorithm());
+            
+            // 步骤2：验证 Claims
+            Claims claims = jwt.getPayload();
+            validateClaims(claims);
+            
+            // 步骤3：检查黑名单
+            String jti = claims.getId();
+            if (jti != null && blacklistService.isRevoked(jti)) {
+                throw new TokenRevokedException();
+            }
+            
+            // 步骤4：构建认证上下文
+            return AuthenticationContext.builder()
+                .subject(claims.getSubject())
+                .userId(extractUserId(claims))
+                .roles(extractRoles(claims))
+                .scopes(extractScopes(claims))
+                .tokenId(jti)
+                .issuedAt(claims.getIssuedAt().toInstant())
+                .expiresAt(claims.getExpiration().toInstant())
+                .build();
+                
+        } catch (ExpiredJwtException e) {
+            throw new TokenExpiredException("Token has expired", e);
+        } catch (MalformedJwtException e) {
+            throw new TokenMalformedException("Malformed token", e);
+        } catch (SecurityException e) {
+            throw new TokenSignatureException("Invalid signature", e);
+        } catch (JwtException e) {
+            throw new TokenValidationException("Token validation failed", e);
+        }
+    }
+    
+    private void validateAlgorithm(String algorithm) {
+        if (algorithm == null || !allowedAlgorithms.contains(algorithm)) {
+            throw new SecurityException(
+                "Unsupported signature algorithm: " + algorithm);
+        }
+        // 明确禁止 none 算法
+        if ("none".equalsIgnoreCase(algorithm)) {
+            throw new SecurityException("Algorithm 'none' is not allowed");
+        }
+    }
+    
+    private void validateClaims(Claims claims) {
+        // 验证 issuer
+        if (!expectedIssuer.equals(claims.getIssuer())) {
+            throw new SecurityException("Invalid issuer");
+        }
+        
+        // 验证 audience
+        List<String> audience = claims.getAudience();
+        if (audience == null || !audience.contains(expectedAudience)) {
+            throw new SecurityException("Invalid audience");
+        }
+        
+        // 验证过期时间
+        Instant expiration = claims.getExpiration().toInstant();
+        if (Instant.now().isAfter(expiration)) {
+            throw new TokenExpiredException();
+        }
+        
+        // 验证生效时间
+        Instant notBefore = claims.getNotBefore().toInstant();
+        if (Instant.now().isBefore(notBefore)) {
+            throw new SecurityException("Token not yet valid");
+        }
+    }
+}
+```
+
+## 思考题
+
+**问题 1**：JWT 的「自包含」特性带来了哪些安全挑战？如何应对？
+
+<details>
+<summary>参考答案</summary>
+
+**安全挑战**：
+
+1. **无法即时撤销**：JWT 签发后，在过期前无法主动失效。攻击者获取 Token 后，即使服务端检测到异常，也只能等待过期。
+
+2. **敏感信息暴露**：Payload 是明文的（虽然 Base64 编码），任何人都能读取。
+
+3. **密钥管理复杂**：签名密钥需要在多个服务间共享或同步，轮转困难。
+
+**应对措施**：
+
+1. **短期 Token**：Access Token 有效期短（15 分钟），泄露影响有限。
+
+2. **Token 黑名单**：使用 `jti` 标识每个 Token，将已撤销 Token 存入 Redis。
+
+3. **避免存放敏感信息**：只存放必要信息，敏感数据通过其他安全通道获取。
+
+4. **使用 JWK Set**：集中管理公钥，支持密钥轮转而不影响服务。
+
+5. **双重验证**：JWT 验证通过后，额外检查用户状态（如是否被禁用）。
+</details>
+
+**问题 2**：在 JWT 验证中，为什么要「硬编码期望的算法」而不是信任 Header 中的 `alg` 字段？
+
+<details>
+<summary>参考答案</summary>
+
+**信任 Header 中 `alg` 的风险**：
+
+1. **Algorithm Confusion 攻击**：攻击者将 `alg` 从 `RS256`（公钥验证）改为 `HS256`（对称密钥验证），而服务端恰好使用同一个密钥的不同版本（开发环境密钥），攻击者就能伪造签名。
+
+2. **服务配置错误**：如果服务部署时配置了多个密钥（用于平滑轮转），而验证时根据 Header 选择密钥，攻击者可以选择最弱的密钥。
+
+**硬编码算法的必要性**：
+
+1. **明确预期**：服务端明确知道应该使用哪种算法验证 Token。
+2. **减少攻击面**：不信任客户端提供的任何安全相关参数。
+3. **防御配置错误**：即使配置文件写错，硬编码的校验逻辑也能捕获异常。
+
+**最佳实践**：同时在两个层面校验——既在解析器级别指定算法，又在代码中二次校验 Header 中的 `alg` 字段。
+</details>
+
+**问题 3**：Refresh Token 通常比 Access Token 有效期长很多，如何确保 Refresh Token 的安全性？
+
+<details>
+<summary>参考答案</summary>
+
+**Refresh Token 的安全威胁**：
+
+1. **更长的攻击窗口**：有效期长意味着攻击者有更多时间利用泄露的 Token。
+2. **更高的价值**：Refresh Token 可以获取新的 Access Token，攻击者可以用它持续获取新 Token。
+
+**安全防护措施**：
+
+1. **存储安全**：
+   - 服务端：加密存储，不明文保存
+   - 客户端：存放在 HTTP-only Cookie 或安全存储区，不存放在 LocalStorage
+
+2. **使用限制**：
+   - 每次刷新后颁发新的 Refresh Token（旧 Token 失效）
+   - 限制 Refresh Token 的使用频率（如每分钟最多刷新 5 次）
+
+3. **绑定验证**：
+   - 绑定到设备指纹/IP，异常时拒绝刷新
+   - 检测 Refresh Token 的使用模式，异常时触发告警
+
+4. **即时撤销**：
+   - Refresh Token 通常是 Reference Token（不透明），服务端可以即时撤销
+   - 用户修改密码、账户被盗时，立即撤销所有 Refresh Token
+
+5. **并发控制**：
+   - 限制同一个 Refresh Token 的并发使用
+   - 检测「Token 盗窃」——同一个 Token 在不同地点同时使用
+</details>

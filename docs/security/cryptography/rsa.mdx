@@ -1,0 +1,773 @@
+---
+title: RSA 原理与最佳实践
+description: 深入解析 RSA 算法的数学基础、密钥生成流程、填充方案与安全攻击类型，以及 Java 实现中的最佳安全实践与性能权衡。
+---
+
+1977 年，三位数学家 Rivest、Shamir 和 Adleman 在 MIT 发表了一篇论文，提出了一个看似简单却影响深远的问题：**能否找到一个数学函数，使得正向计算很容易，但逆向计算几乎不可能？**
+
+他们的答案是 RSA 算法。这个算法的安全性建立在「整数分解」这一世界级难题上——给你一个巨大的整数 `n = p * q`，找出原始的质数 `p` 和 `q`。
+
+四十年后，RSA 仍然是互联网安全的基础之一。但它的使用方式已经从「银弹」变成了「需要谨慎使用的工具」。理解 RSA 的原理和局限，是每个安全工程师的必修课。
+
+## 一、RSA 的数学基础
+
+### 大数分解问题
+
+RSA 的安全性基于一个简单的事实：**大整数的质因数分解在计算上是困难的**。
+
+```
+给定：
+n = 61,253,527,869
+（这是两个大质数的乘积）
+
+求：
+p = ?
+q = ?
+
+答案（用计算机找到）：
+p = 223,649
+q = 273,849,781
+
+验证：
+p * q = 61,253,527,869  ✓
+```
+
+当数字足够大时，即使使用超级计算机，分解也需要天文数字的时间。对于一个 2048 位的整数，目前最好的分解算法需要数十亿年。
+
+### 欧拉函数与模逆元
+
+理解 RSA 需要两个数学概念：
+
+**欧拉函数 `φ(n)`**：小于等于 `n` 的正整数中，与 `n` 互质的数的个数。当 `n = p * q`（两个质数相乘）时，`φ(n) = (p-1) * (q-1)`。
+
+**模逆元**：如果 `a * x ≡ 1 (mod m)`，则 `x` 是 `a` 在模 `m` 下的逆元，记作 `a⁻¹ (mod m)`。
+
+### RSA 的数学原理
+
+```
+密钥生成：
+1. 选择两个大质数 p 和 q
+2. 计算 n = p * q
+3. 计算 φ(n) = (p-1) * (q-1)
+4. 选择公钥指数 e，使得 gcd(e, φ(n)) = 1（通常 e = 65537）
+5. 计算私钥指数 d，使得 e * d ≡ 1 (mod φ(n))
+
+加密：c = m^e mod n
+解密：m = c^d mod n
+```
+
+为什么解密能恢复明文？因为 `m = (m^e)^d mod n = m^(e*d) mod n`，而根据欧拉定理，当 `gcd(m, n) = 1` 时，`m^φ(n) ≡ 1 (mod n)`。
+
+## 二、密钥生成流程
+
+### 素数选择
+
+素数的选择是 RSA 安全性的基础。候选素数必须满足：
+
+- 足够大（建议至少 1024 位）
+- 不能太接近
+- 不能在已知素数列表中
+
+```java title="RsaKeyGenerator.java"
+import java.security.KeyPairGenerator;
+import java.security.KeyPair;
+import java.security.SecureRandom;
+import java.security.interfaces.RSAPrivateKey;
+import java.security.interfaces.RSAPublicKey;
+
+public class RsaKeyGenerator {
+    
+    /**
+     * 生成 RSA 密钥对
+     * 推荐密钥长度 >= 2048 位
+     */
+    public static KeyPair generateKeyPair(int keySize) throws Exception {
+        if (keySize < 2048) {
+            throw new IllegalArgumentException("密钥长度必须 >= 2048 位");
+        }
+        
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(keySize, new SecureRandom());
+        return generator.generateKeyPair();
+    }
+    
+    /**
+     * 推荐：使用 2048 位密钥
+     * 这是当前安全与性能的平衡点
+     */
+    public static KeyPair generateRsa2048() throws Exception {
+        return generateKeyPair(2048);
+    }
+    
+    /**
+     * 高安全场景：使用 4096 位密钥
+     * 注意：性能显著下降（约 8-10 倍）
+     */
+    public static KeyPair generateRsa4096() throws Exception {
+        return generateKeyPair(4096);
+    }
+}
+```
+
+### 公钥指数 e 的选择
+
+公钥指数 `e` 的选择影响 RSA 的效率和安全性：
+
+| e 值 | 优点 | 缺点 |
+|------|------|------|
+| 3 | 最快 | 需要填充防止某些攻击 |
+| 17 | 较快 | 需要填充 |
+| 65537 (2^16+1) | 推荐 | 略慢于 3 |
+| 更大值 | 更安全（理论） | 性能显著下降 |
+
+**推荐使用 `e = 65537`**：这个值是质数，提供了足够的安全性，同时有高效的平方-乘算法实现。
+
+```java
+// e = 65537 是 RSA 算法的标准选择
+// Java 默认使用 65537
+KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+generator.initialize(2048); // 默认 e = 65537
+
+// 如果需要显式指定
+RSAKeyGenParameterSpec spec = new RSAKeyGenParameterSpec(
+    2048,
+    RSAKeyGenParameterSpec.F4  // F4 = 65537
+);
+generator.initialize(spec);
+```
+
+## 三、填充方案详解
+
+### 为什么需要填充
+
+RSA 的纯数学运算存在安全隐患。假设明文 `m < n`，直接计算 `c = m^e mod n` 会导致：
+
+- **确定性**：相同明文总是产生相同密文
+- **小公钥指数攻击**：当 `e = 3` 时，某些填充不当的密文可被攻击
+
+填充（Padding）在加密前添加随机数据，解决了这些问题。
+
+### PKCS#1 v1.5 填充
+
+这是最广泛使用的填充方案，但存在已知攻击面：
+
+```java title="Pkcs1Padding.java"
+/**
+ * RSA PKCS#1 v1.5 填充格式
+ * 
+ * 加密前：
+ * 0x00 || 0x02 || RandomNonZeroBytes || 0x00 || Message
+ * 
+ * 填充后数据长度 = 密钥字节长度
+ * 至少 8 字节随机非零数据
+ */
+public class Pkcs1Padding {
+    
+    public static byte[] pad(byte[] message, int keyLengthBytes) {
+        // 格式：00 02 [至少8字节随机非零] 00 [消息]
+        byte[] padding = new byte[keyLengthBytes - message.length - 3];
+        
+        SecureRandom random = new SecureRandom();
+        int zeroCount = 0;
+        while (zeroCount < 8) {
+            byte b = (byte) random.nextInt(256);
+            if (b != 0) {
+                padding[zeroCount++] = b;
+            }
+        }
+        
+        // 填充剩余部分
+        random.nextBytes(padding);
+        
+        byte[] result = new byte[keyLengthBytes];
+        result[0] = 0x00;
+        result[1] = 0x02;
+        System.arraycopy(padding, 0, result, 2, padding.length);
+        result[keyLengthBytes - message.length - 1] = 0x00;
+        System.arraycopy(message, 0, result, keyLengthBytes - message.length, message.length);
+        
+        return result;
+    }
+}
+```
+
+:::warning
+**PKCS#1 v1.5 的风险**
+
+Bleichenbacher 攻击（1998 年）利用 PKCS#1 v1.5 填充的提示信息，通过百万次查询可以恢复明文。即使在 2006 年发现了更有效的变种，这种攻击仍然威胁着依赖 PKCS#1 v1.5 的系统。
+
+**防御措施**：检测填充异常时返回固定错误消息，避免泄露填充状态信息。
+:::
+
+### OAEP 填充（推荐）
+
+OAEP（Optimal Asymmetric Encryption Padding）提供了更强的安全性保证：
+
+```java title="OaepPadding.java"
+/**
+ * RSA-OAEP 填充
+ * 使用哈希函数提供更强的安全性
+ * 
+ * 格式：
+ * 00 || maskedSeed || maskedData
+ * 
+ * 其中 maskedData = DB XOR MGF(maskedSeed)
+ * DB = lHash || PS || 01 || Message
+ */
+public class OaepEncryption {
+    
+    public static String encryptOAEP(String plaintext, PublicKey publicKey) 
+            throws Exception {
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        
+        OAEPParameterSpec spec = new OAEPParameterSpec(
+            "SHA-256",    // 哈希函数
+            "MGF1",       // 掩码生成函数
+            new MGF1ParameterSpec("SHA-1"),  // MGF1 的哈希
+            PSpecified.DEFAULT  // 默认-label（空）
+        );
+        
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey, spec);
+        byte[] ciphertext = cipher.doFinal(plaintext.getBytes("UTF-8"));
+        
+        return Base64.getEncoder().encodeToString(ciphertext);
+    }
+    
+    public static String decryptOAEP(String encryptedData, PrivateKey privateKey) 
+            throws Exception {
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        
+        OAEPParameterSpec spec = new OAEPParameterSpec(
+            "SHA-256",
+            "MGF1",
+            new MGF1ParameterSpec("SHA-1"),
+            PSpecified.DEFAULT
+        );
+        
+        cipher.init(Cipher.DECRYPT_MODE, privateKey, spec);
+        byte[] ciphertext = Base64.getDecoder().decode(encryptedData);
+        byte[] plaintext = cipher.doFinal(ciphertext);
+        
+        return new String(plaintext, "UTF-8");
+    }
+}
+```
+
+### PSS 签名填充
+
+对于签名，PSS（Probabilistic Signature Scheme）提供了更优的安全性：
+
+```java title="PssSigning.java"
+import java.security.Signature;
+
+public class PssSigning {
+    
+    /**
+     * RSA-PSS 签名
+     * 推荐使用 SHA-256 作为哈希函数
+     */
+    public static byte[] signPSS(String message, PrivateKey privateKey) 
+            throws Exception {
+        Signature signature = Signature.getInstance("SHA256withRSA/PSS");
+        
+        // 配置 PSS 参数
+        PSSParameterSpec pssSpec = new PSSParameterSpec(
+            "SHA-256",    // 哈希函数
+            "MGF1",       // 掩码生成函数
+            new MGF1ParameterSpec("SHA-256"),  // MGF1 也使用 SHA-256
+            32,           // 盐长度（字节）
+            PSSParameterSpec.TRAILER_FIELD_ABORT  // 使用标准 trailer
+        );
+        
+        signature.setParameter(pssSpec);
+        signature.initSign(privateKey);
+        signature.update(message.getBytes("UTF-8"));
+        
+        return signature.sign();
+    }
+    
+    /**
+     * 验证签名
+     */
+    public static boolean verifyPSS(byte[] signature, String message, 
+            PublicKey publicKey) throws Exception {
+        Signature sig = Signature.getInstance("SHA256withRSA/PSS");
+        
+        PSSParameterSpec pssSpec = new PSSParameterSpec(
+            "SHA-256", "MGF1", new MGF1ParameterSpec("SHA-256"), 32, 
+            PSSParameterSpec.TRAILER_FIELD_ABORT);
+        sig.setParameter(pssSpec);
+        
+        sig.initVerify(publicKey);
+        sig.update(message.getBytes("UTF-8"));
+        
+        return sig.verify(signature);
+    }
+}
+```
+
+## 四、安全攻击类型
+
+### 选择明文攻击（CPA）
+
+**攻击原理**：攻击者可以选择明文并获取对应密文，利用这种能力分析加密模式。
+
+**RSA 的情况**：标准 RSA（不带填充）是确定性的，相同明文产生相同密文。攻击者可以：
+- 识别重复传输的消息
+- 构造特殊的明文来探测系统
+
+**防御**：使用随机填充（OAEP、PSS），确保相同明文每次加密产生不同密文。
+
+### 选择密文攻击（CCA）
+
+**攻击原理**：攻击者可以获得任意密文的解密结果，利用这个能力恢复目标密文对应的明文。
+
+**Bleichenbacher 攻击**（针对 PKCS#1 v1.5）：
+```
+攻击场景：
+1. 服务器对密文解密，填充有效返回 200 OK
+2. 服务器对填充无效的密文返回 400 Bad Request
+3. 攻击者利用这个微小的差异，通过二分查找逐步缩小明文范围
+
+结果：
+通过约 100 万次查询，攻击者可以恢复完整的明文
+```
+
+**防御措施**：
+1. 使用 OAEP 填充而非 PKCS#1 v1.5
+2. 对填充错误返回统一的错误消息（避免泄露填充状态）
+3. 限制解密请求频率
+
+### 共模攻击
+
+**攻击原理**：当多个用户共享相同的模数 `n` 时，如果使用相同的 `e` 值，攻击者可以利用两个用户的密文恢复明文。
+
+```
+如果 c1 = m^e mod n
+     c2 = m^e mod n（相同明文）
+
+攻击者计算：
+c1 * c2 mod n = m^e * m^e mod n = m^2e mod n
+
+利用扩展欧几里得算法可以恢复 m
+```
+
+**防御**：
+- 每个用户使用独立的素数对（不要共享模数）
+- 或者确保每个用户的 e 值不同
+
+### 低指数攻击
+
+**攻击原理**：当 `e = 3` 且填充不足时，攻击者可以通过立方根计算恢复明文。
+
+```
+如果 m^3 < n（明文太小，没有有效填充）
+则 c = m^3
+    m = c^(1/3)（直接开立方根）
+```
+
+**防御**：
+- 使用 OAEP 填充，确保明文有足够的随机填充
+- 使用更大的 e 值（65537）
+
+## 五、最佳实践建议
+
+### 密钥长度选择
+
+| 密钥长度 | 安全性 | 性能 | 有效期 | 建议场景 |
+|----------|--------|------|--------|----------|
+| 1024 | 不安全 | 快 | 已过期 | 禁止使用 |
+| 2048 | 安全 | 中 | 2030 年前 | 通用场景推荐 |
+| 3072 | 高安全 | 慢 | 2030 年后 | 长期数据 |
+| 4096 | 极高 | 很慢 | 长期 | 极端敏感数据 |
+
+:::tip
+**为什么不是越长越好？**
+
+密钥长度翻倍，安全性不是线性增长，但性能开销是指数级增长。RSA-4096 的解密速度大约是 RSA-2048 的 1/8。
+
+对于大多数应用，2048 位已经足够安全。更重要的是正确使用填充方案。
+:::
+
+### RSA-2048 vs RSA-4096 的权衡
+
+| 维度 | RSA-2048 | RSA-4096 |
+|------|----------|----------|
+| 安全强度 | 约 112 位 | 约 128 位 |
+| 密钥生成 | ~500ms | ~3000ms |
+| 加密 | ~5ms | ~15ms |
+| 解密 | ~50ms | ~400ms |
+| 签名 | ~50ms | ~400ms |
+| 证书大小 | 256 字节 | 512 字节 |
+| TLS 握手开销 | 中等 | 较高 |
+
+### Java 实现最佳实践
+
+```java title="SecureRsaUtils.java"
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
+import java.security.*;
+import java.security.spec.MGF1ParameterSpec;
+import java.util.Base64;
+
+public class SecureRsaUtils {
+    
+    private static final int KEY_SIZE = 2048;
+    private static final String HASH_ALGO = "SHA-256";
+    private static final String MGF_ALGO = "MGF1";
+    
+    /**
+     * 生成密钥对
+     */
+    public static KeyPair generateKeyPair() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(KEY_SIZE, new SecureRandom());
+        return generator.generateKeyPair();
+    }
+    
+    /**
+     * OAEP 加密（推荐）
+     */
+    public static String encryptOAEP(String plaintext, PublicKey publicKey) 
+            throws Exception {
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        
+        OAEPParameterSpec spec = new OAEPParameterSpec(
+            HASH_ALGO,
+            MGF_ALGO,
+            new MGF1ParameterSpec(HASH_ALGO),
+            PSource.PSpecified.DEFAULT
+        );
+        
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey, spec);
+        return Base64.getEncoder().encodeToString(
+            cipher.doFinal(plaintext.getBytes("UTF-8"))
+        );
+    }
+    
+    /**
+     * OAEP 解密
+     */
+    public static String decryptOAEP(String ciphertext, PrivateKey privateKey) 
+            throws Exception {
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        
+        OAEPParameterSpec spec = new OAEPParameterSpec(
+            HASH_ALGO,
+            MGF_ALGO,
+            new MGF1ParameterSpec(HASH_ALGO),
+            PSource.PSpecified.DEFAULT
+        );
+        
+        cipher.init(Cipher.DECRYPT_MODE, privateKey, spec);
+        return new String(
+            cipher.doFinal(Base64.getDecoder().decode(ciphertext)),
+            "UTF-8"
+        );
+    }
+    
+    /**
+     * PSS 签名（推荐）
+     */
+    public static byte[] signPSS(String message, PrivateKey privateKey) 
+            throws Exception {
+        Signature signature = Signature.getInstance("SHA256withRSA/PSS");
+        signature.setParameter(new PSSParameterSpec(
+            HASH_ALGO, MGF_ALGO, 
+            new MGF1ParameterSpec(HASH_ALGO),
+            32, PSSParameterSpec.TRAILER_FIELD_ABORT
+        ));
+        signature.initSign(privateKey);
+        signature.update(message.getBytes("UTF-8"));
+        return signature.sign();
+    }
+    
+    /**
+     * PSS 验签
+     */
+    public static boolean verifyPSS(byte[] signature, String message, 
+            PublicKey publicKey) throws Exception {
+        Signature sig = Signature.getInstance("SHA256withRSA/PSS");
+        sig.setParameter(new PSSParameterSpec(
+            HASH_ALGO, MGF_ALGO, 
+            new MGF1ParameterSpec(HASH_ALGO),
+            32, PSSParameterSpec.TRAILER_FIELD_ABORT
+        ));
+        sig.initVerify(publicKey);
+        sig.update(message.getBytes("UTF-8"));
+        return sig.verify(signature);
+    }
+}
+```
+
+### 私钥保护
+
+```java title="PrivateKeyProtection.java"
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.cert.Certificate;
+
+public class PrivateKeyProtection {
+    
+    /**
+     * 将私钥存入 KeyStore
+     * 
+     * KeyStore 类型：
+     * - JKS：Java 专用，已不推荐
+     * - PKCS12：跨平台推荐
+     * - PKCS11：用于访问 HSM
+     */
+    public static void storePrivateKey(PrivateKey privateKey, 
+            Certificate certificate,
+            char[] password,
+            String alias) throws Exception {
+        
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        keyStore.load(null, null);  // 初始化空 keystore
+        
+        keyStore.setKeyEntry(
+            alias,
+            privateKey,
+            password,
+            new Certificate[]{certificate}
+        );
+        
+        // 写入文件
+        try (FileOutputStream fos = new FileOutputStream("keystore.p12")) {
+            keyStore.store(fos, password);
+        }
+    }
+    
+    /**
+     * 从 KeyStore 加载私钥
+     */
+    public static PrivateKey loadPrivateKey(String keyStorePath, 
+            char[] password,
+            String alias) throws Exception {
+        
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        try (FileInputStream fis = new FileInputStream(keyStorePath)) {
+            keyStore.load(fis, password);
+        }
+        
+        return (PrivateKey) keyStore.getKey(alias, password);
+    }
+}
+```
+
+---
+
+## 思考题
+
+**问题 1**：假设你发现系统中使用了 RSA-1024 密钥，并且正在考虑升级到更长的密钥。以下哪种升级方案更合理？请分析利弊。
+
+A. 直接将所有密钥升级到 RSA-4096
+B. 分阶段升级：先升级到 RSA-2048，再逐步升级到 RSA-4096
+C. 考虑迁移到 ECC（椭圆曲线密码学）
+
+<details>
+<summary>参考答案</summary>
+
+**方案分析**：
+
+**A. 直接升级到 RSA-4096**
+
+优点：
+- 一步到位，未来不需要再次升级
+- 最高安全性
+
+缺点：
+- 性能开销显著（约 8 倍）
+- 兼容性风险：某些老系统可能不支持
+- 证书体积增大，增加 TLS 握手开销
+- 实施风险大，回滚困难
+
+**B. 分阶段升级到 RSA-2048 再到 RSA-4096**
+
+优点：
+- RSA-2048 已经是业界标准，兼容性良好
+- 性能可接受（相比 RSA-1024 约 4 倍开销）
+- 可以分批次升级，降低风险
+- 给旧系统留出更新时间
+
+缺点：
+- 需要两次升级工作
+- RSA-2048 的安全性到 2030 年后可能不足
+
+**C. 迁移到 ECC**
+
+优点：
+- 相同安全强度下，密钥长度短得多（ECC-256 ≈ RSA-2048）
+- 性能更好（加密/解密速度更快）
+- 更适合移动端和 IoT 场景
+- 未来升级路径更平滑（曲线参数固定）
+
+缺点：
+- 某些老系统可能不支持
+- 需要替换所有现有密钥和证书
+- 迁移复杂度最高
+- 如果依赖 RSA 特有的功能（如某些密钥协商），需要重新设计
+
+**推荐方案**：
+
+```
+对于大多数系统，推荐方案 B：
+1. 立即将 RSA-1024 升级到 RSA-2048
+2. 在证书层面设置双证书机制（新证书 RSA-2048，旧证书 RSA-1024）
+3. 监控兼容性问题
+4. 根据业务需求，决定是否进一步升级到 RSA-4096 或迁移到 ECC
+
+对于新系统，推荐方案 C：
+1. 直接使用 ECC
+2. 兼容层支持 RSA 作为备选
+3. 减少未来的升级压力
+```
+
+</details>
+
+**问题 2**：解释为什么 RSA 加密不适合直接加密大量数据。在实际应用中，应该如何结合对称加密和非对称加密？
+
+<details>
+<summary>参考答案</summary>
+
+**RSA 加密不适合大量数据的原因**：
+
+1. **大小限制**
+```
+RSA 加密的数据长度 = 密钥长度 - 填充开销
+RSA-2048: 256 - 66 = 190 字节（OAEP-256）
+RSA-4096: 512 - 66 = 446 字节
+
+190 字节能存什么？
+- 一段短密码
+- 一个 AES 密钥
+- 几个字段的用户信息
+
+190 字节不能存什么？
+- 任何中等长度的文本
+- 图片、文件
+- 任何实际应用数据
+```
+
+2. **性能问题**
+```
+性能对比（RSA-2048 vs AES-256）：
+- RSA 加密 1KB：约 50ms
+- AES 加密 1MB：约 5ms
+
+RSA 加密 1KB 的时间，够 AES 加密 10MB
+```
+
+**混合加密方案**：
+
+```
+原理：
+1. 用非对称加密传输对称密钥（解决密钥分发问题）
+2. 用对称加密加密实际数据（解决性能问题）
+```
+
+```java title="HybridEncryption.java"
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import java.security.KeyPair;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+public class HybridEncryption {
+    
+    private static final int AES_KEY_SIZE = 256;
+    private static final int GCM_IV_SIZE = 12;
+    private static final int GCM_TAG_SIZE = 128;
+    
+    /**
+     * 混合加密
+     * 1. 生成随机 AES 密钥
+     * 2. 用 AES 加密数据
+     * 3. 用 RSA 公钥加密 AES 密钥
+     * 4. 组合 IV + 密文 + 标签 + 加密的密钥
+     */
+    public static String encrypt(String plaintext, KeyPair keyPair) 
+            throws Exception {
+        
+        // 1. 生成随机 AES 密钥
+        KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+        keyGen.init(AES_KEY_SIZE, new SecureRandom());
+        SecretKey aesKey = keyGen.generateKey();
+        
+        // 2. 生成随机 IV
+        byte[] iv = new byte[GCM_IV_SIZE];
+        new SecureRandom().nextBytes(iv);
+        
+        // 3. AES-GCM 加密
+        Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_SIZE, iv);
+        aesCipher.init(Cipher.ENCRYPT_MODE, aesKey, gcmSpec);
+        byte[] ciphertext = aesCipher.doFinal(plaintext.getBytes("UTF-8"));
+        
+        // 4. RSA-OAEP 加密 AES 密钥
+        Cipher rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        rsaCipher.init(Cipher.ENCRYPT_MODE, keyPair.getPublic());
+        byte[] encryptedAesKey = rsaCipher.doFinal(aesKey.getEncoded());
+        
+        // 5. 组合所有部分
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        baos.write(encryptedAesKey.length >> 8);
+        baos.write(encryptedAesKey.length & 0xFF);
+        baos.write(encryptedAesKey);
+        baos.write(iv);
+        baos.write(ciphertext);
+        
+        return Base64.getEncoder().encodeToString(baos.toByteArray());
+    }
+    
+    /**
+     * 混合解密
+     */
+    public static String decrypt(String encryptedData, KeyPair keyPair) 
+            throws Exception {
+        byte[] data = Base64.getDecoder().decode(encryptedData);
+        ByteArrayInputStream bais = new ByteArrayInputStream(data);
+        
+        // 1. 读取加密的 AES 密钥
+        int keyLen = (bais.read() << 8) | bais.read();
+        byte[] encryptedAesKey = new byte[keyLen];
+        bais.read(encryptedAesKey);
+        
+        // 2. RSA-OAEP 解密获取 AES 密钥
+        Cipher rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        rsaCipher.init(Cipher.DECRYPT_MODE, keyPair.getPrivate());
+        byte[] aesKeyBytes = rsaCipher.doFinal(encryptedAesKey);
+        SecretKey aesKey = new SecretKeySpec(aesKeyBytes, "AES");
+        
+        // 3. 读取 IV
+        byte[] iv = new byte[GCM_IV_SIZE];
+        bais.read(iv);
+        
+        // 4. 读取密文
+        byte[] ciphertext = bais.readAllBytes();
+        
+        // 5. AES-GCM 解密
+        Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_SIZE, iv);
+        aesCipher.init(Cipher.DECRYPT_MODE, aesKey, gcmSpec);
+        byte[] plaintext = aesCipher.doFinal(ciphertext);
+        
+        return new String(plaintext, "UTF-8");
+    }
+}
+```
+
+**为什么 GCM 模式优于 CBC**：
+
+| 模式 | 认证 | 错误传播 | 推荐场景 |
+|------|------|----------|----------|
+| CBC | 无 | 错误影响当前块和后续块 | 不推荐 |
+| GCM | 有（内置完整性验证） | 任何篡改可检测 | **推荐** |
+
+GCM 模式同时提供了机密性和完整性验证，一次计算完成两种保护。
+
+</details>

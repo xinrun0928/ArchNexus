@@ -1,0 +1,1156 @@
+---
+title: OWASP API Security Top 10
+description: 深入解析 OWASP API Security Top 10 2023 版本的十大风险类型、攻击手法、真实案例与防御策略。
+---
+
+2019 年，某社交媒体平台的 API 被曝出存在大规模数据泄露。攻击者利用批量用户 ID 查询接口，遍历获取了超过 5 亿用户的个人信息，包括电话号码、邮箱、生日等。事后分析发现，这个漏洞存在已久，且攻击手法并不复杂——正是 API 特有的「失效对象级授权」。
+
+这个案例被 OWASP 收录为 API1:2023 风险的典型案例，并推动了 API 安全领域的系统性反思。
+
+## OWASP API Security Top 10 2023
+
+2023 年，OWASP 发布了更新版的 API 安全风险排名，反映了当前 API 面临的最严重威胁：
+
+```mermaid
+mindmap
+  root((API 安全 Top 10))
+    API1 失效的对象级授权
+      直接访问他人资源
+      批量查询滥用
+    API2 失效的身份认证
+      Token 泄露
+      弱密码策略
+      认证绕过
+    API3 失效的对象属性级授权
+      过度暴露字段
+      字段级越权
+    API4 不受限的资源消耗
+      无限流
+      内存耗尽
+    API5 失效的功能级授权
+      垂直越权
+      管理接口暴露
+    API6 不受限的敏感业务访问
+      SSRF
+      内部服务探测
+    API7 错误的配置
+      CORS 错误
+      调试模式开启
+    API8 注入
+      SQL 注入
+      NoSQL 注入
+    API9 不当的资产管理
+      旧版本未维护
+      文档泄露
+    API10 不充分的日志与监控
+      攻击未被检测
+      事后无法溯源
+```
+
+## API1:2023 — 失效的对象级授权（Broken Object Level Authorization, BOLA）
+
+### 风险描述
+
+API 访问对象时未验证用户是否有权访问该对象。攻击者通过修改请求中的对象 ID（如 URL 中的资源标识符），访问不属于自己的对象。
+
+### 攻击手法
+
+```http
+# 正常请求：获取当前用户的订单
+GET /api/v1/orders/12345
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# 攻击：修改订单 ID，尝试获取他人订单
+GET /api/v1/orders/12346
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# 批量攻击：枚举所有订单
+GET /api/v1/orders/1
+GET /api/v1/orders/2
+GET /api/v1/orders/3
+...
+```
+
+### 真实案例
+
+**Facebook 漏洞赏金案例**：研究员通过修改 GraphQL API 中的 `photo_id` 参数，访问了任意用户的私密照片，包括已删除的照片。
+
+**具体攻击流程**：
+
+1. 下载自己的照片，获取其 photo_id
+2. 将 photo_id 修改为其他用户的 photo_id
+3. 请求被返回，说明存在越权访问
+
+### 防御措施
+
+```java title="对象级授权检查"
+@Service
+public class OrderAccessService {
+    
+    @Autowired
+    private OrderRepository orderRepository;
+    
+    /**
+     * 获取订单前的权限验证
+     */
+    public Order getOrder(Long orderId, Long userId) {
+        Order order = orderRepository.findById(orderId)
+            .orElseThrow(() -> new OrderNotFoundException(orderId));
+        
+        // 关键：验证当前用户是否有权访问此订单
+        if (!order.getOwnerId().equals(userId)) {
+            // 检查是否是共享订单
+            if (!orderShareRepository.isShared(orderId, userId)) {
+                throw new UnauthorizedAccessException(
+                    "用户 " + userId + " 无权访问订单 " + orderId
+                );
+            }
+        }
+        
+        return order;
+    }
+    
+    /**
+     * 通用授权检查方法
+     */
+    private void verifyObjectAccess(Object resource, Long userId, 
+                                   Function<Object, Long> getOwnerId) {
+        Long resourceOwnerId = getOwnerId.apply(resource);
+        
+        if (!resourceOwnerId.equals(userId)) {
+            log.warn("检测到越权访问: user={}, resource={}, owner={}", 
+                userId, resource, resourceOwnerId);
+            
+            // 可以选择记录但不拒绝（蜜罐策略）
+            if (securityConfig.isHoneyPotEnabled()) {
+                return;
+            }
+            
+            throw new UnauthorizedAccessException("无权访问此资源");
+        }
+    }
+}
+```
+
+## API2:2023 — 失效的身份认证（Broken Authentication）
+
+### 风险描述
+
+API 的认证机制实现存在缺陷，允许攻击者获得他人有效 Token 或冒充其他用户。
+
+### 常见认证漏洞
+
+| 漏洞类型 | 描述 | 风险 |
+| --- | --- | --- |
+| 弱 Token 生成 | Token 可预测或使用弱密钥 | 高 |
+| Token 不验证 | 不检查 Token 签名或过期时间 | 极高 |
+| 认证绕过 | 通过删除参数、修改头部绕过 | 高 |
+| 密码策略弱 | 允许弱密码，无登录尝试限制 | 高 |
+| 会话固定 | 攻击者可以固定用户会话 ID | 中 |
+
+### 攻击场景
+
+```http
+# 场景1：Token 不验证签名
+# 攻击者使用空签名创建 Token
+POST /api/v1/admin/action
+Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9.
+
+# 场景2：绕过认证
+# 删除 Authorization 头
+GET /api/v1/users/me
+
+# 修改 JWT 算法的 kid 参数
+GET /api/v1/users/me
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImFkbWluIn0...
+
+# 场景3：使用已撤销的 Token
+# JWT 没有包含 token_id，无法验证是否已撤销
+```
+
+### 防御措施
+
+```java title="强化 JWT 验证"
+@Configuration
+public class JwtAuthenticationConfig {
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        return http
+            // 禁用 CSRF（API 使用 Token）
+            .csrf(csrf -> csrf.disable())
+            
+            // 禁用不安全的认证方式
+            .httpBasic(basic -> basic.disable())
+            .formLogin(form -> form.disable())
+            
+            // 配置 JWT 过滤器
+            .addFilterBefore(jwtAuthenticationFilter(), 
+                UsernamePasswordAuthenticationFilter.class)
+            
+            // 账户锁定配置
+            .userDetailsService(userDetailsService())
+                .passwordEncoder(passwordEncoder())
+            
+            .build();
+    }
+}
+
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    
+    private final JwtTokenProvider tokenProvider;
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                   HttpServletResponse response,
+                                   FilterChain chain) {
+        
+        String token = extractToken(request);
+        
+        if (StringUtils.hasText(token)) {
+            try {
+                // 1. 验证 Token 签名
+                Claims claims = tokenProvider.validateToken(token);
+                
+                // 2. 验证 Token ID（jti）未被撤销
+                String jti = claims.getId();
+                if (tokenRevocationService.isRevoked(jti)) {
+                    throw new TokenRevokedException();
+                }
+                
+                // 3. 验证 Token 主题
+                String subject = claims.getSubject();
+                if (subject == null || subject.isEmpty()) {
+                    throw new InvalidTokenException("Token subject is missing");
+                }
+                
+                // 4. 验证 Token 类型
+                String tokenType = claims.get("type", String.class);
+                if (!"access".equals(tokenType)) {
+                    throw new InvalidTokenException("Invalid token type");
+                }
+                
+                // 5. 提取权限并设置认证上下文
+                setAuthenticationContext(claims);
+                
+            } catch (ExpiredJwtException e) {
+                handleExpiredToken(response);
+            } catch (JwtException e) {
+                handleInvalidToken(response, e);
+            }
+        }
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+## API3:2023 — 失效的对象属性级授权（Broken Object Property Level Authorization）
+
+### 风险描述
+
+API 未正确验证用户是否有权访问特定的对象属性。攻击者可以读取或修改本无权访问的属性。
+
+### 攻击手法
+
+```http
+# 场景1：读取敏感属性
+# 正常响应只包含基本信息
+GET /api/v1/users/12345
+Response: {"id": 12345, "name": "张三", "email": "zhang@example.com"}
+
+# 尝试指定返回所有字段
+GET /api/v1/users/12345?fields=*
+Response: {"id": 12345, "name": "张三", "email": "zhang@example.com", 
+           "passwordHash": "sha256:xxx", "ssn": "***-**-1234"}
+
+# 场景2：修改不该修改的属性
+PUT /api/v1/users/12345
+{"name": "张三", "role": "admin"}
+
+# 场景3：通过其他端点访问敏感属性
+GET /api/v1/users/12345/profile
+# 返回更详细的 profile 信息
+```
+
+### 防御措施
+
+```java title="字段级授权控制"
+@RestController
+public class UserController {
+    
+    @Autowired
+    private FieldAuthorizationService fieldAuthService;
+    
+    /**
+     * 用户查询，统一处理字段过滤
+     */
+    @GetMapping("/api/v1/users/{id}")
+    public UserDto getUser(@PathVariable Long id,
+                           @RequestParam(required = false) String fields) {
+        
+        User user = userService.findById(id);
+        
+        // 获取当前用户
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        
+        // 确定允许返回的字段
+        Set<String> allowedFields = fieldAuthService.getReadableFields(
+            auth, user, "User"
+        );
+        
+        // 如果请求指定了字段，验证是否在允许范围内
+        if (fields != null) {
+            Set<String> requestedFields = parseFields(fields);
+            if (!allowedFields.containsAll(requestedFields)) {
+                throw new UnauthorizedFieldAccessException();
+            }
+            return user.toDto(requestedFields);
+        }
+        
+        return user.toDto(allowedFields);
+    }
+    
+    /**
+     * 用户更新，统一处理字段写入权限
+     */
+    @PutMapping("/api/v1/users/{id}")
+    public UserDto updateUser(@PathVariable Long id, 
+                              @RequestBody Map<String, Object> updates) {
+        
+        User user = userService.findById(id);
+        
+        // 获取可写字段
+        Set<String> writableFields = fieldAuthService.getWritableFields(
+            auth, user, "User"
+        );
+        
+        // 过滤不允许修改的字段
+        Map<String, Object> filteredUpdates = updates.entrySet().stream()
+            .filter(e -> writableFields.contains(e.getKey()))
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        
+        // 拒绝敏感字段修改
+        Set<String> sensitiveFields = Set.of("role", "permissions", "password");
+        for (String sensitiveField : sensitiveFields) {
+            if (updates.containsKey(sensitiveField)) {
+                log.warn("尝试修改敏感字段 {}，已拒绝", sensitiveField);
+                throw new SensitiveFieldModificationException(sensitiveField);
+            }
+        }
+        
+        return userService.update(id, filteredUpdates);
+    }
+}
+```
+
+## API4:2023 — 不受限的资源消耗（Unrestricted Resource Consumption）
+
+### 风险描述
+
+API 未限制客户端可以请求的资源大小和数量。攻击者可以利用这一点耗尽服务资源，导致服务降级或中断。
+
+### 攻击场景
+
+| 攻击类型 | 描述 | 影响 |
+| --- | --- | --- |
+| 无限流攻击 | 发送大量请求 | DoS |
+| 大文件上传 | 上传超大文件 | 磁盘耗尽 |
+| 复杂查询 | 查询返回大量数据 | 内存耗尽 |
+| 嵌套查询 | 深度嵌套的数据结构 | CPU 耗尽 |
+| 批量操作 | 一次性提交大量操作 | 数据库过载 |
+
+```http
+# 场景1：分页参数滥用
+GET /api/v1/users?page=1&size=1000000
+
+# 场景2：搜索参数滥用
+GET /api/v1/users?search=*&limit=1000000
+
+# 场景3：嵌套查询
+GET /api/v1/orders?include=items,items.product,items.product.category,...
+
+# 场景4：文件上传大小
+POST /api/v1/documents
+Content-Type: multipart/form-data
+file: [100MB file]
+```
+
+### 防御措施
+
+```java title="资源消耗限制"
+@Configuration
+public class ResourceLimitConfig {
+    
+    @Bean
+    public FilterRegistrationBean<ResourceLimitFilter> resourceLimitFilter() {
+        FilterRegistrationBean<ResourceLimitFilter> registration = 
+            new FilterRegistrationBean<>();
+        
+        registration.setFilter(new ResourceLimitFilter());
+        registration.addUrlPatterns("/api/*");
+        
+        return registration;
+    }
+}
+
+public class ResourceLimitFilter implements Filter {
+    
+    // 资源配置
+    private static final int MAX_PAGE_SIZE = 100;
+    private static final int MAX_UPLOAD_SIZE = 10 * 1024 * 1024;  // 10MB
+    private static final int MAX_SEARCH_RESULTS = 1000;
+    private static final int MAX_NESTING_DEPTH = 3;
+    private static final int MAX_STRING_LENGTH = 10000;
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response,
+                        FilterChain chain) throws IOException, ServletException {
+        
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // 1. 限制分页大小
+        String pageSize = httpRequest.getParameter("size");
+        if (pageSize != null) {
+            int size = Integer.parseInt(pageSize);
+            if (size > MAX_PAGE_SIZE) {
+                sendError(httpResponse, 400, "PAGE_SIZE_EXCEEDED", 
+                    "每页最多 " + MAX_PAGE_SIZE + " 条");
+                return;
+            }
+        }
+        
+        // 2. 限制查询结果数
+        String limit = httpRequest.getParameter("limit");
+        if (limit != null) {
+            int l = Integer.parseInt(limit);
+            if (l > MAX_SEARCH_RESULTS) {
+                sendError(httpResponse, 400, "SEARCH_LIMIT_EXCEEDED",
+                    "查询最多返回 " + MAX_SEARCH_RESULTS + " 条");
+                return;
+            }
+        }
+        
+        // 3. 限制 include 嵌套深度
+        String include = httpRequest.getParameter("include");
+        if (include != null && countNestingDepth(include) > MAX_NESTING_DEPTH) {
+            sendError(httpResponse, 400, "NESTING_DEPTH_EXCEEDED",
+                "嵌套深度最多 " + MAX_NESTING_DEPTH + " 层");
+            return;
+        }
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+## API5:2023 — 失效的功能级授权（Broken Function Level Authorization）
+
+### 风险描述
+
+API 使用了隐藏或未正确保护的端点来实现访问控制。攻击者通过猜测或枚举 API 端点，获得本不该访问的管理功能。
+
+### 常见漏洞
+
+| 漏洞类型 | 描述 | 示例 |
+| --- | --- | --- |
+| 隐藏端点 | 管理接口未保护 | `/api/admin/users` |
+| HTTP 方法滥用 | GET 可以做 DELETE | GET /api/users/123 (DELETE) |
+| 猜测端点 | 管理员端点无认证 | `/api/v1/internal/stats` |
+| 版本差异 | 新版本有保护，旧版本没有 | `/api/v1/...` vs `/api/v2/...` |
+
+```http
+# 场景1：隐藏的管理端点
+# 普通用户访问管理 API
+GET /api/v1/admin/users
+# 403 Forbidden
+
+# 但直接访问 JSON API 可能绕过
+GET /api/v1/admin/users.json
+# 200 OK!
+
+# 场景2：HTTP 方法不限制
+# 尝试 DELETE 方法
+GET /api/v1/users/123?_method=DELETE
+# 如果后端框架支持 method override
+
+# 场景3：猜测内部端点
+GET /api/v1/internal/health
+GET /api/v1/internal/config
+GET /api/debug/pprof
+```
+
+### 防御措施
+
+```java title="功能级授权配置"
+@Configuration
+@EnableMethodSecurity
+public class AuthorizationConfig {
+    
+    /**
+     * 配置端点级别的访问控制
+     */
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        return http
+            .authorizeHttpRequests(auth -> auth
+                // 公开端点
+                .requestMatchers("/api/v1/public/**").permitAll()
+                .requestMatchers("/api/v1/auth/**").permitAll()
+                .requestMatchers("/health").permitAll()
+                
+                // 用户端点 - 需要认证
+                .requestMatchers("/api/v1/users/me/**")
+                    .access(new AuthorizationManager<HttpServletRequest>() {
+                        @Override
+                        public AuthorizationDecision check(
+                                Authentication authentication,
+                                HttpServletRequest request) {
+                            return new AuthorizationDecision(
+                                authentication.isAuthenticated()
+                            );
+                        }
+                    })
+                
+                // 管理员端点 - 需要 ADMIN 角色
+                .requestMatchers("/api/v1/admin/**")
+                    .hasRole("ADMIN")
+                
+                // 内部端点 - 需要 SYSTEM 或 INTERNAL_SERVICE 角色
+                .requestMatchers("/api/v1/internal/**")
+                    .hasAnyRole("SYSTEM", "INTERNAL_SERVICE")
+                
+                // 调试端点 - 生产环境禁用
+                .requestMatchers("/api/debug/**")
+                    .access((authentication, object) -> {
+                        HttpServletRequest request = 
+                            object.getRequest();
+                        if ("prod".equals(getCurrentEnvironment())) {
+                            return new AuthorizationDecision(false);
+                        }
+                        return new AuthorizationDecision(true);
+                    })
+                
+                // 默认拒绝
+                .anyRequest().authenticated()
+            )
+            .build();
+    }
+    
+    /**
+     * 方法级别的权限检查
+     */
+    @Bean
+    public MethodSecurityExpressionHandler methodSecurityExpressionHandler(
+            PermissionEvaluator permissionEvaluator) {
+        
+        DefaultMethodSecurityExpressionHandler handler = 
+            new DefaultMethodSecurityExpressionHandler();
+        handler.setPermissionEvaluator(permissionEvaluator);
+        
+        return handler;
+    }
+}
+
+@Service
+public class AdminUserService {
+    
+    /**
+     * 删除用户 - 需要明确授权检查
+     */
+    @PreAuthorize("hasRole('ADMIN') and " +
+                  "@permissionEvaluator.hasPermission('USER', 'DELETE')")
+    public void deleteUser(Long userId) {
+        // 实现删除逻辑
+    }
+    
+    /**
+     * 查看审计日志 - 双重检查
+     */
+    @PreAuthorize("hasRole('AUDITOR') or hasRole('ADMIN')")
+    @PreAuthorize("@permissionEvaluator.hasPermission('AUDIT_LOG', 'READ')")
+    public List<AuditLog> getAuditLogs(Date startDate, Date endDate) {
+        // 实现查询逻辑
+    }
+}
+```
+
+## API6:2023 — 不受限的敏感业务访问（Server Side Request Forgery, SSRF）
+
+### 风险描述
+
+API 未验证客户端提供的 URL 地址，可能导致服务端向任意地址发起请求，从而访问内部系统或进行端口扫描。
+
+### 攻击场景
+
+```http
+# 场景1：图片 URL 验证
+# 正常请求：提供外部图片 URL
+POST /api/v1/profile/avatar
+{"avatarUrl": "https://example.com/avatar.jpg"}
+
+# 攻击：探测内网服务
+{"avatarUrl": "http://192.168.1.1/admin"}
+{"avatarUrl": "http://localhost:6379/"}
+{"avatarUrl": "file:///etc/passwd"}
+
+# 场景2：Webhook URL
+POST /api/v1/webhook/test
+{"callbackUrl": "http://169.254.169.254/latest/meta-data/"}
+
+# 场景3：文件预览
+POST /api/v1/document/preview
+{"url": "http://internal.corp.com/confidential.pdf"}
+```
+
+### 防御措施
+
+```java title="SSRF 防护"
+@Service
+public class UrlValidator {
+    
+    private static final Set<String> BLOCKED_HOSTS = Set.of(
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "metadata.google.internal",  // GCP 元数据
+        "169.254.169.254",           // AWS 元数据
+        "metadata.azure.com"
+    );
+    
+    private static final Set<String> ALLOWED_SCHEMES = Set.of(
+        "http", "https"
+    );
+    
+    private static final Set<String> BLOCKED_PROTOCOLS = Set.of(
+        "file", "ftp", "gopher"
+    );
+    
+    /**
+     * 验证 URL 是否安全
+     */
+    public ValidationResult validateUrl(String urlString) {
+        try {
+            URL url = new URL(urlString);
+            
+            // 1. 检查协议
+            if (!ALLOWED_SCHEMES.contains(url.getProtocol().toLowerCase())) {
+                return ValidationResult.rejected("不允许的协议: " + url.getProtocol());
+            }
+            
+            // 2. 检查主机名
+            String host = url.getHost().toLowerCase();
+            if (BLOCKED_HOSTS.contains(host)) {
+                return ValidationResult.rejected("不允许的主机: " + host);
+            }
+            
+            // 3. 检查 IP 地址（防止绕过）
+            String ip = resolveHost(host);
+            if (isPrivateIp(ip)) {
+                return ValidationResult.rejected("不允许访问内网 IP: " + ip);
+            }
+            
+            // 4. 检查 DNS 重绑定
+            InetAddress address = InetAddress.getByName(host);
+            if (address.isLoopbackAddress() || address.isSiteLocalAddress()) {
+                return ValidationResult.rejected("DNS 重绑定检测: " + host);
+            }
+            
+            // 5. 检查端口
+            int port = url.getPort() != -1 ? url.getPort() : url.getDefaultPort();
+            if (isBlockedPort(port)) {
+                return ValidationResult.rejected("不允许的端口: " + port);
+            }
+            
+            // 6. 发出实际请求前再次检查
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("HEAD");
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(5000);
+            
+            // 验证实际连接的地址
+            String actualHost = connection.getURL().getHost();
+            if (BLOCKED_HOSTS.contains(actualHost.toLowerCase())) {
+                return ValidationResult.rejected("重定向到阻止的主机");
+            }
+            
+            return ValidationResult.approved();
+            
+        } catch (MalformedURLException e) {
+            return ValidationResult.rejected("无效的 URL 格式");
+        } catch (IOException e) {
+            return ValidationResult.rejected("无法验证 URL: " + e.getMessage());
+        }
+    }
+    
+    private boolean isPrivateIp(String ip) {
+        try {
+            InetAddress address = InetAddress.getByName(ip);
+            return address.isLoopbackAddress() 
+                || address.isSiteLocalAddress()
+                || address.isLinkLocalAddress()
+                || address.isAnyLocalAddress();
+        } catch (UnknownHostException e) {
+            return true;
+        }
+    }
+    
+    private boolean isBlockedPort(int port) {
+        // 阻止常见危险端口
+        Set<Integer> dangerousPorts = Set.of(
+            22,    // SSH
+            23,    // Telnet
+            445,   // SMB
+            3389,  // RDP
+            5432,  // PostgreSQL
+            6379,  // Redis
+            27017  // MongoDB
+        );
+        return dangerousPorts.contains(port);
+    }
+}
+```
+
+## API7:2023 — 错误的配置（Security Misconfiguration）
+
+### 常见配置错误
+
+| 配置错误 | 描述 | 影响 |
+| --- | --- | --- |
+| 调试模式开启 | 生产环境暴露调试接口 | 信息泄露 |
+| CORS 配置错误 | 允许任意来源访问 | 数据泄露 |
+| 缺少安全头 | 未配置 CSP、X-Frame-Options | XSS、点击劫持 |
+| 默认账户 | 使用默认密码 | 未授权访问 |
+| 不必要的功能 | 启用了不需要的功能 | 增加攻击面 |
+| 错误信息泄露 | 详细错误堆栈暴露 | 漏洞探测 |
+
+### 防御措施
+
+```java title="安全配置清单"
+@Configuration
+public class SecurityHeadersConfig {
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        return http
+            // 禁用调试模式相关的端点
+            .addFilterBefore(debugEndpointFilter(), ChannelProcessingFilter)
+            
+            // 配置安全响应头
+            .headers(headers -> headers
+                // 防止点击劫持
+                .frameOptions(frame -> frame.deny())
+                
+                // XSS 防护
+                .xssProtection(xss -> xss.enable())
+                
+                // 内容类型嗅探防护
+                .contentTypeOptions(contentType -> contentType.strict())
+                
+                // 内容安全策略
+                .contentSecurityPolicy(csp -> csp
+                    .policyDirectives("default-src 'self'; " +
+                                     "script-src 'self'; " +
+                                     "object-src 'none'; " +
+                                     "base-uri 'self';")
+                )
+                
+                // Referrer 策略
+                .referrerPolicy(referrer -> 
+                    referrer.policy(ReferrerPolicy.StrictOriginWhenCrossOrigin)
+                )
+                
+                // 权限策略
+                .permissionsPolicy(permissions -> 
+                    permissions.policy("geolocation=(), microphone=(), camera=()")
+                )
+            )
+            
+            // 错误处理
+            .exceptionHandling(exceptions -> exceptions
+                .authenticationEntryPoint((request, response, authException) -> {
+                    response.setStatus(401);
+                    response.setContentType("application/json");
+                    response.getWriter().write(
+                        "{\"error\":\"UNAUTHORIZED\",\"message\":\"认证失败\"}"
+                    );
+                })
+                .accessDeniedHandler((request, response, accessDeniedException) -> {
+                    response.setStatus(403);
+                    response.setContentType("application/json");
+                    response.getWriter().write(
+                        "{\"error\":\"FORBIDDEN\",\"message\":\"权限不足\"}"
+                    );
+                })
+            )
+            
+            // CORS 配置
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            
+            .build();
+    }
+}
+
+@Configuration
+public class CorsConfig {
+    
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        
+        // 限制允许的来源
+        configuration.setAllowedOrigins(List.of("https://example.com"));
+        
+        // 限制允许的方法
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE"));
+        
+        // 限制允许的头部
+        configuration.setAllowedHeaders(List.of(
+            "Authorization", "Content-Type", "X-Request-ID"
+        ));
+        
+        // 允许凭证
+        configuration.setAllowCredentials(true);
+        
+        // 预检请求缓存时间
+        configuration.setMaxAge(3600L);
+        
+        // 暴露响应头
+        configuration.setExposedHeaders(List.of("X-Total-Count"));
+        
+        UrlBasedCorsConfigurationSource source = 
+            new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", configuration);
+        
+        return source;
+    }
+}
+```
+
+## API8:2023 — 注入（Injection）
+
+### 注入攻击类型
+
+| 类型 | 目标 | 风险 |
+| --- | --- | --- |
+| SQL 注入 | 数据库 | 数据泄露、权限提升 |
+| NoSQL 注入 | MongoDB、Redis 等 | 数据泄露 |
+| 命令注入 | 系统命令 | 服务器接管 |
+| LDAP 注入 | 目录服务 | 认证绕过 |
+| XPath 注入 | XML 数据 | 数据泄露 |
+| GraphQL 注入 | GraphQL API | 数据泄露 |
+
+### 攻击示例
+
+```http
+# SQL 注入
+GET /api/v1/users?search=admin' OR '1'='1
+
+# NoSQL 注入（MongoDB）
+GET /api/v1/users?filter={"$where":"1=1"}
+GET /api/v1/users?filter={"role":"admin","$exists":true}
+
+# 命令注入
+GET /api/v1/ping?host=google.com;cat /etc/passwd
+
+# GraphQL 注入
+POST /api/v1/graphql
+{
+  "query": "query { users(search: \"admin\") { name password } }"
+}
+
+# 批量查询滥用
+POST /api/v1/graphql
+{
+  "query": "query { u1: user(id:1) { name } u2: user(id:2) { name } ... }"
+}
+```
+
+### 防御措施
+
+```java title="注入防护"
+@Service
+public class SafeQueryService {
+    
+    /**
+     * 参数化查询（防止 SQL 注入）
+     */
+    public List<User> searchUsers(String keyword) {
+        // 使用参数化查询
+        String sql = "SELECT * FROM users WHERE name LIKE ?";
+        return jdbcTemplate.query(sql, 
+            preparedStatement -> {
+                preparedStatement.setString(1, "%" + escapeWildcards(keyword) + "%");
+            },
+            userRowMapper
+        );
+    }
+    
+    /**
+     * 输入转义
+     */
+    private String escapeWildcards(String input) {
+        // 只转义通配符，防止 LIKE 注入
+        return input
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_");
+    }
+}
+
+@Service
+public class MongoQueryService {
+    
+    /**
+     * NoSQL 注入防护
+     */
+    public List<Document> safeFind(String username) {
+        // 使用 Document 构造而非字符串解析
+        Document filter = new Document();
+        
+        // 用户名字段必须是字符串，不是操作符
+        if (username.contains("$")) {
+            throw new IllegalArgumentException("输入包含非法字符");
+        }
+        
+        filter.put("username", username);
+        
+        // 限制返回字段
+        Bson projection = new Document("_id", 1)
+            .append("username", 1)
+            .append("email", 1);
+        
+        return collection.find(filter)
+            .projection(projection)
+            .limit(100)  // 限制返回数量
+            .into(new ArrayList<>());
+    }
+}
+
+@Configuration
+public class GraphQLSecurityConfig {
+    
+    @Bean
+    public RuntimeWiringConfigurer runtimeWiringConfigurer(
+            DataFetcherInterceptor interceptor) {
+        
+        return wiringBuilder -> wiringBuilder
+            // 添加复杂度限制
+            .type("Query", builder -> builder
+                .dataFetcher("users", environment -> {
+                    // 检查查询深度
+                    if (environment.getFragmentsByRoot().size() > 5) {
+                        throw new SecurityException("查询复杂度超限");
+                    }
+                    return userService.getUsers();
+                })
+            )
+            // 限制字段数量
+            .field(new FieldVisibilityStrategy() {
+                @Override
+                public List<GraphQLFieldDefinition> getVisibleFields(
+                        List<GraphQLFieldDefinition> fields) {
+                    return fields.stream()
+                        .filter(f -> !isSensitiveField(f.getName()))
+                        .collect(Collectors.toList());
+                }
+                
+                private boolean isSensitiveField(String name) {
+                    return Set.of("password", "ssn", "creditCard")
+                        .contains(name.toLowerCase());
+                }
+            })
+            .build();
+    }
+}
+```
+
+## API9:2023 — 不当的资产管理（Improper Inventory Management）
+
+### 常见问题
+
+| 问题 | 描述 | 影响 |
+| --- | --- | --- |
+| 旧版本 API | 仍在使用的旧版本未维护 | 漏洞持续存在 |
+| 测试端点 | 测试环境端点暴露 | 信息泄露 |
+| 影子 API | 未记录的 API | 无安全防护 |
+| 文档泄露 | Swagger/OpenAPI 文档泄露 | 攻击面暴露 |
+| 默认端点 | 不必要的默认端点 | 增加攻击面 |
+
+### 防御措施
+
+```yaml title="API 版本管理策略"
+api:
+  versions:
+    v1:
+      deprecated: true
+      sunset_date: "2024-12-31"
+      migration_url: "/api/v2/migrate"
+      allowed: false  # 阻止访问
+      maintenance_only: true  # 只返回维护提示
+    
+    v2:
+      deprecated: false
+      current: true
+    
+    v3:
+      deprecated: false
+      beta: true
+
+  hidden_endpoints:
+    - "/api/v1/debug/*"      # 禁用所有调试端点
+    - "/api/v1/internal/*"   # 只允许内网访问
+    
+  documentation:
+    public:
+      enabled: false  # 禁止公开文档
+    authenticated:
+      enabled: true
+      roles:
+        - DEVELOPER
+        - ADMIN
+```
+
+```java title="API 版本控制过滤器"
+@Component
+public class ApiVersionFilter extends OncePerRequestFilter {
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain) {
+        
+        String path = request.getRequestURI();
+        ApiVersion version = extractVersion(path);
+        
+        if (version != null) {
+            VersionConfig config = versionConfig.get(version);
+            
+            if (config == null) {
+                sendError(response, 404, "VERSION_NOT_FOUND");
+                return;
+            }
+            
+            if (config.isDeprecated() && !config.isAllowed()) {
+                response.setHeader("Deprecation", "true");
+                response.setHeader("Sunset", config.getSunsetDate());
+                
+                if (isPastSunsetDate(config.getSunsetDate())) {
+                    sendError(response, 410, "VERSION_DEPRECATED",
+                        "此 API 版本已停用，请迁移到最新版本");
+                    return;
+                } else {
+                    response.setHeader("Warning", 
+                        "版本即将停用，请尽快迁移");
+                }
+            }
+        }
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+## API10:2023 — 不充分的日志与监控（Insufficient Logging & Monitoring）
+
+### 缺乏日志与监控的影响
+
+大多数安全事件（平均 200 天以上）都是通过第三方发现的，而非内部检测。这说明缺乏有效的日志和监控机制。
+
+| 缺失项 | 后果 |
+| --- | --- |
+| 认证失败未记录 | 暴力破解无法检测 |
+| 访问控制失败未记录 | 越权攻击无法检测 |
+| 敏感操作未记录 | 数据泄露无法溯源 |
+| 告警阈值设置不当 | 真实攻击被淹没 |
+| 日志未集中存储 | 无法关联分析 |
+
+### 防御措施
+
+详见 [API 安全监控与告警](/security/api/monitoring) 章节。
+
+## 总结：风险优先级矩阵
+
+| 优先级 | 风险 | 攻击难度 | 影响 | 漏洞普遍性 |
+| --- | --- | --- | --- | --- |
+| 1 | API1: 失效的对象级授权 | 低 | 高 | 高 |
+| 2 | API2: 失效的身份认证 | 低 | 高 | 高 |
+| 3 | API3: 失效的对象属性级授权 | 低 | 中 | 高 |
+| 4 | API4: 不受限的资源消耗 | 低 | 中 | 高 |
+| 5 | API5: 失效的功能级授权 | 中 | 高 | 中 |
+| 6 | API6: 不受限的敏感业务访问 | 中 | 高 | 低 |
+| 7 | API7: 错误的配置 | 高 | 中 | 高 |
+| 8 | API8: 注入 | 低 | 高 | 低 |
+| 9 | API9: 不当的资产管理 | 高 | 中 | 高 |
+| 10 | API10: 不充分的日志与监控 | 高 | 中 | 高 |
+
+## 思考题
+
+**问题 1**：在 API1（BOLA）中，批量 IDOR 和单个 IDOR 的防御策略有什么不同？为什么说批量攻击的危害更大？
+
+<details>
+<summary>参考答案</summary>
+
+**单个 IDOR vs 批量 IDOR 的区别**：
+
+| 维度 | 单个 IDOR | 批量 IDOR |
+| --- | --- | --- |
+| 攻击特征 | 低频、偶发 | 高频、自动化 |
+| 检测难度 | 难（请求量小） | 相对容易（请求量大） |
+| 影响范围 | 单个用户 | 大量用户 |
+| 防御重点 | 每次访问都校验 | 速率限制 + 异常检测 |
+
+**为什么批量攻击危害更大**：
+
+1. **数据泄露规模**：单次批量攻击可能泄露数万甚至数百万用户数据
+2. **难以察觉**：每次请求都是「合法」的（单个资源确实存在），只检查返回状态码无法检测
+3. **攻击成本低**：自动化脚本可以在短时间内遍历所有 ID
+
+**防御策略差异**：
+
+单个 IDOR：每次访问都必须验证所有权
+批量 IDOR：增加速率限制 + 异常行为检测（如同一用户短时间内访问大量不同资源）
+</details>
+
+**问题 2**：API4（不受限的资源消耗）可能导致 DoS 攻击，但很多开发者认为「限流会影响用户体验」。如何在安全和用户体验之间取得平衡？
+
+<details>
+<summary>参考答案</summary>
+
+**平衡策略**：
+
+1. **分层限流**：
+   - 普通用户：宽松限制（如每分钟 1000 次）
+   - API Key 用户：固定配额
+   - 认证用户 vs 未认证用户分开限制
+
+2. **优雅降级**：
+   - 超出限制后返回详细的重试信息
+   - 提供批量 API 替代高频单次请求
+
+3. **资源分级**：
+   - 简单查询：无限制或宽松
+   - 复杂聚合查询：严格限制
+   - 写入操作：中等限制
+
+4. **客户端 SDK**：
+   - 提供官方的 SDK，内置智能限流
+   - 客户端自动重试 + 退避
+
+5. **透明的配额信息**：
+   - 在响应头中返回剩余配额
+   - 让用户知道自己的使用情况
+
+6. **分级服务**：
+   - 免费用户：严格限制
+   - 付费用户：宽松限制
+   - 企业用户：可定制配额
+
+**最佳实践**：
+- 限制基于「业务合理性」，而非「系统极限」
+- 用户友好的错误消息，包含重试建议
+- 提供实时配额监控和告警
+</details>

@@ -1,0 +1,572 @@
+---
+title: API Key 与 Token 管理
+description: 深入讲解API Key的生成策略、安全存储、生命周期管理、作用域限制、泄露检测，以及与OAuth2 Access Token的对比。
+---
+
+API Key 是 API 认证中最古老也最简单的方式。1990 年代，Amazon Web Services 开创了这种方式，随后几乎所有开放平台都沿用了这一模式——开发者注册应用，获得一对 Key 和 Secret，用它们来签名请求，证明「我是这个应用的开发者」。
+
+但「简单」不等于「没有技术含量」。API Key 的管理不善，是大量安全事件的根源。2019 年，某知名云服务商因内部 API Key 泄露，导致大量用户数据被公开访问；2021 年，某社交平台因 API Key 硬编码在移动应用中，导致数百万用户数据被爬取。这些事件的共同特点是：**问题不在于 API Key 本身，而在于对 API Key 的管理**。
+
+## API Key 的工作原理
+
+API Key 认证的基本流程是：服务端为每个应用/用户分配一个唯一的字符串，客户端在请求中携带这个字符串，服务端校验其存在性和有效性。
+
+```http
+# 方式一：Header 传递（推荐）
+GET /api/v1/data HTTP/1.1
+Host: api.example.com
+X-API-Key: ak_live_8f3k9s2d4a1b7c9e5f3d8a2b4c6e9f
+
+# 方式二：Query 参数传递（不推荐）
+GET /api/v1/data?api_key=ak_live_8f3k9s2d4a1b7c9e5f3d8a2b4c6e9f HTTP/1.1
+
+# 方式三：Basic Auth（较少使用）
+GET /api/v1/data HTTP/1.1
+Authorization: Basic YWtfbGl2ZV84ZjNrOXMyZDRhMWI3YzllNWYzZDhhMmI0YzZlOWY6
+```
+
+**为什么 Query 参数不推荐**？因为 Key 会出现在 URL 中，可能被浏览器历史记录、服务器日志、Referer 头等地方记录，增加泄露风险。
+
+**为什么 Basic Auth 较少用于 API Key**？Basic Auth 通常用于用户名+密码场景，API Key 只有 Key 没有密码，不符合 Basic Auth 的语义。
+
+## API Key 的生成策略
+
+API Key 的生成必须满足两个特性：**唯一性**（不重复）和 **不可预测性**（无法猜测）。
+
+### 1. UUID v4
+
+```java title="ApiKeyGenerator.java"
+import java.util.UUID;
+
+public class ApiKeyGenerator {
+    
+    public static String generateApiKey() {
+        // UUID v4 使用随机数生成，128位熵
+        // 格式：xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+        return UUID.randomUUID().toString()
+            .replace("-", "")
+            .toLowerCase();
+    }
+    
+    public static void main(String[] args) {
+        System.out.println(generateApiKey());
+        // 输出示例：d8f3k9s24a1b7c9e5f3d8a2b4c6e9f
+    }
+}
+```
+
+**优点**：实现简单，库支持广泛。**缺点**：纯随机字符串，无业务含义，不便于管理。
+
+### 2. 前缀 + 随机数
+
+```java title="ApiKeyGenerator.java"
+import java.security.SecureRandom;
+import java.util.Base64;
+
+public class ApiKeyGenerator {
+    private static final String PREFIX = "ak_live_";
+    private static final SecureRandom RANDOM = new SecureRandom();
+    
+    public static String generateApiKey() {
+        // 128位随机数，Base64编码后约22字符
+        byte[] bytes = new byte[16];
+        RANDOM.nextBytes(bytes);
+        String randomPart = Base64.getUrlEncoder()
+            .withoutPadding()
+            .encodeToString(bytes);
+        return PREFIX + randomPart;
+    }
+    
+    public static void main(String[] args) {
+        System.out.println(generateApiKey());
+        // 输出示例：ak_live_Xn5sDf8L2kQ9mP3rT7wV1uY
+    }
+}
+```
+
+**优点**：前缀可以标识环境（`ak_live_` / `ak_test_`）或类型。**缺点**：需要确保随机数生成器的安全性。
+
+### 3. 结构化 API Key
+
+```java title="ApiKeyGenerator.java"
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.util.Base64;
+
+public class ApiKeyGenerator {
+    
+    public static String generateStructuredApiKey(
+            String clientId,
+            String environment,
+            byte[] secretBytes) throws Exception {
+        
+        // 组成部分：版本号 + 时间戳 + 客户端ID + 校验位
+        byte version = 1;
+        long timestamp = Instant.now().getEpochSecond();
+        
+        // 构建数据
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 8 + clientId.length() + secretBytes.length);
+        buffer.put(version);
+        buffer.putLong(timestamp);
+        buffer.put(clientId.getBytes());
+        buffer.put(secretBytes);
+        
+        // 计算校验和（取前4字节的SHA256）
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] hash = md.digest(buffer.array());
+        byte[] checksum = new byte[4];
+        System.arraycopy(hash, 0, checksum, 0, 4);
+        
+        // 编码
+        ByteBuffer finalBuffer = ByteBuffer.allocate(buffer.capacity() + 4);
+        finalBuffer.put(buffer.array());
+        finalBuffer.put(checksum);
+        
+        String encoded = Base64.getUrlEncoder()
+            .withoutPadding()
+            .encodeToString(finalBuffer.array());
+        
+        return String.format("%s_%s_%s", environment, clientId, encoded);
+    }
+}
+```
+
+**优点**：包含版本号、时间戳等元信息，便于服务端解析和校验。**缺点**：实现复杂。
+
+## API Key 的安全存储与传输
+
+### 服务端存储
+
+API Key 在服务端必须加密存储，绝不能明文保存。推荐使用 AES-256-GCM 加密：
+
+```java title="ApiKeyService.java"
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.security.SecureRandom;
+
+public class ApiKeyService {
+    
+    private static final String ALGORITHM = "AES/GCM/NoPadding";
+    private static final int GCM_IV_LENGTH = 12;
+    private static final int GCM_TAG_LENGTH = 128;
+    
+    // 加密存储
+    public String encryptApiKey(String plaintextKey, SecretKey encryptionKey) 
+            throws Exception {
+        // 生成随机IV
+        byte[] iv = new byte[GCM_IV_LENGTH];
+        new SecureRandom().nextBytes(iv);
+        
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        GCMParameterSpec parameterSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+        cipher.init(Cipher.ENCRYPT_MODE, encryptionKey, parameterSpec);
+        
+        byte[] ciphertext = cipher.doFinal(plaintextKey.getBytes());
+        
+        // 拼接 IV + 密文
+        ByteBuffer buffer = ByteBuffer.allocate(iv.length + ciphertext.length);
+        buffer.put(iv);
+        buffer.put(ciphertext);
+        
+        return Base64.getEncoder().encodeToString(buffer.array());
+    }
+    
+    // 解密使用
+    public String decryptApiKey(String encryptedKey, SecretKey encryptionKey) 
+            throws Exception {
+        byte[] decoded = Base64.getDecoder().decode(encryptedKey);
+        
+        ByteBuffer buffer = ByteBuffer.wrap(decoded);
+        byte[] iv = new byte[GCM_IV_LENGTH];
+        buffer.get(iv);
+        byte[] ciphertext = new byte[buffer.remaining()];
+        buffer.get(ciphertext);
+        
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        GCMParameterSpec parameterSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+        cipher.init(Cipher.DECRYPT_MODE, encryptionKey, parameterSpec);
+        
+        return new String(cipher.doFinal(ciphertext));
+    }
+}
+```
+
+:::warning 禁止明文存储
+API Key 是服务端的「密码」，必须加密存储。即使数据库被拖库，明文 API Key 也会直接导致所有用户的认证被攻破。
+:::
+
+### 客户端传输
+
+API Key 只能通过 HTTPS 传输，绝不允许 HTTP。明文传输的 API Key 容易被中间人攻击截获。
+
+```http
+# 错误：HTTP 明文传输
+GET /api/v1/data?api_key=ak_live_xxx HTTP/1.1
+
+# 正确：HTTPS 加密传输
+GET /api/v1/data HTTP/1.1
+Host: api.example.com
+X-API-Key: ak_live_xxx
+```
+
+移动应用中，API Key 不应该硬编码在代码里，而应该：
+
+1. 存放在安全存储区（iOS Keychain / Android Keystore）
+2. 通过远程配置获取，而不是打包在 App 中
+3. 使用代码混淆增加逆向难度
+
+## API Key 的生命周期管理
+
+API Key 的生命周期包括：创建、使用、轮转、撤销、销毁。每个阶段都需要相应的安全措施。
+
+### 1. 创建
+
+```java title="ApiKeyCreationService.java"
+public class ApiKeyCreationService {
+    
+    public ApiKey createApiKey(String userId, List<String> scopes, 
+                                Map<String, Object> metadata) {
+        // 生成 Key 和 Secret
+        String apiKey = ApiKeyGenerator.generateApiKey();
+        String apiSecret = ApiKeyGenerator.generateSecret();
+        
+        // 存储记录
+        ApiKeyRecord record = new ApiKeyRecord();
+        record.setKeyHash(hashApiKey(apiKey)); // 存储哈希而非明文
+        record.setEncryptedSecret(encryptSecret(apiSecret));
+        record.setUserId(userId);
+        record.setScopes(String.join(",", scopes));
+        record.setCreatedAt(Instant.now());
+        record.setExpiresAt(calculateExpiry());
+        record.setStatus("active");
+        
+        apiKeyRepository.save(record);
+        
+        // 只在创建时返回明文 Key，之后不再显示
+        return new ApiKey(apiKey, apiSecret, record.getExpiresAt());
+    }
+    
+    private String hashApiKey(String apiKey) {
+        // 使用 SHA-256 哈希，仅存储哈希值用于校验
+        return SHA256.hash(apiKey);
+    }
+}
+```
+
+**关键点**：创建时一次性返回明文 Key，之后服务端只存储哈希值用于快速校验。
+
+### 2. 轮转
+
+Key 轮转是指在不中断服务的情况下，用新 Key 替换旧 Key。
+
+```java title="ApiKeyRotationService.java"
+public class ApiKeyRotationService {
+    
+    public RotationResult rotateApiKey(String oldKeyHash) {
+        ApiKeyRecord oldRecord = apiKeyRepository.findByKeyHash(oldKeyHash)
+            .orElseThrow(() -> new ApiKeyNotFoundException());
+        
+        // 创建新 Key
+        String newApiKey = ApiKeyGenerator.generateApiKey();
+        String newSecret = ApiKeyGenerator.generateSecret();
+        
+        // 标记旧 Key 为「宽限期」
+        oldRecord.setStatus("rotating");
+        oldRecord.setRotatedAt(Instant.now());
+        oldRecord.setReplacementKeyHash(hashApiKey(newApiKey));
+        oldRecord.setGracePeriodEnd(Instant.now().plusSeconds(GRACE_PERIOD_SECONDS));
+        
+        // 创建新 Key 记录
+        ApiKeyRecord newRecord = new ApiKeyRecord();
+        newRecord.setKeyHash(hashApiKey(newApiKey));
+        newRecord.setEncryptedSecret(encryptSecret(newSecret));
+        newRecord.setUserId(oldRecord.getUserId());
+        newRecord.setScopes(oldRecord.getScopes());
+        newRecord.setCreatedAt(Instant.now());
+        newRecord.setStatus("active");
+        
+        apiKeyRepository.save(oldRecord);
+        apiKeyRepository.save(newRecord);
+        
+        return new RotationResult(newApiKey, newSecret, GRACE_PERIOD_SECONDS);
+    }
+}
+```
+
+**宽限期设计**：在轮转期间（通常 24-48 小时），新旧 Key 同时有效，给客户端足够的时间更新配置。
+
+### 3. 撤销
+
+Key 撤销是指立即使 Key 失效，通常在以下场景触发：
+
+- 用户主动撤销
+- 检测到 Key 泄露
+- 账户异常
+- 权限变更
+
+```java title="ApiKeyRevocationService.java"
+public class ApiKeyRevocationService {
+    
+    public void revokeApiKey(String keyHash, RevocationReason reason) {
+        ApiKeyRecord record = apiKeyRepository.findByKeyHash(keyHash)
+            .orElseThrow(() -> new ApiKeyNotFoundException());
+        
+        record.setStatus("revoked");
+        record.setRevokedAt(Instant.now());
+        record.setRevocationReason(reason.name());
+        
+        // 加入撤销列表（用于快速校验）
+        revocationList.add(keyHash);
+        
+        apiKeyRepository.save(record);
+        
+        // 发送告警通知
+        alertService.sendKeyRevocationAlert(record.getUserId(), reason);
+    }
+}
+```
+
+### 4. 清理过期 Key
+
+定期清理过期的 API Key，减少攻击面：
+
+```java title="ApiKeyCleanupJob.java"
+@Scheduled(cron = "0 0 3 * * ?") // 每天凌晨3点执行
+public void cleanupExpiredKeys() {
+    Instant expiryThreshold = Instant.now().minus(DAYS_AFTER_EXPIRY, ChronoUnit.DAYS);
+    
+    List<ApiKeyRecord> expiredRecords = apiKeyRepository
+        .findByStatusAndExpiresAtBefore("active", expiryThreshold);
+    
+    for (ApiKeyRecord record : expiredRecords) {
+        record.setStatus("expired");
+        record.setDeletedAt(Instant.now());
+        apiKeyRepository.save(record);
+        
+        auditLogger.log(new AuditEvent(
+            "API_KEY_EXPIRED",
+            record.getUserId(),
+            record.getKeyHash()
+        ));
+    }
+}
+```
+
+## API Key 的作用域限制
+
+API Key 应该遵循最小权限原则，只授予必要的访问范围。
+
+### 1. 访问范围限制
+
+```json title="api_key_scopes.json"
+{
+  "key_id": "ak_live_8f3k9s2d",
+  "scopes": [
+    "users:read",
+    "orders:read",
+    "orders:write:own"  // 只允许操作自己的订单
+  ],
+  "restrictions": {
+    "allowed_ips": ["10.0.0.0/8", "192.168.1.0/24"],
+    "allowed_domains": ["example.com"],
+    "rate_limit": {
+      "requests_per_second": 10,
+      "daily_quota": 10000
+    }
+  }
+}
+```
+
+### 2. 作用域校验
+
+```java title="ScopeValidator.java"
+public class ScopeValidator {
+    
+    public void validateAccess(String requiredScope, ApiKeyRecord keyRecord, 
+                                SecurityContext context) {
+        // 检查 Key 状态
+        if (!"active".equals(keyRecord.getStatus())) {
+            throw new ApiKeyInactiveException();
+        }
+        
+        // 检查作用域
+        Set<String> grantedScopes = parseScopes(keyRecord.getScopes());
+        if (!grantedScopes.contains(requiredScope)) {
+            throw new InsufficientScopeException(requiredScope);
+        }
+        
+        // 检查 IP 限制
+        if (keyRecord.getAllowedIps() != null) {
+            validateIpRestriction(context.getClientIp(), keyRecord.getAllowedIps());
+        }
+        
+        // 检查时间限制（如果配置了工作时间）
+        if (keyRecord.getAllowedHours() != null) {
+            validateTimeRestriction(context.getCurrentHour(), keyRecord.getAllowedHours());
+        }
+    }
+    
+    private void validateIpRestriction(String clientIp, List<String> allowedCidrs) {
+        for (String cidr : allowedCidrs) {
+            if (IpUtils.isInCidrRange(clientIp, cidr)) {
+                return;
+            }
+        }
+        throw new IpRestrictionViolationException(clientIp);
+    }
+}
+```
+
+## API Key 的泄露检测
+
+API Key 泄露的途径很多：代码仓库（硬编码）、日志文件、网络流量、钓鱼攻击。主动检测 Key 泄露是安全运营的重要环节。
+
+### 1. Git 提交扫描
+
+```bash title="git-secret-scan.sh"
+#!/bin/bash
+# 扫描 Git 历史中的 API Key
+git log --all -p | \
+  grep -E "(ak_live_|sk_live_|x-api-key|api.?key.?=)" | \
+  grep -v "test" | \
+  grep -v "example" | \
+  while read line; do
+    echo "[ALERT] Potential API Key found: $line"
+  done
+```
+
+### 2. 实时日志监控
+
+```java title="ApiKeyExposureDetector.java"
+public class ApiKeyExposureDetector {
+    
+    // 检测频繁失败的认证尝试
+    public void detectBruteForce(String apiKeyHash, String clientIp) {
+        String cacheKey = "auth_fail:" + apiKeyHash + ":" + clientIp;
+        Long failures = redis.incr(cacheKey);
+        redis.expire(cacheKey, FAILURE_WINDOW_SECONDS);
+        
+        if (failures > MAX_ALLOWED_FAILURES) {
+            // 触发告警并暂时封禁
+            alertService.sendBruteForceAlert(apiKeyHash, clientIp, failures);
+            securityService.temporarilyBlock(clientIp);
+        }
+    }
+    
+    // 检测异常访问模式
+    public void detectAnomalousUsage(ApiKeyRecord record, RequestContext context) {
+        // 新地理位置
+        if (!record.getLastKnownLocation().equals(context.getLocation())) {
+            alertService.sendNewLocationAlert(record.getKeyId(), context.getLocation());
+        }
+        
+        // 异常时间访问
+        if (!isWithinAllowedHours(context.getTimestamp())) {
+            alertService.sendOffHoursAccessAlert(record.getKeyId(), context.getTimestamp());
+        }
+        
+        // 批量数据导出检测
+        if (isLargeDataExport(context)) {
+            alertService.sendBulkExportAlert(record.getKeyId(), context.getDataSize());
+        }
+    }
+}
+```
+
+## OAuth2 Access Token 与 API Key 的对比
+
+很多开发者会混淆 OAuth2 Access Token 和 API Key。实际上，它们是不同层级的抽象。
+
+| 维度 | API Key | OAuth2 Access Token |
+| --- | --- | --- |
+| **定义** | 应用级别的标识符 | 用户授权的临时凭证 |
+| **获取方式** | 手动创建/API 注册 | OAuth2 授权流程 |
+| **关联对象** | 应用 | 用户+应用 |
+| **权限粒度** | 粗粒度（通常是应用级） | 细粒度（Scope） |
+| **生命周期** | 长期有效 | 短期有效 |
+| **撤销能力** | 即时 | 即时（Reference Token）或等待过期 |
+| **用户上下文** | 无 | 有 |
+| **典型使用** | 服务端间通信、开放平台 | 面向用户的数据访问 |
+
+**何时用哪个**：
+- **API Key**：应用是资源的Owner，不需要区分具体用户。例如，云服务的 API 密钥。
+- **OAuth2 Token**：需要区分不同用户的权限，需要细粒度授权。例如，第三方应用访问用户数据。
+
+## 思考题
+
+**问题 1**：为什么服务端应该存储 API Key 的哈希值而不是明文？这与密码存储有何相似之处？
+
+<details>
+<summary>参考答案</summary>
+
+**服务端存储哈希的原因**：
+
+1. **防止内部人员滥用**：即使 DBA 或有数据库访问权限的工程师，也无法看到真实的 API Key。
+2. **防止数据库拖库**：如果数据库被攻击者拖走，只有哈希值无法直接用于 API 调用。
+3. **审计一致性**：校验时只需比较哈希值，不需要解密。
+
+**与密码存储的相似之处**：
+
+- 都使用哈希算法（SHA-256、Bcrypt、Argon2）
+- 都建议加盐（Salt）防止彩虹表攻击
+- 都需要防暴力破解（密钥拉伸、速率限制）
+
+**区别**：
+- 密码用于人类记忆，通常需要可找回机制；API Key 是机器生成的，通常不需要可找回。
+- API Key 泄露通常意味着完整的凭证泄露（没有第二个验证因素），而密码泄露可能还有 MFA 保护。
+
+**最佳实践**：API Key 使用 SHA-256 哈希 + 唯一 Salt 即可，密钥拉伸（如 Argon2）会显著增加验证延迟，通常不需要。
+</details>
+
+**问题 2**：在微服务架构中，多个服务共用同一个 API Key 有何风险？
+
+<details>
+<summary>参考答案</summary>
+
+**共用 API Key 的风险**：
+
+1. **单点泄露**：任何一个服务被攻破，API Key 就泄露了，影响所有共用该 Key 的服务。
+
+2. **无法精确定位泄露源**：Key 被泄露后，无法确定是哪个服务在泄露，排查困难。
+
+3. **权限难以隔离**：共用 Key 意味着共用权限，无法实现服务间的权限隔离。
+
+4. **轮转影响范围大**：Key 需要轮转时，所有服务都需要更新。
+
+**推荐方案**：每个服务使用独立的 API Key，服务间的信任通过 mTLS（双向 TLS）建立，而不是共享 Key。
+
+**实际案例**：某公司内部服务共用同一个 API Key，某员工在公开博客中无意间粘贴了配置代码，导致整个内部 API 集群被外部访问。
+</details>
+
+**问题 3**：如何设计一个「自销毁」的 API Key，使得它在被泄露后能自动失效？
+
+<details>
+<summary>参考答案</summary>
+
+**方案一：基于 IP 的动态校验**
+
+API Key 的签名包含请求来源 IP 的哈希，服务端校验时验证 IP 是否匹配。如果 Key 被复制到其他 IP 使用，校验会失败。
+
+```http
+请求签名内容：Method + Path + Timestamp + Nonce + Body + ClientIP
+```
+
+**方案二：定期变化的滚动 Key**
+
+服务端维护一个基于时间的滚动因子（例如，每小时变化的 HMAC），客户端和服务端独立计算当前的有效 Key。只有两个 Key 匹配时才通过校验。
+
+**方案三：硬件绑定**
+
+使用 TPM（可信平台模块）或安全芯片存储 Key，Key 无法被导出到其他设备。
+
+**方案四：异常检测 + 自动撤销**
+
+- 监控 Key 的使用模式（IP、时间、频率）
+- 检测到异常时自动触发撤销流程
+- 配合告警通知用户确认是否为本人操作
+
+**综合建议**：对于高敏感场景，推荐「方案四 + 方案一」的组合——主动监控 + IP 绑定。正常泄露场景下，异常检测可以快速发现；极端场景下，IP 绑定可以阻止异地使用。
+</details>

@@ -1,0 +1,201 @@
+---
+title: OAuth 2.0 安全最佳实践
+description: 深入解析 OAuth 2.0 的常见安全威胁与防护措施，包括 CSRF 防护、Token 安全存储、PKCE 配置等，帮助架构师构建安全的授权体系。
+---
+
+2018 年，某知名社交平台 OAuth 实现被发现存在严重漏洞：攻击者只需构造特定 URL，就能让受害者在授权合法应用的同时，额外绑定攻击者的账号。更糟糕的是，这个漏洞存在了 8 年才被发现。
+
+这个案例揭示了 OAuth 2.0 安全的一个残酷现实：**协议本身是安全的，但实现中的细微缺陷可能导致整个安全体系崩塌。** 很多开发者知道 OAuth 2.0 的基本流程，却忽略了每一个安全细节的实现要求。本文档深入剖析 OAuth 2.0 的安全威胁与防御策略。
+
+## 一、常见安全威胁
+
+**CSRF（Cross-Site Request Forgery）攻击** 是 OAuth 2.0 最常见的安全威胁之一。攻击者构造恶意页面，诱导已登录用户访问，该页面自动发起 OAuth 授权请求。由于浏览器会自动携带用户的 Cookie，授权服务器会认为是用户本人发起的请求。攻击者获得授权码后，立即使用该授权码换取令牌，从而绑定了用户的账号。
+
+CSRF 攻击的典型场景：用户登录了社交平台 A，攻击者在平台 A 上创建了一个钓鱼页面，该页面包含一个指向授权服务器的隐藏 iframe 或自动提交的表单。用户点击页面后，授权码被发送到攻击者控制的回调地址。攻击者拿到授权码后，立即用它换取令牌，实现账号绑定。
+
+**授权码劫持**发生在授权码传输过程中。如果授权码通过 URL 参数传递而非 POST 请求，授权码可能出现在浏览器历史记录、Referer 日志、服务器日志中。攻击者获取授权码后，冒充合法客户端兑换令牌。授权码有效期很短（通常 60 秒），但这个窗口足以完成攻击。
+
+**重定向 URI 篡改** 利用的是授权服务器对 URI 验证不严格的问题。如果授权服务器只检查 URI 前缀而非精确匹配，攻击者可以注册一个看似合法的回调 URI（如 `https://legitimate-app.com.attacker.com/callback`），欺骗授权服务器将授权码发送到攻击者的服务器。
+
+**Token 泄露** 可能发生在多个环节：浏览器历史记录和日志中存储了 URL 形式的 Token；前端 JavaScript 可以访问 localStorage，XSS 攻击可以窃取存储的 Token；Token 以明文形式在网络传输，被中间人攻击截获；服务端日志记录了 Token。
+
+## 二、State 参数的 CSRF 防护
+
+`state` 参数是防止 CSRF 攻击的标准机制。正确实现时，`state` 参数需要满足以下要求：
+
+**随机性**：`state` 必须是密码学安全的随机字符串，长度至少 32 字节，防止攻击者猜测。绝不能使用递增序列号、时间戳或用户 ID 作为 state。
+
+**绑定会话**：客户端在发起授权请求前，将 `state` 存入用户会话（如 Cookie、服务端 Session）。授权回调到来时，验证回调中的 `state` 与会话中存储的值是否完全一致。
+
+```java title="OAuth2CsrfProtection.java"
+import javax.servlet.http.HttpSession;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+public class OAuth2CsrfProtection {
+    
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    
+    public static String generateState(HttpSession session) {
+        byte[] bytes = new byte[32];
+        SECURE_RANDOM.nextBytes(bytes);
+        String state = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        
+        session.setAttribute("oauth2_state", state);
+        session.setAttribute("oauth2_state_created", System.currentTimeMillis());
+        return state;
+    }
+    
+    public static boolean validateState(HttpSession session, String receivedState) {
+        if (receivedState == null || receivedState.isEmpty()) {
+            return false;
+        }
+        
+        String storedState = (String) session.getAttribute("oauth2_state");
+        if (storedState == null) {
+            return false;
+        }
+        
+        Long created = (Long) session.getAttribute("oauth2_state_created");
+        if (created != null) {
+            long age = System.currentTimeMillis() - created;
+            if (age > 600_000) { // 10 分钟超时
+                session.removeAttribute("oauth2_state");
+                session.removeAttribute("oauth2_state_created");
+                return false;
+            }
+        }
+        
+        boolean valid = SECURE_RANDOM.isTrusted()
+            && receivedState.equals(storedState);
+        
+        session.removeAttribute("oauth2_state");
+        session.removeAttribute("oauth2_state_created");
+        return valid;
+    }
+}
+```
+
+**一次性使用**：`state` 验证后应该立即失效，防止重放攻击。如果收到重复的 `state`，说明可能正在遭受攻击，应该拒绝并记录安全事件。
+
+## 三、Redirect URI 的精确验证
+
+Redirect URI 验证是 OAuth 2.0 安全的核心环节。授权服务器必须严格验证客户端注册的回调地址与实际回调地址是否匹配。
+
+**精确匹配**是最安全的方案。授权服务器存储客户端注册时提供的完整 URI，回调时逐字节比较。只有完全匹配时才允许回调。如果 URI 包含端口号、查询参数或路径，必须完全一致。
+
+**前缀匹配**安全性较低，但如果业务需要灵活性，可以限制前缀范围。例如只允许 `https://app.example.com/oauth/callback` 开头的 URI，并额外检查：域名必须是 `app.example.com` 而非其子域；路径必须以 `/oauth/callback` 开头；不允许存在路径遍历（如 `..`）。
+
+**禁止的写法**：不应该使用正则表达式匹配 URI，因为正则表达式本身可能存在漏洞；不应该允许 HTTP 协议回调，因为中间人攻击可以拦截；不应该允许内网 IP 地址回调，因为可能被攻击者利用。
+
+```java title="RedirectUriValidator.java"
+import java.net.URI;
+import java.util.Set;
+
+public class RedirectUriValidator {
+    
+    private static final Set<String> BLOCKED_HOSTS = Set.of(
+        "localhost", "127.0.0.1", "0.0.0.0", "[::1]"
+    );
+    
+    public static boolean isValid(String registeredUri, String callbackUri) {
+        try {
+            URI registered = URI.create(registeredUri);
+            URI callback = URI.create(callbackUri);
+            
+            if (!registered.getScheme().equalsIgnoreCase("https")) {
+                return false;
+            }
+            
+            if (!registered.getHost().equals(callback.getHost())) {
+                return false;
+            }
+            
+            if (!registered.getPath().equals(callback.getPath())) {
+                return false;
+            }
+            
+            if (!registered.getPort().equals(callback.getPort())) {
+                return false;
+            }
+            
+            if (BLOCKED_HOSTS.contains(callback.getHost().toLowerCase())) {
+                return false;
+            }
+            
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+```
+
+## 四、Token 安全存储
+
+访问令牌的存储安全直接影响整个 OAuth 2.0 系统的安全性。错误的存储方式可能导致令牌泄露。
+
+**不建议存储在 localStorage**：localStorage 中的数据可以通过任何页面上的 JavaScript 访问。如果应用存在 XSS 漏洞，攻击者可以轻易读取 localStorage 中的令牌。历史上大量数据泄露事件都与 localStorage 存储敏感信息有关。
+
+**推荐方案：HttpOnly Secure Cookie**：将令牌存储在 HttpOnly Cookie 中，JavaScript 无法直接访问，避免 XSS 攻击窃取令牌。Cookie 需要设置 `Secure` 标志，确保只在 HTTPS 连接中传输。同时设置 `SameSite=Lax` 或 `SameSite=Strict` 防止 CSRF 攻击。
+
+**替代方案：内存存储 + Refresh Token 轮换**：访问令牌存储在 JavaScript 内存变量中，页面关闭后自动清除。对于需要持久登录的场景，使用 Refresh Token 轮换机制：Refresh Token 存储在 HttpOnly Cookie 中，每次使用后签发新的 Refresh Token，原 Token 作废。
+
+```java title="TokenStorageAdvice.java"
+public class TokenStorageAdvice {
+    
+    void configureSecurityHeaders(HttpServletResponse response) {
+        response.setHeader("Set-Cookie", String.format(
+            "access_token=%s; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=%d",
+            accessToken, tokenExpirySeconds
+        ));
+    }
+    
+    void setCacheControl(HttpServletResponse response) {
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("Pragma", "no-cache");
+    }
+}
+```
+
+## 五、授权服务器安全配置
+
+授权服务器是 OAuth 2.0 生态的核心，其安全性至关重要。
+
+**令牌有效期策略**：访问令牌建议有效期不超过 1 小时，敏感操作可缩短至 5-15 分钟。刷新令牌有效期可设为 7-30 天，具体取决于用户信任程度和应用风险等级。令牌续期时，应该同时颁发新的 Refresh Token 并使旧的作废，防止 Refresh Token 泄露导致的持续被盗用。
+
+**客户端凭证的安全管理**：客户端密钥必须使用密码学安全的随机数生成器生成，长度至少 256 位。密钥不能以明文形式存储，必须使用哈希值比较。客户端密钥支持更换，应该保留旧密钥的宽限期（Grace Period），让正在使用的应用有时间更新。
+
+**速率限制**：对令牌端点的请求实施速率限制，防止暴力破解授权码。对登录页面实施 IP 级别的限制，防止凭证填充攻击。检测异常的授权请求模式，如短时间内来自不同 IP 的同一用户请求。
+
+:::warning 重要提醒
+任何安全措施的效果都取决于最薄弱的一环。不要只关注 OAuth 2.0 本身的安全性，整个系统都需要符合安全最佳实践：TLS 加密、HSTS 头设置、输入验证、SQL 注入防护、XSS 防护等。
+:::
+
+## 六、PKCE 对公共客户端的必要性
+
+对于公共客户端（前端应用、移动 App），PKCE 是必须启用而非可选的安全增强。
+
+PKCE 防止授权码被拦截后兑换：即使攻击者截获了授权码，由于不知道 `code_verifier`，无法完成令牌兑换。攻击者截获授权码的唯一方式是同时截获用户设备和授权服务器的通信，这在 HTTPS 环境下极为困难。
+
+PKCE 实现注意事项：`code_verifier` 必须使用密码学安全的随机数生成器；`code_challenge` 必须使用 S256 方法而非 plain 方法（S256 更安全，plain 方法理论上可被绕过）；`code_verifier` 的长度必须在 43-128 字符之间。
+
+---
+
+## 思考题
+
+**问题 1**：某团队使用 OAuth 2.0 实现第三方登录功能。他们发现用户点击授权后，如果关闭了授权页面而不是等待重定向，授权码就会丢失，导致登录失败。为了解决这个问题，他们在授权页面添加了一个「返回按钮」，点击后通过 JavaScript 将授权码传递回原页面。请分析这个方案的安全问题。
+
+<details>
+<summary>参考答案</summary>
+
+这个方案存在严重的安全漏洞。将授权码通过 JavaScript 传递实际上创建了一个授权码传输的新通道，而这个通道可能暴露给恶意网页。具体风险包括：XSS 攻击可以通过拦截 JavaScript 中的授权码来完成整个攻击链；恶意扩展可以注入脚本拦截授权码；浏览器的开发者工具、网络标签页都会记录授权码。更根本的问题是：授权码不应该通过 JavaScript 处理，所有授权码的传输都应该通过服务器端重定向完成。如果授权页面需要与父窗口通信，应该使用 `postMessage` API，并严格验证消息来源（`origin`）。正确的做法是让授权服务器直接重定向到正确的回调 URL，而不是「返回」按钮。
+</details>
+
+**问题 2**：在 OAuth 2.0 系统中，Token 撤销（Revocation）是一个容易被忽视但很重要的功能。请分析什么情况下需要撤销 Token，以及如何实现有效的 Token 撤销机制。
+
+<details>
+<summary>参考答案</summary>
+
+需要撤销 Token 的场景包括：用户主动退出登录；用户撤销对某个应用的授权；管理员发现可疑活动或安全事件；用户修改了安全设置（如启用 MFA）；用户账号被禁用或删除；怀疑 Token 已被泄露。实现方式取决于 Token 类型：对于自包含 Token（如 JWT），撤销机制通常是令牌黑名单或短令牌策略，因为 JWT 一旦签发在有效期内无法作废；对于引用 Token（不透明的随机字符串），授权服务器维护 Token 的有效状态，撤销时在数据库中将 Token 标记为无效。实际生产环境中，还需要考虑撤销通知的传播延迟——授权服务器更新状态后，资源服务器可能还在使用旧的缓存验证结果。建议使用主动通知（如 Webhook）或缩短验证缓存 TTL 来减少这个窗口期。
+</details>

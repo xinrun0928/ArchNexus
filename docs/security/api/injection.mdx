@@ -1,0 +1,1016 @@
+---
+title: API 注入攻击防护
+description: SQL注入、NoSQL注入、Command注入、LDAP注入的原理与防护，参数验证层次，白名单vs黑名单，依赖框架的安全配置。
+---
+
+2017 年，征信公司 Equifax 被黑客入侵，1.47 亿人的个人信息泄露。攻击入口是 Apache Struts 框架的一个已知漏洞。2020 年，SolarWinds 供应链攻击影响了数千家企业。这些事件的共同点是：攻击者利用了注入漏洞——用户输入被当作代码执行。
+
+注入攻击之所以危险，是因为它违反了一个基本原则：**用户输入应该被当作数据处理，而不是代码执行**。API 是注入攻击的高发区，因为 API 接收各种格式的输入（JSON、XML、Query 参数），每一处输入都可能是攻击向量。
+
+## API 注入攻击的类型
+
+### SQL 注入
+
+SQL 注入是最经典的注入攻击。攻击者通过构造恶意输入，突破应用的输入校验，让数据库执行攻击者指定的 SQL 语句。
+
+```http
+# 正常请求
+GET /api/v1/users?id=123
+
+# 恶意请求：尝试 SQL 注入
+GET /api/v1/users?id=123' UNION SELECT password_hash FROM admin_users--
+```
+
+```java title="UserController.java"
+// 错误的做法：直接拼接 SQL
+@GetMapping("/users")
+public List<User> getUsers(@RequestParam("id") String id) {
+    // 危险！直接拼接用户输入
+    String sql = "SELECT * FROM users WHERE id = '" + id + "'";
+    return jdbcTemplate.queryForList(sql);
+}
+
+// 正确的做法：使用参数化查询
+@GetMapping("/users")
+public List<User> getUsers(@RequestParam("id") Long id) {
+    String sql = "SELECT * FROM users WHERE id = ?";
+    return jdbcTemplate.queryForList(sql, id);
+}
+```
+
+### NoSQL 注入
+
+NoSQL 数据库（如 MongoDB）的查询语法也容易被注入：
+
+```javascript
+// MongoDB 查询
+// 用户输入被直接拼接到查询中
+db.users.find({ username: req.body.username, password: req.body.password });
+
+// 恶意输入：{"username": {"$ne": ""}, "password": {"$ne": ""}}
+// 实际查询：db.users.find({ username: {$ne: ""}, password: {$ne: ""} })
+// 结果：绕过认证，返回所有用户！
+```
+
+```java title="UserService.java"
+// 错误的做法：动态查询构建
+public Optional<User> findByUsername(String username) {
+    Query query = new Query();
+    // 危险！直接使用用户输入作为查询条件
+    query.addCriteria(Criteria.where("username").is(username));
+    return mongoTemplate.findOne(query, User.class);
+}
+
+// 正确的做法：严格类型校验 + 显式字段映射
+public Optional<User> findByUsername(String username) {
+    // 先校验格式
+    if (!USERNAME_PATTERN.matcher(username).matches()) {
+        throw new IllegalArgumentException("Invalid username format");
+    }
+    
+    Query query = new Query();
+    query.addCriteria(Criteria.where("username").is(username));
+    return mongoTemplate.findOne(query, User.class);
+}
+```
+
+### Command 注入
+
+当应用调用系统命令时，用户输入可能被当作命令的一部分执行：
+
+```java title="FileController.java"
+// 危险的代码
+@PostMapping("/download")
+public void downloadFile(@RequestParam("filename") String filename) throws Exception {
+    // 危险！用户输入被拼接到命令中
+    String command = "cat /var/files/" + filename;
+    Process process = Runtime.getRuntime().exec(command);
+    // ...
+}
+
+// 恶意输入：filename = "test.txt; rm -rf /"
+// 实际命令：cat /var/files/test.txt; rm -rf /
+// 结果：删除服务器上的所有文件！
+```
+
+```java title="FileController.java"
+// 安全的做法：白名单校验 + 路径规范化
+@PostMapping("/download")
+public void downloadFile(@RequestParam("filename") String filename) throws Exception {
+    // 1. 白名单校验文件名格式
+    if (!FILENAME_PATTERN.matcher(filename).matches()) {
+        throw new IllegalArgumentException("Invalid filename");
+    }
+    
+    // 2. 规范化为绝对路径
+    Path baseDir = Paths.get("/var/files").normalize();
+    Path requestedPath = baseDir.resolve(filename).normalize();
+    
+    // 3. 安全检查：确保路径在允许范围内
+    if (!requestedPath.startsWith(baseDir)) {
+        throw new SecurityException("Path traversal attempt");
+    }
+    
+    // 4. 使用数组方式传递命令参数，避免 shell 解析
+    ProcessBuilder pb = new ProcessBuilder("cat", requestedPath.toString());
+    Process process = pb.start();
+    // ...
+}
+```
+
+### LDAP 注入
+
+LDAP 查询同样可能被注入：
+
+```java title="LdapService.java"
+// 危险的代码
+public DN authenticate(String username, String password) {
+    // 危险！用户输入直接拼接到 LDAP 查询
+    String filter = "(uid=" + username + ",password=" + password + ")";
+    return ldapTemplate.lookup(filter);
+}
+
+// 恶意输入：username = "admin)(objectClass=*)"
+// 实际查询：(uid=admin)(objectClass=*),password=*)
+// 结果：绕过密码校验！
+```
+
+```java title="LdapService.java"
+// 安全的做法：使用 LDAP 过滤器的安全 API
+public DN authenticate(String username, String password) {
+    // 使用 NameClassPair 的安全 API
+    AndFilter filter = new AndFilter();
+    filter.and(new EqualsFilter("uid", username));
+    filter.and(new EqualsFilter("userPassword", password));
+    
+    return ldapTemplate.authenticate(
+        BaseLdapPathContextSource.DEFAULT_BASE_DN,
+        filter.toString(),
+        password
+    );
+}
+```
+
+## API 参数注入风险
+
+API 的灵活性使其面临更多注入风险：
+
+### JSON 注入
+
+```json
+// 正常请求
+{
+  "username": "alice",
+  "age": 25
+}
+
+// 恶意请求：注入额外的字段
+{
+  "username": "alice",
+  "age": 25,
+  "isAdmin": true
+}
+```
+
+```java title="UserController.java"
+// 错误的做法：直接反序列化到实体类
+@PostMapping("/users")
+public User createUser(@RequestBody Map<String, Object> userData) {
+    // 危险！攻击者可以注入任意字段
+    User user = objectMapper.convertValue(userData, User.class);
+    return userRepository.save(user);
+}
+
+// 正确的做法：使用 DTO 严格定义允许的字段
+public class CreateUserRequest {
+    @NotBlank
+    private String username;
+    
+    @NotNull
+    @Min(0)
+    @Max(150)
+    private Integer age;
+    
+    // 不包含 isAdmin 字段！
+    // Jackson 只会反序列化定义的字段，忽略其他字段
+}
+```
+
+### 参数污染（HTTP Parameter Pollution）
+
+同一个参数多次提交，框架可能处理方式不同：
+
+```http
+# 正常请求
+GET /api/v1/users?id=123
+
+# 参数污染
+GET /api/v1/users?id=123&id=456
+```
+
+```java title="IdorPreventionInterceptor.java"
+public class IdorPreventionInterceptor implements HandlerInterceptor {
+    
+    @Override
+    public boolean preHandle(HttpServletRequest request, 
+                            HttpServletResponse response, 
+                            Object handler) {
+        // 检查是否存在参数污染
+        Map<String, String[]> params = request.getParameterMap();
+        
+        for (Map.Entry<String, String[]> entry : params.entrySet()) {
+            // 业务关键参数不应该有多个值
+            if (isBusinessCritical(entry.getKey()) && entry.getValue().length > 1) {
+                throw new SecurityException(
+                    "Parameter pollution detected: " + entry.getKey());
+            }
+        }
+        
+        return true;
+    }
+}
+```
+
+### XML 注入
+
+```xml
+<!-- 正常请求 -->
+<user>
+  <name>Alice</name>
+</user>
+
+<!-- 恶意请求：注入实体引用 -->
+<!DOCTYPE user [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<user>
+  <name>&xxe;</name>
+</user>
+```
+
+```java title="XmlSecurityConfig.java"
+@Configuration
+public class XmlSecurityConfig {
+    
+    @Bean
+    public DocumentBuilderFactory documentBuilderFactory() {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        
+        // 禁用外部实体
+        try {
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            factory.setNamespaceAware(true);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to configure XML security", e);
+        }
+        
+        return factory;
+    }
+}
+```
+
+## 参数验证的层次
+
+参数验证是防止注入攻击的第一道防线。验证应该在多个层次进行：
+
+### 1. 类型检查
+
+```java title="RequestValidator.java"
+public class RequestValidator {
+    
+    // 基本类型检查
+    public Long validateId(String idStr) {
+        if (idStr == null || idStr.trim().isEmpty()) {
+            throw new ValidationException("ID cannot be empty");
+        }
+        
+        try {
+            return Long.parseLong(idStr);
+        } catch (NumberFormatException e) {
+            throw new ValidationException("ID must be a valid number");
+        }
+    }
+    
+    // 使用 Bean Validation 注解
+    public class CreateUserRequest {
+        @NotBlank(message = "Username cannot be blank")
+        @Size(min = 3, max = 50, message = "Username must be 3-50 characters")
+        @Pattern(regexp = "^[a-zA-Z0-9_]+$", 
+                message = "Username can only contain letters, numbers, and underscore")
+        private String username;
+        
+        @NotNull(message = "Age cannot be null")
+        @Min(value = 0, message = "Age cannot be negative")
+        @Max(value = 150, message = "Age cannot exceed 150")
+        private Integer age;
+        
+        @Email(message = "Invalid email format")
+        private String email;
+        
+        @Pattern(regexp = "^\\+?[1-9]\\d{1,14}$", 
+                message = "Invalid phone number format")
+        private String phone;
+    }
+}
+```
+
+### 2. 格式验证
+
+```java title="FormatValidator.java"
+public class FormatValidator {
+    
+    // 日期格式验证
+    public LocalDate validateDate(String dateStr) {
+        try {
+            return LocalDate.parse(dateStr, DateTimeFormatter.ISO_DATE);
+        } catch (DateTimeParseException e) {
+            throw new ValidationException("Invalid date format");
+        }
+    }
+    
+    // JSON 格式验证
+    public JsonNode validateJson(String jsonStr) {
+        try {
+            return objectMapper.readTree(jsonStr);
+        } catch (JsonProcessingException e) {
+            throw new ValidationException("Invalid JSON format");
+        }
+    }
+    
+    // URL 格式验证
+    public URI validateUrl(String urlStr) {
+        try {
+            URI uri = new URI(urlStr);
+            
+            // 只允许 HTTP/HTTPS
+            if (!uri.getScheme().matches("https?")) {
+                throw new ValidationException("Only HTTP/HTTPS URLs are allowed");
+            }
+            
+            // 禁止内网地址
+            String host = uri.getHost();
+            if (isInternalHost(host)) {
+                throw new ValidationException("Internal URLs are not allowed");
+            }
+            
+            return uri;
+        } catch (URISyntaxException e) {
+            throw new ValidationException("Invalid URL format");
+        }
+    }
+}
+```
+
+### 3. 业务规则验证
+
+```java title="BusinessValidator.java"
+public class BusinessValidator {
+    
+    // 业务规则验证
+    public void validateTransfer(TransferRequest request, User user) {
+        // 余额检查
+        if (request.getAmount().compareTo(user.getBalance()) > 0) {
+            throw new ValidationException("Insufficient balance");
+        }
+        
+        // 每日限额检查
+        BigDecimal dailyTotal = calculateDailyTotal(user.getId());
+        BigDecimal newDailyTotal = dailyTotal.add(request.getAmount());
+        if (newDailyTotal.compareTo(MAX_DAILY_AMOUNT) > 0) {
+            throw new ValidationException("Daily transfer limit exceeded");
+        }
+        
+        // 黑名单检查
+        if (blacklistService.isBlacklisted(request.getRecipientId())) {
+            throw new ValidationException("Recipient is blacklisted");
+        }
+    }
+}
+```
+
+## 白名单 vs 黑名单
+
+参数验证有两种策略：**白名单（Whitelist）**和**黑名单（Blacklist）**。
+
+| 策略 | 原理 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| **白名单** | 只允许已知安全的值 | 安全性高，可预测 | 需要预先定义所有合法值 |
+| **黑名单** | 拒绝已知危险的值 | 灵活，不需要预先定义 | 容易遗漏，无法穷举危险值 |
+
+**强烈推荐使用白名单策略。** 黑名单的致命问题是：你永远不知道攻击者会使用什么新的攻击手法。
+
+```java title="WhitelistValidator.java"
+// 黑名单策略（不推荐）
+public String sanitize(String input) {
+    // 永远无法穷举所有危险字符
+    String dangerous = "';\"<>script|$(`";
+    for (char c : dangerous.toCharArray()) {
+        input = input.replace(String.valueOf(c), "");
+    }
+    return input;
+    // 攻击者可能使用：%27 (%22 等 URL 编码)
+    // 或使用其他未被考虑的攻击向量
+}
+
+// 白名单策略（推荐）
+public boolean validateCommand(String command) {
+    // 严格定义允许的命令
+    Set<String> ALLOWED_COMMANDS = Set.of("status", "restart", "stop", "logs");
+    return ALLOWED_COMMANDS.contains(command);
+}
+
+public boolean validateFileExtension(String filename) {
+    // 只允许特定的文件扩展名
+    Set<String> ALLOWED_EXTENSIONS = Set.of("jpg", "png", "pdf", "docx");
+    String extension = FilenameUtils.getExtension(filename).toLowerCase();
+    return ALLOWED_EXTENSIONS.contains(extension);
+}
+```
+
+## 安全的 API 设计原则
+
+### 1. 参数类型强制化
+
+```java title="StrongTypingController.java"
+@RestController
+@RequestMapping("/api/v1")
+public class StrongTypingController {
+    
+    // 强类型参数（推荐）
+    @GetMapping("/users/{id}")
+    public User getUser(@PathVariable("id") Long id) {
+        // Spring 会自动校验 id 是否为有效数字
+        return userService.findById(id);
+    }
+    
+    // 弱类型参数（不推荐）
+    @GetMapping("/users")
+    public List<User> getUsers(@RequestParam("id") String id) {
+        // 危险！id 是字符串，可能包含恶意内容
+        return userService.findByRawId(id);
+    }
+}
+```
+
+### 2. 显式 API 契约
+
+```java title="ApiContractController.java"
+@RestController
+@RequestMapping("/api/v1")
+public class ApiContractController {
+    
+    // 定义清晰的请求 DTO
+    public static class CreateOrderRequest {
+        @NotNull
+        @Positive
+        @Digits(integer = 10, fraction = 2)
+        private BigDecimal amount;
+        
+        @NotBlank
+        @Size(max = 50)
+        private String currency;
+        
+        @NotNull
+        private List<@NotBlank String> productIds;
+        
+        // 使用 @JsonTypeInfo 防止多态注入
+        @JsonTypeInfo(use = JsonTypeInfo.Id.NAME)
+        private OrderType type;
+    }
+    
+    // 使用 @Validated 启用校验
+    @PostMapping("/orders")
+    public Order createOrder(@Valid @RequestBody CreateOrderRequest request) {
+        return orderService.create(request);
+    }
+}
+```
+
+### 3. 最小权限数据库账号
+
+```yaml title="database-config.yaml"
+# 应用不应该使用 DBA 账号
+# 应该为每个应用分配最小权限的数据库账号
+
+# 错误的配置
+username: root
+password: admin123
+
+# 正确的配置
+username: api_service_readonly
+password: <complex-password>
+# 只授予必要的权限：
+# GRANT SELECT, INSERT, UPDATE ON app_db.* TO 'api_service_readonly'@'%'
+```
+
+### 4. 查询结构化
+
+```java title="QueryBuilder.java"
+public class SafeQueryBuilder {
+    
+    // 使用参数化查询，不拼接字符串
+    public List<User> searchUsers(String username, String email, String status) {
+        // 构建安全的动态查询
+        Query query = new Query();
+        
+        if (username != null) {
+            // 严格类型校验
+            if (!USERNAME_PATTERN.matcher(username).matches()) {
+                throw new ValidationException("Invalid username");
+            }
+            query.addCriteria(Criteria.where("username").is(username));
+        }
+        
+        if (email != null) {
+            if (!EMAIL_PATTERN.matcher(email).matches()) {
+                throw new ValidationException("Invalid email");
+            }
+            query.addCriteria(Criteria.where("email").is(email));
+        }
+        
+        if (status != null) {
+            // 白名单校验
+            Set<String> validStatuses = Set.of("active", "inactive", "pending");
+            if (!validStatuses.contains(status)) {
+                throw new ValidationException("Invalid status");
+            }
+            query.addCriteria(Criteria.where("status").is(status));
+        }
+        
+        return mongoTemplate.find(query, User.class);
+    }
+}
+```
+
+## 依赖框架的安全配置
+
+现代开发大量依赖框架，但框架也可能存在漏洞或默认配置不安全。
+
+### Spring Security 配置
+
+```java title="SpringSecurityConfig.java"
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // 禁用危险的 HTTP 方法
+            .csrf(csrf -> csrf.disable())
+            
+            // 配置请求授权
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated()
+            )
+            
+            // 安全响应头
+            .headers(headers -> headers
+                .contentSecurityPolicy(csp -> csp
+                    .policyDirectives("default-src 'self'"))
+                .httpStrictTransportSecurity(hsts -> hsts
+                    .includeSubDomains(true)
+                    .maxAgeInSeconds(31536000))
+            );
+        
+        return http.build();
+    }
+}
+```
+
+### JPA 安全配置
+
+```java title="JpaSecurityConfig.java"
+@Configuration
+@EnableJpaAuditing
+public class JpaSecurityConfig {
+    
+    @Bean
+    public EntityManagerFactory entityManagerFactory(
+            DataSource dataSource, 
+            JpaProperties jpaProperties) {
+        
+        HibernateProperties hibernateProperties = 
+            jpaProperties.getHibernate();
+        
+        // 禁用危险的 SQL 功能
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("hibernate.dialect", "org.hibernate.dialect.PostgreSQLDialect");
+        
+        // 禁用批量插入的动态创建表功能
+        properties.put("hibernate.jdbc.batch_size", 20);
+        properties.put("hibernate.order_inserts", true);
+        properties.put("hibernate.order_updates", true);
+        
+        // 审计功能
+        properties.put("jpa.properties.hibernate.generate_statistics", false);
+        
+        return createEntityManagerFactory(dataSource, properties);
+    }
+}
+```
+
+### MongoDB 安全配置
+
+```java title="MongoSecurityConfig.java"
+@Configuration
+public class MongoSecurityConfig {
+    
+    @Bean
+    public MongoClientSettings mongoClientSettings() {
+        return MongoClientSettings.builder()
+            // 强制客户端认证
+            .credential(MongoCredential.createScramSha256Credential(
+                username, database, password.toCharArray()))
+            
+            // 连接池配置
+            .applyToConnectionPoolSettings(builder -> builder
+                .maxSize(50)
+                .minSize(5)
+                .maxWaitTime(5, TimeUnit.SECONDS))
+            
+            // 网络超时配置
+            .applyToSocketSettings(builder -> builder
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS))
+            
+            // 禁用危险的 BSON 功能
+            .build();
+    }
+}
+```
+
+## 注入攻击的检测与告警
+
+即使有了防御措施，也应该持续监控注入攻击尝试：
+
+```java title="InjectionDetectionService.java"
+public class InjectionDetectionService {
+    
+    private final Pattern SQL_INJECTION_PATTERN = Pattern.compile(
+        ".*(?i)(union|select|insert|update|delete|drop|exec|script).*");
+    
+    private final Pattern COMMAND_INJECTION_PATTERN = Pattern.compile(
+        ".*[;|`$&<>].*");
+    
+    private final Pattern NOSQL_INJECTION_PATTERN = Pattern.compile(
+        ".*\\$where|\\$eval|\\$ne|\\$regex. *");
+    
+    private final AlertService alertService;
+    
+    public void analyzeRequest(String parameterName, String value) {
+        // SQL 注入检测
+        if (SQL_INJECTION_PATTERN.matcher(value).matches()) {
+            alertService.sendSecurityAlert(
+                SecurityAlertType.SQL_INJECTION_SUSPECTED,
+                Map.of(
+                    "parameter", parameterName,
+                    "value", sanitizeForLog(value),
+                    "pattern", "sql_injection"
+                )
+            );
+        }
+        
+        // 命令注入检测
+        if (COMMAND_INJECTION_PATTERN.matcher(value).matches()) {
+            alertService.sendSecurityAlert(
+                SecurityAlertType.COMMAND_INJECTION_SUSPECTED,
+                Map.of(
+                    "parameter", parameterName,
+                    "value", sanitizeForLog(value),
+                    "pattern", "command_injection"
+                )
+            );
+        }
+        
+        // NoSQL 注入检测
+        if (NOSQL_INJECTION_PATTERN.matcher(value).matches()) {
+            alertService.sendSecurityAlert(
+                SecurityAlertType.NOSQL_INJECTION_SUSPECTED,
+                Map.of(
+                    "parameter", parameterName,
+                    "value", sanitizeForLog(value),
+                    "pattern", "nosql_injection"
+                )
+            );
+        }
+    }
+    
+    private String sanitizeForLog(String value) {
+        // 脱敏处理，只保留可疑特征的片段
+        return value.replaceAll("[a-zA-Z0-9]", "*");
+    }
+}
+```
+
+## SQL 注入检测工具
+
+### 1. OWASP ZAP
+
+```bash
+# 使用 ZAP 扫描 API 的 SQL 注入漏洞
+./zap-cli -p 8080 quick-scan https://api.example.com/v1
+```
+
+### 2. SQLMap
+
+```bash
+# 使用 SQLMap 检测 SQL 注入
+sqlmap -u "https://api.example.com/users?id=1" \
+       --level=5 \
+       --risk=3 \
+       --batch \
+       --output-dir=/tmp/sqlmap-results
+```
+
+### 3. 自定义测试用例
+
+```java title="InjectionTestSuite.java"
+@SpringBootTest
+public class InjectionTestSuite {
+    
+    @Autowired
+    private TestRestTemplate restTemplate;
+    
+    @Test
+    public void testSqlInjectionInUserId() {
+        // 测试各种 SQL 注入 payload
+        String[] payloads = {
+            "' OR '1'='1",
+            "'; DROP TABLE users; --",
+            "1 UNION SELECT * FROM admin_users",
+            "admin'--",
+            "1; SELECT SLEEP(5)--"
+        };
+        
+        for (String payload : payloads) {
+            ResponseEntity<String> response = restTemplate.getForEntity(
+                "/api/users?id=" + payload, String.class);
+            
+            // 应该返回 400 或空结果，不应该执行注入
+            assertThat(response.getStatusCode())
+                .isNotEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+    
+    @Test
+    public void testNosqlInjectionInJson() {
+        // 测试 NoSQL 注入 payload
+        Object[][] payloads = {
+            {"$ne": null},
+            {"$regex": ".*"},
+            {"$where": "1==1"}
+        };
+        
+        for (Object[] payload : payloads) {
+            Map<String, Object> request = new HashMap<>();
+            request.put("username", payload);
+            request.put("password", "anything");
+            
+            ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/auth/login", request, String.class);
+            
+            // 不应该绕过认证
+            // 注意：这个测试应该失败，说明存在漏洞
+        }
+    }
+}
+```
+
+## 思考题
+
+**问题 1**：ORM 框架（如 Hibernate、MyBatis）是否可以完全防止 SQL 注入？为什么？
+
+<details>
+<summary>参考答案</summary>
+
+**ORM 框架的安全保证**：
+
+ORM 框架在**正常使用**情况下可以有效防止 SQL 注入，因为它们使用参数化查询：
+
+```java
+// Hibernate / JPA
+User user = entityManager.find(User.class, userId);  // 参数化查询
+
+// MyBatis
+@Select("SELECT * FROM users WHERE id = #{id}")
+User findById(Long id);  // 参数化查询
+```
+
+**但不是万无一失，原因如下**：
+
+1. **动态 SQL 拼接**：
+```java
+// MyBatis 使用 ${ } 动态拼接（危险）
+@Select("SELECT * FROM users WHERE ${columnName} = #{value}")
+List<User> findByDynamicColumn(
+    @Param("columnName") String columnName, 
+    @Param("value") String value
+);
+
+// 攻击：columnName = "id; DROP TABLE users;--"
+```
+
+2. **原生查询**：
+```java
+// JPA 原生查询仍然可以拼接
+@Query("SELECT * FROM users WHERE name = '" + name + "'")
+List<User> dangerousFind(String name);
+```
+
+3. **Order By / Group By 子句**：
+```java
+// 动态列名问题
+@Query("SELECT * FROM users ORDER BY :sortColumn")
+List<User> findAll(@Param("sortColumn") String sortColumn);
+// 需要使用白名单验证 sortColumn
+```
+
+4. **框架漏洞**：ORM 框架本身可能存在漏洞，历史上 Hibernate、MyBatis 都曾被发现过注入相关的安全漏洞。
+
+**结论**：ORM 是很好的安全工具，但开发者仍需：
+- 避免使用 `${ }` 动态拼接
+- 谨慎使用原生查询
+- 对动态列名/表名使用白名单验证
+- 保持框架版本更新
+</details>
+
+**问题 2**：为什么说参数验证的「白名单策略」比「黑名单策略」更安全？
+
+<details>
+<summary>参考答案</summary>
+
+**黑名单的致命缺陷**：
+
+1. **无法穷举所有攻击向量**：
+```java
+// 黑名单策略示例
+public String sanitize(String input) {
+    input = input.replace("'", "");      // 单引号
+    input = input.replace("--", "");    // SQL 注释
+    input = input.replace(";", "");     // 语句分隔符
+    return input;
+}
+
+// 攻击者可以使用：
+// - 双引号 " 代替单引号 '
+// - URL 编码 %27 代替单引号 '
+// - Unicode 编码 \u0027 代替单引号 '
+// - 组合绕过 and 1=1 可以变成 and\u00201\u0021\u003d\u0031
+```
+
+2. **遗漏的场景**：
+```java
+// 黑名单只检查了 SQL 注入
+// 但没有检查：
+// - LDAP 注入
+// - 命令注入
+// - XPath 注入
+// - 模板注入
+```
+
+3. **上下文差异**：
+```java
+// 在 SQL 中危险的字符
+// 在 JSON 中可能完全安全
+// 在 URL 中又是另一种规则
+// 黑名单无法适应所有上下文
+```
+
+**白名单的优势**：
+
+1. **可预测性**：明确知道哪些值是合法的
+```java
+// 白名单策略
+Set<String> ALLOWED_STATUS = Set.of("active", "inactive", "pending");
+if (!ALLOWED_STATUS.contains(status)) {
+    throw new ValidationException("Invalid status");
+}
+```
+
+2. **上下文无关**：不需要考虑各种编码和变体
+3. **防御全面**：任何未被明确允许的值都会被拒绝
+
+**实际最佳实践**：两者结合
+- 使用白名单定义合法值
+- 黑名单作为额外保护层（用于记录和告警）
+</details>
+
+**问题 3**：在 API 安全设计中，如何平衡「严格的参数验证」和「良好的用户体验」？
+
+<details>
+<summary>参考答案</summary>
+
+**矛盾点**：
+
+- 验证越严格，安全性越高，但误报可能越多
+- 验证越宽松，用户体验越好，但安全性降低
+
+**平衡策略**：
+
+**1. 分层验证**：
+```java
+public class LayeredValidation {
+    
+    // 第一层：基础校验（快速失败）
+    // 格式、类型、必填
+    public void basicValidation(CreateUserRequest request) {
+        // 这些错误应该立即返回
+        if (request.getUsername() == null) {
+            throw new ValidationException("用户名不能为空");
+        }
+    }
+    
+    // 第二层：业务规则校验（可能需要多步验证）
+    // 唯一性检查、黑名单等
+    public void businessValidation(CreateUserRequest request) {
+        // 这些错误可能需要特殊处理
+        if (userRepository.existsByUsername(request.getUsername())) {
+            throw new ValidationException("用户名已被占用");
+        }
+    }
+}
+```
+
+**2. 渐进式错误信息**：
+```json
+// 立即返回的错误（基础校验）
+{
+  "error": "validation_failed",
+  "field": "email",
+  "message": "邮箱格式不正确",
+  "hint": "请输入有效的邮箱地址，如 user@example.com"
+}
+
+// 延迟返回的错误（业务校验）
+// 在表单提交后验证，给出更友好的提示
+```
+
+**3. 客户端预验证**：
+```javascript
+// 客户端使用 Yup/Zod 等库预验证
+const schema = Yup.object().shape({
+  username: Yup.string()
+    .min(3, '用户名至少3个字符')
+    .max(20, '用户名最多20个字符')
+    .matches(/^[a-zA-Z0-9_]+$/, '用户名只能包含字母、数字和下划线')
+});
+
+await schema.validate(formData);
+// 减少不必要的 API 请求
+```
+
+**4. 宽容的输入处理**：
+```java
+public class LenientInputHandling {
+    
+    // 自动清理和规范化输入
+    public String sanitizeName(String name) {
+        if (name == null) return null;
+        
+        // 去除首尾空格
+        name = name.trim();
+        
+        // 转换全角字符为半角（某些用户可能无意中输入）
+        name = convertFullWidthToHalfWidth(name);
+        
+        // 转换中文标点为英文标点
+        name = convertChinesePunctuation(name);
+        
+        return name;
+    }
+}
+```
+
+**5. 用户友好的错误格式**：
+```java
+public class UserFriendlyErrors {
+    
+    // 使用 i18n 提供本地化错误信息
+    // 提供解决建议
+    // 不暴露内部实现细节
+    
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ErrorResponse handleValidation(MethodArgumentNotValidException ex) {
+        List<FieldError> errors = ex.getBindingResult().getFieldErrors();
+        
+        return ErrorResponse.builder()
+            .code("VALIDATION_FAILED")
+            .message("请检查以下输入")
+            .errors(errors.stream()
+                .map(e -> ErrorDetail.builder()
+                    .field(e.getField())
+                    .message(getLocalizedMessage(e))
+                    .suggestion(getSuggestion(e))
+                    .build())
+                .toList())
+            .build();
+    }
+}
+```
+</details>
