@@ -1,0 +1,518 @@
+---
+title: 淘宝架构演进
+description: 中国最大电商平台的二十年技术架构演进深度解析
+---
+
+# 淘宝架构演进
+
+2003 年 5 月 10 日，淘宝网上线。那时候，eBay 收购中国最大 C2C 平台易趣（Eachnet），占据超过 90% 的市场份额。eBay 中国区负责人宣称：「淘宝不可能活过 18 个月。」马云的回答是：「eBay 是大海里的鲨鱼，而我们是长江里的扬子鳄。」
+
+淘宝用了三年做到中国市场第一。这个过程中，技术团队用一套完全自研的分布式架构，以远低于 eBay 的成本，支撑了更高的交易量。这是中国互联网技术史上最重要的架构演进之一——从 PHP 单体到 Java 微服务，从 Oracle 到 MySQL，从商业方案到全面开源，从中心化架构到中台战略。
+
+## 公司画像
+
+淘宝（Taobao.com）是阿里巴巴集团的核心业务，2003 年由阿里巴巴创立，定位 C2C（个人对个人）电商平台，2008 年分拆出天猫（Tmall.com）专注 B2C（企业对个人）。
+
+理解淘宝技术挑战的关键，在于两个数字：
+
+- **双十一峰值**：2023 年天猫双十一，开门红首日交易创建峰值达到 **数十万笔/秒**，相比 2009 年首届双十一的 500 笔/秒，增长了数百倍
+- **日常规模**：淘宝日活用户超过 **3 亿**，商品数量超过 **10 亿**，每秒处理的搜索请求超过 **100 万次**
+
+淘宝与其他电商的区别在于：它的流量波动幅度是全球最大的——平时和双十一峰值相差可达百倍。这种量级的潮汐效应，在 Amazon、eBay 都不存在。这是逼迫淘宝不断进行架构升级的核心驱动力。
+
+## 架构演进时间线
+
+| 时间 | 阶段 | 核心技术 | 解决的核心问题 |
+| --- | --- | --- | --- |
+| **2003-2008** | PHP 单体时代 | LAMP + 自研分片 | 快速上线，用低成本架构支撑 C2C 爆发 |
+| **2008-2011** | Java 改造期 | Java + Spring + HSF | PHP 性能瓶颈，服务化拆分 |
+| **2011-2015** | 去 IOE 运动 | MySQL + OceanBase + PC 服务器 | Oracle 成本和扩展性瓶颈 |
+| **2015-2019** | 中台战略期 | 业务中台 + 技术中台 | 重复造轮子，前台响应慢 |
+| **2019-至今** | 极致弹性期 | 容器化 + 云原生 + 智能化 | 资源利用率优化，成本控制 |
+
+## 第一阶段：PHP 单体时代（2003-2008）
+
+### 快速迭代的秘密武器
+
+2003 年的淘宝，技术栈简单到极致：一台 Sun 小型机，几个 PC 服务器，跑 Apache + PHP + MySQL。这个配置跟 eBay 的 Oracle RAC 集群比起来，是蚂蚁对大象。
+
+但 PHP 的**简单性**反而成了早期优势：开发效率极高，改 bug 不用编译，发布直接覆盖文件。2003 年到 2005 年，淘宝以每个月发布一次的速度快速迭代，功能从简单的商品展示，逐步增加到店铺、购物车、支付。
+
+这个阶段淘宝面临的核心问题是**增长速度太快**。2004 年双十一，访问量是平时的 10 倍，服务器差点撑不住。团队连夜从其他部门借服务器，才勉强扛过去。从那之后，双十一备战成了淘宝的年度惯例。
+
+### 数据分片：应用层扩容
+
+PHP 的另一个问题是**单实例容量有限**。MySQL 单表超过几千万行后，性能急剧下降。淘宝的解决方案是**应用层数据分片**：
+
+```java
+// 淘宝早期数据分片策略
+public class ShardingStrategy {
+
+    // 按用户 ID 哈希分片
+    public int getShardIndex(Long userId, int shardCount) {
+        return (int) (userId % shardCount);
+    }
+
+    // 获取分片对应的数据源
+    public DataSource getDataSource(Long userId) {
+        int shardIndex = getShardIndex(userId, shardCount);
+        return dataSources[shardIndex];
+    }
+
+    // 分片内查询
+    public List<Order> findOrders(Long userId, int page, int pageSize) {
+        DataSource ds = getDataSource(userId);
+        try (Connection conn = ds.getConnection()) {
+            String sql = "SELECT * FROM orders WHERE user_id = ? LIMIT ? OFFSET ?";
+            return jdbcTemplate.query(sql, userId, pageSize, page * pageSize);
+        }
+    }
+}
+```
+
+这个阶段淘宝的架构核心是**纵向切割**：按用户 ID 分片后，每个分片独立 MySQL 实例，容量通过增加分片线性扩展。这种架构在当时解决了燃眉之急，但也埋下了隐患——跨分片查询极慢，JOIN 操作几乎不可能。
+
+## 第二阶段：Java 改造与服务化（2008-2011）
+
+### 为什么要从 PHP 迁移到 Java
+
+2008 年，淘宝交易量突破亿级，PHP 的瓶颈开始暴露：
+
+- **性能问题**：PHP 是解释型语言，每次请求都要重新加载框架，性能远低于 Java
+- **内存泄漏**：PHP-FPM 进程长期运行后内存持续增长，只能定时重启
+- **维护困难**：代码量超过 10 万行后，没有类型检查，bug 难以发现
+- **扩展性差**：无法使用成熟的 Java 生态（Spring、Hibernate 等）
+
+2008 年，淘宝启动代号「TBDB」（Taobao Database）的 Java 改造项目，用两年时间把核心系统从 PHP 重写到 Java。
+
+### HSF：高性能 RPC 框架
+
+Java 改造的同时，淘宝开始服务化拆分。不同业务模块（用户、商品、订单、支付）拆分成独立服务，通过 RPC 互相调用。
+
+淘宝自研了 **HSF（High-Speed Framework）**——一个高性能 RPC 框架，比当时开源的 Dubbo 更早，内部代号 Pandora。
+
+```java
+// HSF 服务提供者
+@HSFService(serviceVersion = "1.0.0", serviceGroup = "taobao")
+public class ItemServiceImpl implements ItemService {
+
+    @Autowired private ItemRepository itemRepository;
+
+    @Override
+    public ItemDetail getItemDetail(Long itemId) {
+        Item item = itemRepository.findById(itemId);
+        if (item == null) {
+            throw new ItemNotFoundException(itemId);
+        }
+        return convertToDetail(item);
+    }
+}
+
+// HSF 服务消费者
+public class ItemController {
+
+    // 从注册中心获取服务实例，负载均衡调用
+    @HSFReference(serviceVersion = "1.0.0", clientTimeout = 3000)
+    private ItemService itemService;
+
+    public ItemDetail getItem(Long itemId) {
+        return itemService.getItemDetail(itemId);
+    }
+}
+```
+
+HSF 的核心能力：基于 TCP 的二进制协议（比 HTTP 更高效）、异步调用、服务治理（限流、降级、权重调整）。
+
+### Notify：可靠消息系统
+
+服务拆分后，服务间调用从进程内变成跨进程。跨进程调用的最大问题是**失败重试**——调用方不知道服务方是否处理成功。
+
+淘宝自研了 **Notify** 消息系统，用于服务间的可靠消息传递：
+
+```java
+// Notify 消息发送
+public class OrderService {
+
+    @Autowired private NotifyServer notifyServer;
+
+    // 创建订单后，发送消息通知库存服务
+    public void createOrder(Long userId, List<Long> itemIds) {
+        // 1. 创建订单记录
+        Order order = orderRepository.save(new Order(userId, itemIds));
+
+        // 2. 发送消息（Notify 保证消息可靠送达）
+        OrderCreatedMessage message = new OrderCreatedMessage();
+        message.setOrderId(order.getId());
+        message.setUserId(userId);
+        message.setItemIds(itemIds);
+        message.setTimestamp(System.currentTimeMillis());
+
+        // 消息先持久化，再发送；失败会重试
+        notifyServer.send("order-created", message);
+
+        return order;
+    }
+}
+
+// Notify 消息消费
+@NotifyListener(topic = "order-created")
+public class InventoryService {
+
+    // 消息回调
+    public void onOrderCreated(OrderCreatedMessage message) {
+        // 幂等处理：检查是否已经扣减过
+        if (inventoryService.hasDeducted(message.getOrderId())) {
+            return;
+        }
+
+        // 扣减库存
+        inventoryService.deductStock(message.getItemIds());
+
+        // 标记已处理
+        inventoryService.markDeducted(message.getOrderId());
+    }
+}
+```
+
+Notify 的核心设计：**消息持久化 + 失败重试 + 幂等消费**。消息发送方先把消息落盘，再发送；消费方要保证幂等（同一消息处理多次效果一样）。
+
+### Tair：高性能缓存
+
+淘宝的高访问量带来巨大的数据库压力。大部分请求是读操作（查看商品、店铺），商品的变更频率远低于访问频率。**Tair**（Taobao Buffer）就是为这个场景设计的。
+
+```java
+// Tair 缓存使用
+public class ItemService {
+
+    @Autowired private TairClient tairClient;
+    @Autowired private ItemRepository itemRepository;
+
+    private static final int CACHE_EXPIRE_SECONDS = 3600; // 1 小时过期
+    private static final int CACHE_NAMESPACE = 1;
+
+    // 查询商品：先查缓存，再查数据库
+    public Item getItem(Long itemId) {
+        String cacheKey = "item:" + itemId;
+
+        // 1. 从 Tair 获取
+        Item cached = tairClient.get(CACHE_NAMESPACE, cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 2. 缓存未命中，从数据库加载
+        Item item = itemRepository.findById(itemId);
+        if (item != null) {
+            // 3. 写入缓存
+            tairClient.put(CACHE_NAMESPACE, cacheKey, item, CACHE_EXPIRE_SECONDS);
+        }
+
+        return item;
+    }
+
+    // 商品更新时删除缓存（Cache Aside 策略）
+    public void updateItem(Long itemId, ItemUpdateRequest request) {
+        itemRepository.update(itemId, request);
+
+        // 删除缓存，让下次查询重新加载最新数据
+        String cacheKey = "item:" + itemId;
+        tairClient.delete(CACHE_NAMESPACE, cacheKey);
+    }
+}
+```
+
+Tair 支持两种存储引擎：**Mdb**（内存存储，高性能）和 **Tfs**（磁盘存储，大容量）。热点商品放 Mdb，冷门商品放 Tfs。
+
+## 第三阶段：去 IOE 运动（2011-2015）
+
+### 为什么要去 IOE
+
+2011 年，淘宝喊出「去 IOE」口号。这三个字母代表三种昂贵的商业方案：
+
+- **IBM**：小型机（RISC 架构，每台数百万美元）
+- **Oracle**：商业数据库（license 费用极高，每年数亿）
+- **EMC**：高端存储（成本高，扩展不灵活）
+
+直接原因是**成本已经高到无法承受**。每年 Oracle license 费用数亿人民币，高峰期依然撑不住。每年双十一前，都要给 Oracle 原厂打电话，请求派工程师驻场应急。
+
+更深层的原因是**扩展性瓶颈**。Oracle 的架构是为强一致性事务设计的，而淘宝 90% 以上的操作是读操作，可以接受最终一致性。
+
+### MySQL 分库分表
+
+淘宝采用 **MySQL 分库分表**替代 Oracle。一个订单库变成 256 个分库，每个分库独立 MySQL 实例。
+
+```sql
+-- 按用户 ID 哈希分库
+-- 分库数 = 256，分表数 = 16
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_no VARCHAR(64) NOT NULL,
+    user_id BIGINT NOT NULL,
+    total_amount DECIMAL(12, 2) NOT NULL,
+    status TINYINT NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    -- 分片键必须加索引
+    INDEX idx_user_id (user_id),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+分库分表的挑战是**跨分片查询**。统计类需求（GMV、订单量）需要打宽表或者走离线 Hive。
+
+### OceanBase：自研分布式数据库
+
+2010 年，淘宝开始自研 **OceanBase**，目标是用 MySQL 语法享受分布式扩展性，同时保证强一致性事务。
+
+OceanBase 的核心设计：
+
+- **LSM-Tree 存储引擎**：写入先写内存，定期刷盘生成 SSTable。写入性能极高，读取需要合并多层数据
+- **准内存数据库**：热点数据尽量放在内存，减少磁盘访问
+- **Paxos/Raft 协议**：保证多数派写入成功，强一致性
+
+OceanBase 在 2019 年开源，2021 年 TPC-C 基准测试创下 7.07 亿 tpmC 世界纪录。
+
+## 第四阶段：中台战略（2015-2019）
+
+### 中台战略的诞生
+
+2015 年，马云在阿里内部提出「中台战略」：
+
+- **前台**：淘宝、天猫、盒马、饿了么等业务 App，各自独立运营
+- **中台**：共享业务能力（用户中心、商品中心、交易中心、支付中心），所有前台共用
+- **后台**：基础设施（数据库、云平台、安全）
+
+中台的核心目标是**复用**。如果每个前台都要自己开发用户认证、商品管理、订单处理，那每个团队都重复造轮子。中台把这些通用能力抽取出来，作为共享服务。
+
+### Dubbo：开源 RPC 框架
+
+**Dubbo** 最初是淘宝开源的 RPC 框架，专注于服务治理。
+
+```java
+// Dubbo 服务提供者
+@Service(version = "1.0.0")
+public class TradeServiceImpl implements TradeService {
+
+    @Override
+    public TradeResult createTrade(Long userId, Long orderId) {
+        // 创建交易记录
+        Trade trade = new Trade();
+        trade.setUserId(userId);
+        trade.setOrderId(orderId);
+        trade.setStatus(TradeStatus.PENDING);
+        tradeRepository.save(trade);
+
+        // 同步调用库存服务
+        inventoryService.deduct(orderId);
+
+        // 异步发送交易事件
+        tradeEventPublisher.publishCreated(trade);
+
+        return TradeResult.success(trade.getId());
+    }
+}
+
+// Dubbo 服务消费者
+@RestController
+@RequestMapping("/trade")
+public class TradeController {
+
+    @Reference(version = "1.0.0", loadbalance = "roundrobin", timeout = 3000)
+    private TradeService tradeService;
+
+    @PostMapping
+    public Response createTrade(@RequestBody TradeRequest request) {
+        TradeResult result = tradeService.createTrade(
+            request.getUserId(), request.getOrderId());
+        return Response.success(result);
+    }
+}
+```
+
+Dubbo 的核心能力：服务注册与发现、负载均衡、熔断降级、流量管理。2018 年进入 Apache 孵化器，2021 年毕业成为 Apache 顶级项目。
+
+### RocketMQ：分布式消息中间件
+
+**RocketMQ** 是阿里巴巴开源的分布式消息中间件，2017 年捐赠给 Apache 并同年毕业。
+
+```java
+// RocketMQ 事务消息
+@Service
+public class TradeService {
+
+    @Autowired private RocketMQTemplate rocketMQTemplate;
+
+    public void createTrade(Long userId, Long orderId) {
+        // 发��半消息（此时消费者看不到）
+        rocketMQTemplate.sendMessageInTransaction(
+            "trade-topic:create",
+            MessageBuilder.withPayload(new TradeMessage(userId, orderId))
+                .setHeader("tradeId", UUID.randomUUID().toString())
+                .build(),
+            // 本地事务 + 事务状态回查
+            (msg, arg) -> {
+                try {
+                    // 执行本地事务
+                    Trade trade = new Trade();
+                    trade.setUserId(userId);
+                    trade.setOrderId(orderId);
+                    tradeRepository.save(trade);
+
+                    // 扣减库存
+                    boolean deducted = inventoryService.deduct(orderId);
+                    if (!deducted) {
+                        throw new StockException("库存不足");
+                    }
+
+                    return LocalTransactionState.COMMIT_MESSAGE;
+                } catch (Exception e) {
+                    return LocalTransactionState.ROLLBACK_MESSAGE;
+                }
+            },
+            null
+        );
+    }
+}
+```
+
+RocketMQ 的核心能力：事务消息（解决分布式事务）、顺序消息、延迟消息、消息过滤。
+
+## 第五阶段：极致弹性（2019-至今）
+
+### 容器化与云原生
+
+2019 年后，淘宝全面转向 **Kubernetes** 容器化和云原生架构。双十一期间，可以在一小时内扩容数万个容器，活动结束后快速缩容。
+
+容器化带来的变化：
+
+- **资源利用率提升**：从物理机时代的 30% 利用率，提升到容器化的 60%+
+- **弹性伸缩**：流量高峰自动扩容，低谷自动缩容
+- **快速部署**：镜像部署，秒级发布
+
+### 全链路压测常态化
+
+双十一的全链路压测从年度变成了**常态化**。每次大促前，都会在生产环境进行真实的压力测试，发现真实的瓶颈点。
+
+```bash
+# 全链路压测：逐步加压
+target_qps=500000  # 目标 50 万 QPS
+current_qps=50000  # 当前 5 万 QPS
+
+# 每次增加 10%，观察系统指标
+while [ $current_qps -lt $target_qps ]; do
+    echo "Increasing to $current_qps QPS..."
+    adjust_load --qps $current_qps
+
+    # 检查错误率、延迟、CPU、DB 连接
+    if error_rate > 1%; then
+        echo "Bottleneck detected at $current_qps QPS"
+        break
+    fi
+
+    current_qps=$((current_qps * 11 / 10))
+done
+```
+
+### 智能化运营
+
+近年来，淘宝引入 AI 技术提升运营效率：
+
+- **智能推荐**：基于用户行为的个性化推荐，提升转化率
+- **智能客服**：对话式客服，解决用户问题
+- **智能运营**：AI 分析商品、店铺数据，提供运营建议
+
+## 淘宝开源项目
+
+淘宝（阿里）在技术开源方面贡献巨大，以下是核心开源项目：
+
+| 项目 | 类型 | 说明 |
+| --- | --- | --- |
+| **Dubbo** | RPC 框架 | Apache 顶级项目，高性能 Java RPC，专注服务治理 |
+| **RocketMQ** | 消息队列 | Apache 顶级项目，分布式消息中间件，支持事务消息 |
+| **Nacos** | 注册配置中心 | 服务发现与配置管理，Spring Cloud Alibaba 核心组件 |
+| **Sentinel** | 流量控制 | 限流、熔断、降级，流量保护三剑客 |
+| **Seata** | 分布式事务 | AT/TCC/ Saga 多种模式，蚂蚁集团开源 |
+| **Arthas** | Java 诊断工具 | 在线诊断 JVM 问题，无需重启 |
+
+## 架构启示
+
+### 启示一：架构是逼出来的，不是设计出来的
+
+淘宝的每一次架构升级，都是被业务增长逼出来的。PHP 单体时代，能支撑当时的业务量；业务量增长 10 倍后，PHP 成为瓶颈，才迁移到 Java；Java 架构支撑了亿级交易量；双十一峰值是平时的百倍，才有了全链路压测和异地多活。
+
+**建议**：不要过度设计。先跑通，再优化。等业务量证明当前架构撑不住时，再升级。
+
+### 启示二：开源与自研的选择
+
+淘宝在开源和自研之间有过多次选择：
+
+- **RPC 框架**：早期自研 HSF，后来开源 Dubbo。自研是为了满足内部特殊需求，开源是为了生态影响力
+- **消息队列**：自研 Notify 用于可靠消息，开源 RocketMQ 用于通用场景
+- **数据库**：自研 OceanBase 用于强一致性场景，开源 MySQL 用于通用场景
+
+**建议**：自研适合核心差异化能力，开源适合通用能力。不要为了自研而自研。
+
+### 启示三：去 IOE 的代价与收益
+
+去 IOE 花了近 10 年，代价巨大：应用兼容性改写、数据迁移、DBA 培训。但收益更大：每年节省数亿 license 费用，架构扩展性大幅提升。
+
+**建议**：技术迁移要渐进式，不要追求一步到位。先在新业务上验证，再逐步迁移老业务。
+
+### 启示四：中台战略的适用条件
+
+中台战略让阿里实现了前台业务的快速迭代——之前每个业务都要开发「用户中心」，有了中台后直接调用共享服务。但中台也有代价：前台灵活性下降，中台成为单点故障。
+
+**建议**：中台适合业务稳定、团队规模大、公用能力多的公司。小公司、新业务不要盲目追求中台。
+
+## 量化数据
+
+| 指标 | 2009 年 | 2013 年 | 2017 年 | 2023 年 |
+| --- | --- | --- | --- | --- |
+| 双十一交易创建峰值 | 500 笔/秒 | 5 万笔/秒 | 32 万笔/秒 | 数十万笔/秒 |
+| 支付峰值 | 200 笔/秒 | 2 万笔/秒 | 8 万笔/秒 | 10 万笔/秒 |
+| 订单库分库数 | 16 | 256 | 1024 | 4096+ |
+| 单机 MySQL 容量 | 1000 万行 | 5000 万行 | 1 亿行 | 通过分库分表线性扩展 |
+
+## 术语表
+
+| 术语 | 类型 | 说明 |
+| --- | --- | --- |
+| 马云（Jack Ma） | 人名 | 阿里巴巴集团创始人，1999 年创办阿里巴巴，2019 年卸任 |
+| 去 IOE | 技术名词 | 阿里 2008 年提出的技术转型战略，替换商业方案为开源/自研 |
+| HSF | 技术名词 | Taobao High Speed Framework，阿里自研 RPC 框架，内部使用 |
+| Notify | 技术名词 | 淘宝自研的可靠消息系统，消息持久化 + 失败重试 |
+| Tair | 技术名词 | Taobao Buffer，阿里自研高性能缓存，Mdb（内存）+ Tfs（磁盘） |
+| OceanBase | 技术名词 | 阿里自研分布式关系数据库，2021 年 TPC-C 世界纪录保持者 |
+| 双十一 | 业务名词 | 每年 11 月 11 日购物节，2009 年首届，峰值流量为平时的百倍 |
+| 中台战略 | 业务名词 | 2015 年阿里提出的组织架构改革，前台业务共享中台能力 |
+| 分库分表 | 技术名词 | 将数据按分片键拆分到多个数据库实例，解决单库容量瓶颈 |
+| 单元化 | 技术名词 | 将业务按用户或地域划分为相互隔离的单元，一个单元故障不影响其他单元 |
+| LSM-Tree | 技术名词 | Log-Structured Merge Tree，写入优化的存储结构，RocketMQ/OceanBase 使用 |
+| Cache Aside | 技术名词 | 缓存策略：读时先缓存后数据库，写时先数据库后删缓存 |
+
+## 总结
+
+淘宝的技术演进，始终围绕一个核心命题：**如何在流量暴涨百倍时，保证系统不崩溃，同时控制成本**。
+
+**演进脉络**：
+
+- **2003-2008**：PHP 单体时代，快速迭代 + 数据分片
+- **2008-2011**：Java 改造，HSF + Notify + Tair 自研中间件体系
+- **2011-2015**：去 IOE，MySQL 分库分表 + OceanBase
+- **2015-2019**：中台战略，Dubbo + RocketMQ + Nacos + Sentinel
+- **2019-至今**：容器化 + 云原生 + 智能化运营
+
+**核心技术贡献**：
+
+- **Dubbo**：高性能 RPC 框架，Apache 顶级项目
+- **RocketMQ**：分布式消息中间件，Apache 顶级项目
+- **Nacos**：服务发现与配置管理
+- **Sentinel**：流量控制组件
+- **OceanBase**：分布式关系数据库
+
+**对普通项目的启发**：
+
+- 架构升级要跟随业务增长，不要过度设计
+- 开源与自研要有清晰边界，核心能力自研，通用能力开源
+- 技术迁移要渐进式推进，控制风险
+- 中台战略要量力而行，业务稳定、规模大的公司才适合

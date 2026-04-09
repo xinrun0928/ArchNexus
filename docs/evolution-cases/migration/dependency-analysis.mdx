@@ -1,0 +1,786 @@
+---
+title: 服务依赖梳理
+description: 边界划分不清晰是拆分失败的头号原因
+---
+
+# 服务依赖梳理
+
+2017 年，某电商公司决定把运行了 5 年的单体系统拆成微服务。他们按照「业务能力」划分出了 12 个服务：用户服务、商品服务、订单服务、库存服务、支付服务、物流服务……
+
+拆分完成后，团队发现了一个致命问题：订单服务和库存服务之间存在循环依赖。订单创建时需要查库存，库存扣减时需要查订单。两个服务互相调用，形成了一个死锁般的依赖环。
+
+更糟糕的是，他们已经在线上运行了 3 个月，数据已经分布在两个服务里。拆分容易合并难，这个循环依赖困扰了他们整整半年才最终解决。
+
+这个案例告诉我们：**边界划分不清晰是拆分失败的头号原因。而边界划分的第一步，是依赖梳理。**
+
+## 为什么依赖梳理是拆分的前提
+
+很多团队在拆分微服务时，习惯性地按照「功能」划分：用户管理、商品管理、订单管理。但这种划分方式往往忽略了一个关键因素：**业务边界和调用关系**。
+
+### 错误的拆分方式
+
+```
+常见错误：按「功能」而非「领域」拆分
+
+┌──────────┐   ┌──────────┐   ┌──────────┐
+│ 用户服务  │   │ 商品服务  │   │ 订单服务  │
+└────┬─────┘   └────┬─────┘   └────┬─────┘
+     │              │              │
+     │   ┌──────────┼──────────┐   │
+     └──►│   共享用户模块（幽灵）    │◄──┘
+         │  订单和商品都依赖它     │
+         └──────────────────────┘
+
+问题：用户模块到底是「用户服务」管，还是「订单服务」管？
+      两个服务都依赖它，怎么拆？
+```
+
+### 正确的拆分方式
+
+```
+正确方式：先梳理依赖，再划分边界
+
+调用关系图（依赖梳理结果）：
+
+    ┌──────────┐
+    │ 用户服务  │  ←─ 被所有服务依赖
+    └────┬─────┘
+         │
+    ┌────┴────┐
+    ▼         ▼
+┌────────┐ ┌────────┐
+│商品服务 │ │订单服务 │
+└────┬───┘ └────┬───┘
+     │         │
+     ▼         ▼
+┌────────────┐
+│ 库存服务   │  ←─ 只被订单服务依赖
+└────────────┘
+
+边界划分原则：
+- 用户服务是基础设施，被广泛依赖，但不能被依赖者反向调用
+- 库存服务只被订单服务使用，可以和订单服务一起考虑
+- 高频调用的服务应尽量靠近调用方
+```
+
+## 依赖梳理的三个维度
+
+依赖梳理需要从三个维度分析：调用链、代码结构、业务流程。
+
+### 维度一：调用链追踪
+
+调用链追踪是发现服务间依赖关系的最直接方式。通过分析请求在系统中的流转路径，可以清晰地看到服务间的调用关系。
+
+```
+调用链示例：
+
+用户下单请求的调用链：
+
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│ API 网关 │───►│ 订单服务 │───►│ 库存服务 │───►│ 库存 DB │
+└─────────┘    └────┬────┘    └─────────┘    └─────────┘
+                   │
+                   ▼
+              ┌─────────┐    ┌─────────┐
+              │ 支付服务 │───►│ 支付 DB │
+              └─────────┘    └─────────┘
+                   │
+                   ▼
+              ┌─────────┐    ┌─────────┐
+              │ 消息队列 │───►│ 物流服务 │
+              └─────────┘    └─────────┘
+```
+
+### 维度二：代码静态分析
+
+通过分析代码中的依赖关系（import 语句、API 调用），可以量化服务间的耦合度。
+
+```java
+// 代码静态分析示例：查找服务间的直接调用
+
+// OrderService.java
+public class OrderService {
+
+    // 直接依赖 UserService
+    @Autowired private UserService userService;
+
+    // 直接依赖 InventoryService
+    @Autowired private InventoryService inventoryService;
+
+    // 直接依赖 PaymentService
+    @Autowired private PaymentService paymentService;
+
+    // 直接依赖 ProductService（可能是不该有的依赖）
+    @Autowired private ProductService productService;
+}
+```
+
+```
+耦合度分析结果：
+
+| 服务 A | 服务 B | 调用次数/天 | 耦合类型 | 风险等级 |
+| --- | --- | --- | --- | --- |
+| 订单服务 | 用户服务 | 50 万 | 必要依赖 | 低 |
+| 订单服务 | 库存服务 | 30 万 | 必要依赖 | 低 |
+| 订单服务 | 支付服务 | 20 万 | 必要依赖 | 低 |
+| 订单服务 | 商品服务 | 10 万 | 可疑依赖 | 中 |
+| 库存服务 | 订单服务 | 5 万 | 循环依赖 | 高 |
+```
+
+### 维度三：业务流程访谈
+
+除了技术视角，还需要从业务视角理解依赖关系。技术上的调用关系，未必代表业务上的真实边界。
+
+```
+业务流程访谈要点：
+
+问题 1：「谁是这个数据的主入口？」
+  → 确定数据的「创建者」和「消费者」
+
+问题 2：「这个数据变更时，谁需要知道？」
+  → 确定数据变更的「订阅者」
+
+问题 3：「如果这个服务挂了，哪些业务会受影响？」
+  → 确定依赖的「关键程度」
+
+问题 4：「这个服务的数据，能被其他服务直接修改吗？」
+  → 确定数据的「所有权」
+```
+
+## 调用链分析工具
+
+现代分布式系统有成熟的调用链分析工具可以帮助发现依赖关系。
+
+### SkyWalking
+
+SkyWalking 是 Apache 顶级项目，支持多语言，自动埋点，无需业务代码修改。
+
+```yaml
+# SkyWalking OAP 配置
+receiver-register:
+  default:
+    acceptLanguage: zh-CN,zh
+
+receiver-trace:
+  default:
+    bufferPath: ../trace-buffer
+    bufferOffsetMaxFileSize: 100
+    bufferDataMaxFileSize: 500
+    flushInterval: 3
+    fitBatchSize: 3000
+
+query:
+  graphql:
+    path: /graphql
+```
+
+```bash
+# SkyWalking CLI 查询依赖关系
+swctl trace list --service order-service --limit 10
+
+# 输出：
+# TRACE_ID        DURATION    START_TIME
+# xyz123          125ms       2024-01-15 10:00:00
+# abc456          89ms        2024-01-15 10:00:01
+
+swctl dependency service order-service
+
+# 输出服务依赖关系：
+# order-service
+# ├── user-service (调用)
+# ├── inventory-service (调用)
+# ├── payment-service (调用)
+# └── 被调用：无
+```
+
+### Jaeger
+
+Jaeger 是 CNCF 项目，专注于分布式追踪，常与 OpenTelemetry 配合使用。
+
+```yaml
+# Jaeger Collector 配置
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger
+spec:
+  collector:
+    maxTraces: 50000
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+  query:
+    basePath: /jaeger
+  storage:
+    type: elasticsearch
+    elasticsearch:
+      nodeCount: 3
+```
+
+```java
+// 手动埋点示例
+@RestController
+public class OrderController {
+
+    @Autowired private Tracer tracer;
+
+    @PostMapping("/orders")
+    public Response createOrder(@RequestBody OrderRequest request) {
+        // 创建子 span
+        Span span = tracer.startSpan("createOrder");
+        try {
+            span.setTag("userId", request.getUserId());
+            span.setTag("itemCount", request.getItems().size());
+
+            // 业务逻辑
+            Order order = orderService.create(request);
+
+            span.setTag("orderId", order.getId());
+            return Response.ok(order);
+        } catch (Exception e) {
+            span.setTag("error", true);
+            span.setTag("error.message", e.getMessage());
+            throw e;
+        } finally {
+            span.finish();
+        }
+    }
+}
+```
+
+### Zipkin
+
+Zipkin 是 Twitter 开源的追踪系统，轻量级，易于部署。
+
+```java
+// Zipkin 埋点示例
+@Configuration
+public class ZipkinConfig {
+
+    @Bean
+    public OkHttpClient okHttpClient(ZipkinProperties properties) {
+        return new OkHttpClient.Builder()
+            .dispatcher(new Dispatcher())
+            .addInterceptor(chain -> {
+                Request request = chain.request();
+                // 注入 Trace ID 到 Header
+                Span currentSpan = Tracer.currentSpan();
+                if (currentSpan != null) {
+                    request = request.newBuilder()
+                        .header("X-B3-TraceId", currentSpan.context().traceIdString())
+                        .header("X-B3-SpanId", currentSpan.context().spanIdString())
+                        .build();
+                }
+                return chain.proceed(request);
+            })
+            .build();
+    }
+}
+```
+
+## 依赖关系矩阵
+
+依赖梳理的输出是一张依赖关系矩阵，清晰展示服务间的调用关系。
+
+### 依赖类型定义
+
+```
+依赖类型说明：
+
+类型一：同步调用（Sync）
+- 调用方等待被调用方返回结果
+- 典型场景：REST API、gRPC
+- 风险：调用方可用性依赖被调用方
+
+类型二：异步消息（Async）
+- 调用方发送消息后不等待返回
+- 典型场景：Kafka、RocketMQ
+- 风险：消息丢失、延迟
+
+类型三：数据库共享（DB）
+- 两个服务读写同一张数据库表
+- 典型场景：共享的 reference 表
+- 风险：强耦合，数据一致性问题
+
+类型四：缓存共享（Cache）
+- 两个服务读写同一个缓存实例
+- 典型场景：Redis 共享数据
+- 风险：缓存穿透导致击穿
+```
+
+### 依赖关系矩阵示例
+
+```
+依赖关系矩阵（行调用列）：
+
+| 服务 | 用户 | 商品 | 订单 | 库存 | 支付 | 物流 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 用户服务 | - | - | Sync | - | - | - |
+| 商品服务 | - | - | Sync | - | - | - |
+| 订单服务 | Sync | - | - | Sync | Sync | Async |
+| 库存服务 | - | - | Sync | - | - | - |
+| 支付服务 | Sync | - | Sync | - | - | - |
+| 物流服务 | - | - | Async | - | - | - |
+
+依赖分析结论：
+1. 订单服务是核心依赖方（依赖最多）
+2. 库存服务 → 订单服务存在循环依赖（高危）
+3. 物流服务依赖订单服务（单向，OK）
+```
+
+## 循环依赖检测与解决
+
+循环依赖是服务拆分中最危险的问题。它会导致部署顺序复杂、服务启动死锁、故障级联传播。
+
+### 循环依赖的识别
+
+```
+循环依赖示意：
+
+    A ──► B ──► C
+    ▲         │
+    │         ▼
+    └─────── D
+
+实际情况：
+- A 调用 B
+- B 调用 C
+- C 调用 D
+- D 调用 A
+
+结果：无论谁先启动，都会因为等待其他服务而死锁。
+```
+
+```java
+// 代码层面的循环依赖检测
+public class CircularDependencyDetector {
+
+    private Map<String, Set<String>> dependencyGraph = new HashMap<>();
+
+    public void addDependency(String service, String dependency) {
+        dependencyGraph
+            .computeIfAbsent(service, k -> new HashSet<>())
+            .add(dependency);
+    }
+
+    // 检测是否存在环
+    public List<String> findCircularDependencies() {
+        List<String> cycles = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        Set<String> recursionStack = new HashSet<>();
+
+        for (String node : dependencyGraph.keySet()) {
+            if (!visited.contains(node)) {
+                findCycle(node, visited, recursionStack, cycles);
+            }
+        }
+        return cycles;
+    }
+
+    private void findCycle(String node, Set<String> visited,
+                          Set<String> recursionStack, List<String> cycles) {
+        visited.add(node);
+        recursionStack.add(node);
+
+        for (String neighbor : dependencyGraph.getOrDefault(node, Collections.emptySet())) {
+            if (!visited.contains(neighbor)) {
+                findCycle(neighbor, visited, recursionStack, cycles);
+            } else if (recursionStack.contains(neighbor)) {
+                cycles.add("Found cycle: " + neighbor + " -> " + node);
+            }
+        }
+
+        recursionStack.remove(node);
+    }
+}
+```
+
+### 循环依赖的解决方案
+
+**方案一：提取公共接口**
+
+把循环调用的部分提取为独立服务或接口，消除循环。
+
+```
+原始循环：
+┌──────────┐     ┌──────────┐
+│ 订单服务  │ ──► │ 库存服务  │
+└────┬─────┘     └────┬─────┘
+     │                │
+     ◄────────────────┘
+
+解决方案：提取「库存检查」接口
+┌──────────┐     ┌──────────┐
+│ 订单服务  │ ──► │ 库存检查  │
+└──────────┘     │  接口    │
+                 └────┬─────┘
+                      │
+                      ▼
+                 ┌──────────┐
+                 │ 库存服务  │
+                 └──────────┘
+
+注意：库存服务不再调用订单服务，而是订单服务通过事件通知库存服务。
+```
+
+**方案二：事件驱动解耦**
+
+用消息队列替代同步调用，打破循环。
+
+```java
+// 事件驱动：订单服务不再同步调用库存服务
+@Service
+public class OrderService {
+
+    @Autowired private EventPublisher eventPublisher;
+
+    public void createOrder(OrderRequest request) {
+        // 1. 创建订单
+        Order order = orderRepository.save(new Order(request));
+
+        // 2. 发布事件，不等待库存服务响应
+        eventPublisher.publish("order.created", new OrderCreatedEvent(order));
+
+        return order;
+    }
+}
+
+// 库存服务订阅事件
+@EventListener(topic = "order.created")
+public void handleOrderCreated(OrderCreatedEvent event) {
+    // 异步扣减库存
+    inventoryService.deductStock(event.getOrderId(), event.getItems());
+}
+```
+
+**方案三：合并服务**
+
+如果两个服务强耦合到无法拆分，考虑合并它们。
+
+```
+合并策略：
+- 订单服务 + 库存服务 → 交易履约服务
+- 用户服务 + 权限服务 → 身份服务
+
+合并后：
+- 内部调用变成进程内调用
+- 事务一致性更容易保证
+- 代价：服务粒度变大
+```
+
+## 依赖治理策略
+
+依赖梳理只是第一步，依赖治理才是长期工作。
+
+### 依赖分层
+
+```
+依赖分层原则：上层可以调用下层，下层不能调用上层
+
+┌─────────────────────────────────────────────┐
+│                  接入层                      │
+│         API 网关、消息消费端                 │
+└─────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────┐
+│                  业务层                      │
+│         订单服务、商品服务、用户服务         │
+└─────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────┐
+│                  基础层                      │
+│         缓存服务、存储服务、搜索服务         │
+└─────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────┐
+│                  平台层                      │
+│         配置中心、注册中心、日志服务         │
+└─────────────────────────────────────────────┘
+
+禁止跨层调用：业务层不能直接调用平台层的内部实现。
+```
+
+### 接口契约
+
+服务间通过接口契约通信，契约变更需要兼容。
+
+```yaml
+# OpenAPI 契约示例
+openapi: 3.0.0
+info:
+  title: 用户服务 API
+  version: 1.0.0
+
+paths:
+  /users/{id}:
+    get:
+      summary: 获取用户信息
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        email:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+```
+
+### 熔断降级
+
+每个服务调用都需要考虑被调用方故障的情况。
+
+```java
+// 熔断降级示例
+@Service
+public class OrderService {
+
+    @Autowired private UserService userService;
+
+    // 使用 Resilience4j 熔断
+    @CircuitBreaker(name = "userService", fallbackMethod = "getUserFallback")
+    public User getUser(Long userId) {
+        return userService.getUser(userId);
+    }
+
+    // 降级方法
+    public User getUserFallback(Long userId, Exception e) {
+        // 降级：返回缓存的用户数据
+        User cachedUser = userCache.get(userId);
+        if (cachedUser != null) {
+            return cachedUser;
+        }
+        // 兜底：返回匿名用户
+        return User.anonymous();
+    }
+}
+```
+
+## 案例：订单与库存的循环依赖发现与解决
+
+以下案例来自某电商平台的真实经历：
+
+### 依赖梳理发现的问题
+
+团队在拆分前进行了完整的依赖梳理，发现了以下问题：
+
+```
+依赖分析报告摘要：
+
+问题 1：订单服务 → 库存服务 → 订单服务（循环依赖）
+- 订单创建时调用库存检查
+- 库存扣减时调用订单验证（检查是否重复下单）
+
+问题 2：商品服务 → 促销服务 → 商品服务（循环依赖）
+- 商品展示时获取促销信息
+- 促销配置时需要验证商品信息
+
+问题 3：用户服务 → 订单服务 → 用户服务（循环依赖）
+- 订单查询时获取用户信息
+- 用户注册时初始化订单额度
+```
+
+### 解决方案实施
+
+**针对问题 1（订单 ↔ 库存）**：
+
+```
+解决方案：事件驱动 + 防腐层
+
+1. 订单服务不再直接调用库存服务
+2. 订单创建后发布事件：OrderCreatedEvent
+3. 库存服务订阅事件，异步扣减库存
+4. 库存服务需要查询订单时，使用「快照数据」而非实时调用
+
+改进后的依赖关系：
+订单服务 ──► 库存服务（单向，同步）
+订单服务 ──► 消息队列 ──► 库存服务（异步）
+```
+
+**针对问题 2（商品 ↔ 促销）**：
+
+```
+解决方案：提取促销计算服务
+
+1. 促销计算从商品服务中独立出来
+2. 商品服务提供商品基础信息（不变）
+3. 促销服务聚合多个商品计算促销规则
+4. 促销服务只读商品信息，不写商品信息
+
+改进后的依赖关系：
+商品服务（被依赖，只读）
+促销服务（依赖商品服务）
+```
+
+**针对问题 3（用户 ↔ 订单）**：
+
+```
+解决方案：数据同步而非实时调用
+
+1. 用户服务维护用户基础数据
+2. 订单服务维护用户订单统计数据（同步数据）
+3. 订单统计通过消息队列同步到用户服务
+4. 查询时各自从自己的数据源获取
+
+改进后的依赖关系：
+用户服务（用户数据源）
+订单服务（订单统计，从消息队列同步用户变更）
+```
+
+### 改进后的依赖矩阵
+
+```
+改进后的依赖矩阵：
+
+| 服务 | 用户 | 商品 | 订单 | 库存 | 促销 | 支付 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 用户服务 | - | - | Async | - | - | - |
+| 商品服务 | - | - | Sync | - | Sync | - |
+| 订单服务 | - | - | - | Async | - | Sync |
+| 库存服务 | - | - | - | - | - | - |
+| 促销服务 | Sync | - | - | - | - | - |
+| 支付服务 | Sync | - | Async | - | - | - |
+
+循环依赖全部消除。
+```
+
+## 总结
+
+依赖梳理是微服务拆分的第一步，也是最关键的一步。
+
+```
+依赖梳理的核心产出：
+
+1. 调用链图：清晰展示服务间的调用关系
+2. 依赖矩阵：量化服务间的耦合度
+3. 循环依赖列表：高危问题的提前发现
+4. 依赖治理策略：长期维护的规范
+
+依赖梳理的工具：
+- SkyWalking：全链路追踪，自动分析
+- Jaeger：分布式追踪，OpenTelemetry 兼容
+- Zipkin：轻量级追踪，易于部署
+- 代码静态分析：发现代码层面的直接依赖
+
+循环依赖的解决：
+- 提取公共接口
+- 事件驱动解耦
+- 合并强耦合服务
+
+依赖治理的原则：
+- 分层调用：上层调用下层，禁止跨层
+- 契约优先：接口变更需兼容
+- 熔断降级：每个调用都要考虑失败场景
+```
+
+## 思考题
+
+**问题 1**：在依赖梳理过程中，发现某个服务的接口被 10 个其他服务调用，但这个服务的团队只有 2 个人。应该如何处理？
+
+<details>
+<summary>参考答案</summary>
+
+这种情况需要评估几个方面：
+
+1. **接口稳定性**：被调用次数多，说明接口稳定，不轻易变更。这是好事。
+2. **接口复杂度**：如果接口简单，维护成本低；如果接口复杂，可能需要考虑拆分。
+3. **服务定位**：这个服务是「基础设施」还是「业务服务」？
+   - 基础设施（如用户服务、配置服务）：被大量依赖是正常的
+   - 业务服务：被大量依赖可能意味着边界划分有问题
+
+建议处理方式：
+- 如果是基础设施服务：为其配备专门的 SRE 保障稳定性
+- 如果是业务服务：考虑将接口下沉到更稳定的底层服务
+- 无论如何：2 人团队维护被 10 个服务依赖的接口，是高风险状态，需要资源倾斜
+
+</details>
+
+**问题 2**：两个服务之间存在同步调用，但业务上确实需要强一致性（如库存扣减）。无法用消息队列异步化时，应该怎么办？
+
+<details>
+<summary>参考答案</summary>
+
+业务上确实存在需要强一致性的场景，不能强行异步化。
+
+几种可行的处理方式：
+
+1. **接受同步调用，但控制范围**：
+   - 同步调用只在核心链路存在
+   - 非核心场景使用异步（如通知、审计日志）
+
+2. ** Saga 模式**：
+   - 将大事务拆成多个小步骤
+   - 每个步骤都有补偿操作
+   - 最终一致性，而非强一致性
+
+3. ** TCC 模式**：
+   - Try：预留资源
+   - Confirm：确认扣减
+   - Cancel：释放预留
+
+4. ** 合并服务**：
+   - 如果两个服务强耦合到无法拆分
+   - 考虑合并为一个服务
+   - 内部调用变成进程内事务
+
+核心原则：不是所有场景都适合微服务，强一致性场景可能是微服务边界划分错误的信号。
+
+</details>
+
+**问题 3**：依赖梳理时发现服务 A 调用服务 B 的某个接口，该接口返回了 A 不需要的数据（过度暴露）。这种情况算不算问题？
+
+<details>
+<summary>参考答案</summary>
+
+这算一个问题，叫「接口污染」或「过度暴露」。
+
+问题表现：
+- 服务 B 的接口返回了 20 个字段
+- 服务 A 只用了 5 个
+- 后来服务 B 想删除/修改其中 10 个字段，但因为担心影响服务 A，不敢改
+
+处理方式：
+
+1. **接口拆分**：按使用方需求拆分接口
+   - 接口 A：返回 5 个字段（给 A 用）
+   - 接口 B：返回 15 个字段（给其他服务用）
+
+2. **字段过滤**：在 API 网关或 BFF 层做字段裁剪
+   - 服务 B 提供完整数据
+   - 各调用方按需裁剪
+
+3. **GraphQL**：如果字段需求差异大，考虑 GraphQL
+   - 调用方按需查询字段
+   - 服务方不预先决定返回哪些
+
+4. **升级契约版本**：
+   - 保留旧接口兼容
+   - 新接口精简字段
+   - 逐步引导调用方迁移
+
+核心原则：接口应该「按需提供」，不要因为「方便」就返回所有数据。
+
+</details>

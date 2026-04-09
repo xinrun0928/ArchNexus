@@ -1,0 +1,306 @@
+---
+title: 数据双写
+description: 深入讲解迁移期间新旧系统并存时的数据同步策略，涵盖同步双写、异步双写、本地消息表三种模式
+---
+
+# 数据双写
+
+2019 年，某金融公司启动核心系统拆分。订单服务从单体中剥离出来，新服务准备接收流量，但数据库还在主库里。怎么让新服务的写操作同时更新旧库？最简单的办法是：写两边。
+
+这就是数据双写（Dual Write）。
+
+双写是迁移期间数据同步的核心手段。它的本质是：在同一个业务操作中，同时向新旧两个数据源写入数据，确保在切换流量期间，两边的数据保持一致。
+
+但双写也是最容易出问题的环节。写入延迟增加、数据冲突、失败重试、网络抖动——任何一个环节出问题，都会导致数据不一致，而数据不一致的后果，轻则是业务异常，重则是资金损失。
+
+这一节从双写的三种模式讲起，分析每种模式的风险和适用场景，并给出生产级的解决方案。
+
+## 双写的三种模式
+
+双写有三种实现方式，各有权衡：
+
+| 模式 | 原理 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| **同步双写** | 在业务代码中同时写入新旧两个数据源 | 实现简单，立即生效 | 写入延迟增加，一致性难以保证 | 过渡期短、数据量小的场景 |
+| **异步双写** | 写完一个数据源后，通过消息队列异步同步到另一个 | 性能好，不阻塞主流程 | 消息可能丢失，需要额外保证 | 大多数迁移场景 |
+| **本地消息表** | 在本地事务中同时写入业务数据和消息记录 | 可靠，消息不会丢失 | 实现复杂，需要定时任务 | 对数据一致性要求高的场景 |
+
+### 同步双写
+
+同步双写是最直观的实现方式：在同一个业务方法中，先写新库，再写旧库（或者反过来）。
+
+```java
+@Service
+public class UserService {
+
+    @Autowired private UserMapper newUserMapper;    // 新库
+    @Autowired private UserMapper legacyUserMapper; // 旧库
+
+    public void createUser(User user) {
+        // 先写新库
+        newUserMapper.insert(user);
+
+        // 再写旧库
+        legacyUserMapper.insert(user);
+    }
+}
+```
+
+**问题在于：任何一个写入失败，都会导致数据不一致。**
+
+如果新库写入成功、旧库写入失败，数据只在新库中，旧库缺失这条记录；如果反过来，旧库有记录但新库没有。两种情况都是数据不一致，但第一种更危险——新服务以为写入成功了，结果旧库没有数据。
+
+你可能会想到加事务。但新库和旧库是两个独立的数据库连接，无法用同一个事务包裹。除非你使用分布式事务框架（如 Seata），但引入分布式事务又会增加复杂度。
+
+**更关键的问题是：延迟。** 两次写入意味着两倍的响应时间。如果新库在另一个机房，网络延迟可能增加 10~50ms。
+
+### 异步双写（消息队列）
+
+异步双写把「写入旧库」这件事从主流程中抽离出来：通过消息队列异步完成。
+
+```java
+@Service
+public class UserService {
+
+    @Autowired private UserMapper newUserMapper;
+    @Autowired private KafkaTemplate kafkaTemplate;
+
+    public void createUser(User user) {
+        // 写新库
+        newUserMapper.insert(user);
+
+        // 发消息，异步同步到旧库
+        kafkaTemplate.send("user-sync", user.getId(), user);
+    }
+}
+
+// 消费者服务（独立部署）
+@Service
+public class UserSyncConsumer {
+
+    @Autowired private UserMapper legacyUserMapper;
+
+    @KafkaListener(topics = "user-sync")
+    public void onUserCreated(User user) {
+        // 写入旧库
+        legacyUserMapper.insert(user);
+    }
+}
+```
+
+异步双写解决了同步双写的两个问题：不阻塞主流程，不增加接口响应时间。但它引入了新的问题：**消息可能丢失**。
+
+Kafka 默认是「至少一次」（at-least-once）语义，消息不会丢失。但如果不正确配置（如 `acks=0`），或者消费者重启期间有消息到达，消息可能丢失。
+
+**另一个问题是消息重复。** 如果消费者处理成功但返回 ACK 失败，Kafka 会重发这条消息，导致旧库写入重复数据。你需要在消费者端做幂等处理。
+
+### 本地消息表
+
+本地消息表是解决消息可靠性问题的经典方案。它的核心思想是：**把消息记录当作业务数据，在同一个事务里写入本地数据库。**
+
+```java
+@Service
+public class UserService {
+
+    @Autowired private UserMapper newUserMapper;  // 新库
+
+    @Transactional
+    public void createUser(User user) {
+        // 1. 写入新库
+        newUserMapper.insert(user);
+
+        // 2. 写入本地消息表（和业务数据在同一个事务）
+        LocalMessage message = new LocalMessage();
+        message.setId(UUID.randomUUID().toString());
+        message.setTopic("user-sync");
+        message.setPayload(JSON.toJSONString(user));
+        message.setStatus("PENDING");
+        message.setRetryCount(0);
+        message.setCreateTime(LocalDateTime.now());
+        newUserMapper.insertMessage(message);
+    }
+}
+```
+
+这里的关键是：**消息记录和业务数据在同一个数据库实例中，在同一个事务里写入**。如果事务提交失败，消息记录也不会被写入；如果事务提交成功，消息记录一定在数据库里。
+
+但消息在本地消息表里，怎么同步到旧库？需要一个定时任务轮询消息表：
+
+```java
+@Service
+public class MessageDispatcher {
+
+    @Autowired private UserMapper newUserMapper;
+    @Autowired private UserMapper legacyUserMapper;
+    @Autowired private KafkaTemplate kafkaTemplate;
+
+    @Scheduled(fixedDelay = 1000)  // 每秒执行一次
+    public void dispatch() {
+        // 1. 查询待发送的消息
+        List<LocalMessage> messages = newUserMapper.selectPendingMessages(100);
+
+        for (LocalMessage msg : messages) {
+            try {
+                // 2. 发送到消息队列
+                kafkaTemplate.send(msg.getTopic(), msg.getPayload());
+
+                // 3. 更新消息状态
+                msg.setStatus("SENT");
+                msg.setSendTime(LocalDateTime.now());
+                newUserMapper.updateMessage(msg);
+
+            } catch (Exception e) {
+                // 4. 发送失败，��加重试次数
+                msg.setRetryCount(msg.getRetryCount() + 1);
+                msg.setLastError(e.getMessage());
+
+                if (msg.getRetryCount() >= 3) {
+                    msg.setStatus("FAILED");
+                }
+
+                newUserMapper.updateMessage(msg);
+            }
+        }
+    }
+}
+```
+
+定时任务负责把消息从本地消息表发送到 Kafka，消费者再把消息写入旧库。**为什么多此一举？** 因为本地消息表解决了 Kafka 消息可能丢失的问题——即使 Kafka 宕机，只要消息表在数据库里，就不会丢失。定时任务会不断重试，直到发送成功。
+
+## 数据冲突处理
+
+双写期间，最麻烦的问题不是「写不进去」，而是**同一个数据在新旧系统中被修改了不同的值**。
+
+场景是这样的：
+
+1. 旧系统中，用户 A 的手机号是 `13800138000`
+2. 新系统上线，开始双写
+3. 用户 A 通过新系统把手机号改成了 `13900139000`
+4. 用户 A 通过旧系统（或其他渠道）把手机号改成了 `13700137000`
+5. 新库收到的是 `13900139000`，旧库收到的是 `13700137000`
+6. 数据冲突了
+
+**解决方案有三种：**
+
+**方案一：以新库为准。** 迁移期间，所有业务操作都走新系统，旧系统只做数据同步。如果用户必须通过旧系统操作，需要加限制（如只读）。
+
+**方案二：最后写入优先（LWW）。** 每次写入都记录时间戳，冲突时以最新时间的数据为准。简单，但可能丢失数据。
+
+**方案三：人工介入。** 冲突时告警，人工确认数据保留哪个值。数据准确性高，但运营成本也高。
+
+对于大多数迁移场景，**方案一（以新库为准）是最推荐的**。迁移的目标就是用新系统替换旧系统，业务操作应该尽量收敛到新系统。
+
+## 双写的监控与告警
+
+双写最怕的不是写失败，而是**静默失败**——写入看起来成功了，但另一边没有收到数据，日志里也没有明显错误。这种情况持续几小时，就会积累大量数据不一致。
+
+必须建立完善的监控：
+
+```java
+@Service
+public class DoubleWriteMonitor {
+
+    @Autowired private UserMapper newUserMapper;
+    @Autowired private UserMapper legacyUserMapper;
+    @Autowired private AlertService alertService;
+
+    // 每分钟检查一次数据一致性
+    @Scheduled(cron = "0 * * * * *")
+    public void checkConsistency() {
+        // 1. 抽样检查：随机抽取 100 条新库数据，对比旧库
+        List<User> samples = newUserMapper.selectRandomSamples(100);
+
+        int inconsistencyCount = 0;
+        for (User newUser : samples) {
+            User oldUser = legacyUserMapper.findById(newUser.getId());
+
+            if (oldUser == null) {
+                // 旧库缺失这条记录
+                inconsistencyCount++;
+                log.warn("数据不一致：旧库缺失 userId={}", newUser.getId());
+
+            } else if (!equals(newUser, oldUser)) {
+                // 数据值不一致
+                inconsistencyCount++;
+                log.warn("数据不一致：userId={}, 新库={}, 旧库={}",
+                    newUser.getId(), newUser, oldUser);
+            }
+        }
+
+        // 2. 告警阈值：超过 1% 的不一致率
+        if (inconsistencyCount > samples.size() * 0.01) {
+            alertService.alert("用户数据双写不一致率超过 1%，当前不一致数量：{}",
+                inconsistencyCount);
+        }
+    }
+
+    private boolean equals(User a, User b) {
+        if (a == null || b == null) return false;
+        return Objects.equals(a.getName(), b.getName())
+            && Objects.equals(a.getEmail(), b.getEmail())
+            && Objects.equals(a.getPhone(), b.getPhone());
+    }
+}
+```
+
+**监控的核心指标有三个：**
+
+1. **不一致率**：新旧库数据差异的比例，应该 `<` 1%
+2. **延迟**：从新库写入到旧库同步完成的时间，应该 `<` 5 秒
+3. **消息堆积**：本地消息表中 PENDING 状态消息的数量，应该 `<` 1000 条
+
+## 真实案例
+
+> **真实案例**：某电商公司订单系统迁移中的双写问题
+>
+> - **现象**：迁移期间，用户反馈订单状态不对，有些订单在新系统中显示「已支付」，但在旧系统中显示「待支付」
+> - **原因**：异步双写的消息队列出现了短暂的抖动，部分消息延迟了 10 分钟才被消费，导致旧库数据更新不及时
+> - **解决方案**：引入本地消息表作为兜底，确保即使 Kafka 出现问题，消息也不会丢失；增加监控告警，消息延迟超过 30 秒就告警
+> - **来源**：内部技术复盘文档
+
+## 总结
+
+数据双写是迁移期间数据同步的核心手段，三种模式各有适用场景：
+
+- **同步双写**：简单但风险高，适合过渡期短、数据量小的场景
+- **异步双写**（消息队列）：性能好，但需要保证消息不丢失
+- **本地消息表**：最可靠，但实现复杂，适合对数据一致性要求高的场景
+
+**选择双写模式时，最重要的判断依据是：对数据不一致的容忍度。** 如果业务能接受几分钟的数据延迟，本地消息表是首选；如果业务要求实时一致，需要引入分布式事务（如 Seata）或其他补偿机制。
+
+---
+
+**常见陷阱与反模式**：
+
+1. **忽略幂等处理**：异步双写时，如果消费者重启或 Kafka 重试，消息可能被重复消费。必须在消费者端做幂等处理（如基于主键的 INSERT 或带条件 UPDATE）。
+2. **没有监控**：双写失败可能是静默的。必须建立数据一致性监控，及时发现数据差异。
+3. **事务边界错误**：同步双写时，不要试图用本地事务包裹两个数据源的写入。两个独立数据库无法用同一个事务保证原子性。
+
+### 思考题
+
+**问题 1**：如果新库写入成功，但消息发送失败（Kafka 不可用），本地消息表方案如何保证数据不丢失？
+
+<details>
+<summary>参考答案</summary>
+
+本地消息表方案的核心在于：消息记录和业务数据在同一个事务中写入。如果 Kafka 发送失败，消息记录已经持久化在数据库中，定时任务会不断重试发送。直到 Kafka 恢复，消息最终会被发送成功。关键配置：定时任务的执行频率要足够高（如每秒一次），重试策略要合理（如最多重试 3 次，超过后告警人工介入）。
+
+</details>
+
+**问题 2**：双写期间，如果旧库被其他系统（如定时任务）修改了数据，如何发现并处理这种「脏写」？
+
+<details>
+<summary>参考答案</summary>
+
+需要在数据中增加「数据来源」和「最后修改时间」字段。新系统写入时标记来源为「新系统」，旧系统写入时标记来源为「旧系统」。如果发现某条记录被旧系统修改，而新系统也有修改历史，则可能出现数据冲突。解决方案：迁移期间限制旧系统的写入能力，或者在应用层增加写锁（同一时刻只允许一个系统写入）。
+
+</details>
+
+**问题 3**：对于已经存在大量历史数据的新旧库，如何快速验证双写期间的数据一致性？
+
+<details>
+<summary>参考答案</summary>
+
+分三步走：第一步，全量校验：在迁移开始前，对比新旧库所有数据，记录不一致的数据；第二步，增量校验：迁移期间，每小时或每天运行一次增量校验，只对比最近修改过的数据；第三步，实时告警：对于关键的写操作，在写入完成后立即触发异步校验，发现不一致立即告警。增量校验的 SQL 示例：`SELECT * FROM new_db.users WHERE update_time > last_check_time MINUS 1 hour` 对比 `SELECT * FROM old_db.users WHERE update_time > last_check_time MINUS 1 hour`。
+
+</details>

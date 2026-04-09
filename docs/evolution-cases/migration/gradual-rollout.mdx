@@ -1,0 +1,413 @@
+---
+title: 灰度发布与流量切换
+description: 深入讲解灰度发布的核心理念、策略选择、流量切换方式以及监控回退机制
+---
+
+# 灰度发布与流量切换
+
+2021 年双十一前夜，某电商团队准备发布新版推荐系统。新系统使用了新的排序算法，团队预计转化率能提升 3%。但他们没有直接全量上线，而是在凌晨 12 点用 1% 的流量试跑了 2 小时，确认数据正常后才逐步放量。
+
+凌晨 2 点，监控大屏显示：新系统的转化率比旧系统低了 0.8%。虽然不是致命问题，但如果全量上线，这 0.8% 的下降会持续整个双十一，影响数百万 GMV。
+
+团队立即回滚，第二天排查发现：新排序算法对一个高频流量入口的用户群体有负面影响。问题修复后，新系统最终带来了 4.2% 的转化率提升。
+
+这就是灰度发布的价值：**在小范围内验证，发现问题后快速回退，避免影响全量用户。**
+
+灰度发布（Canary Release）不是新技术，但它是迁移过程中最关键的安全保障手段。这一节从灰度策略、流量切换方式、监控判断到回退机制，完整讲解灰度发布的实践。
+
+## 灰度策略
+
+灰度策略决定了「哪些用户先体验新版本」。选择合适的灰度策略，能在验证效果的同时控制风险。
+
+### 三种灰度维度
+
+| 维度 | 说明 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| **按用户** | 指定特定用户群（如内测用户、VIP 用户）优先体验 | 精准可控，问题影响范围小 | 需要用户分层体系 | 新功能推广、内部测试 |
+| **按地区** | 按地域逐步放量（如先北上广，再二三线城市） | 符合业务扩展节奏 | 跨地区用户体验不一致 | 区域化业务、全球化部署 |
+| **按流量比例** | 按请求百分比随机分流 | 简单直接，验证统计意义强 | 可能误伤用户体验 | 大多数迁移场景 |
+
+### 按流量比例灰度
+
+按流量比例是最通用的灰度策略。通常的做法是：
+
+```yaml
+# API 网关灰度配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        # 灰度流量：新版本服务
+        - id: product-service-canary
+          uri: lb://product-service-new
+          predicates:
+            - Header=X-Canary, true
+          filters:
+            - StripHeader=X-Canary
+
+        # 生产流量：旧版本服务
+        - id: product-service-legacy
+          uri: lb://product-service-legacy
+          predicates:
+            - Path=/api/product/**
+```
+
+客户端请求时，带上 `X-Canary: true` header 的请求会路由到新服务，其他请求路由到旧服务。灰度放量时，只需要增加带 header 的请求比例。
+
+**更优雅的做法是使用权重路由：**
+
+```yaml
+# 按权重分流（基于 Spring Cloud Gateway）
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: product-service
+          uri: lb://product-service
+          predicates:
+            - Path=/api/product/**
+          filters:
+            - name: Weight
+              args:
+                group1: 90   # 旧服务 90% 权重
+                group2: 10  # 新服务 10% 权重
+```
+
+### 按用户灰度
+
+按用户灰度适合有用户分层体系的业务（如会员等级、用户标签）。可以通过配置中心动态调整：
+
+```java
+@Configuration
+public class CanaryConfig {
+
+    @Autowired private ConfigService configService;
+
+    public boolean shouldUseNewVersion(Long userId) {
+        // 从配置中心读取灰度规则
+        CanaryRule rule = configService.getCanaryRule("product-service");
+
+        if (rule.getType() == "percent") {
+            // 按百分比
+            return userId % 100 < rule.getPercent();
+        } else if (rule.getType() == "userList") {
+            // 按用户名单
+            return rule.getUserIds().contains(userId);
+        } else if (rule.getType() == "tag") {
+            // 按用户标签
+            User user = userService.getById(userId);
+            return rule.getTags().contains(user.getTag());
+        }
+
+        return false;
+    }
+}
+```
+
+## 流量切换的四种方式
+
+灰度策略解决的是「哪些请求走新版本」，流量切换解决的是「请求怎么到达新版本」。有四种常见方式。
+
+### 方式一：网关路由
+
+最常用的方式。API 网关（如 Spring Cloud Gateway、Nginx、Envoy）作为流量入口，根据配置动态路由请求。
+
+```yaml
+# Spring Cloud Gateway 配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+      default-filters:
+        - RewritePath=/api/(?<segment>.*), /$\{segment}
+```
+
+```nginx
+# Nginx 配置（加权轮询）
+upstream backend {
+    server legacy-server:8080 weight=90;
+    server new-server:8080 weight=10;
+}
+
+server {
+    location /api/ {
+        proxy_pass http://backend;
+    }
+}
+```
+
+### 方式二：Istio 虚拟服务
+
+在 Kubernetes + Istio 环境下，可以使用 VirtualService 定义灰度规则：
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: product-service
+spec:
+  hosts:
+    - product-service
+  http:
+    - route:
+        - destination:
+            host: product-service
+            subset: v1  # 旧版本
+          weight: 90
+        - destination:
+            host: product-service
+            subset: v2  # 新版本（canary）
+          weight: 10
+```
+
+灰度放量时，只需修改 `weight` 字段：
+
+```bash
+# 将新版本权重调整到 50%
+kubectl patch virtualservice product-service \
+  --type='json' \
+  -p='[{"op": "replace", "path": "/spec/http/0/route/1/weight", "value": 50}]'
+```
+
+### 方式三：DNS 切换
+
+对于跨地域的灰度，可以通过修改 DNS 解析来实现流量切换。
+
+```bash
+# DNS 切换示例（将新版本 IP 加入解析）
+# 灰度期间：10% 流量解析到新服务 IP
+$TTL 300
+api.example.com.  IN  A  1.2.3.4   ; 旧服务 IP
+api.example.com.  IN  A  5.6.7.8   ; 新服务 IP（10% 权重）
+```
+
+DNS 切换的优点是实现简单，缺点是生效时间长（依赖 DNS 缓存和 TTL），不适合需要快速回退的场景。
+
+### 方式四：配置中心热更新
+
+对于无状态服务，可以通过配置中心（如 Apollo、Nacos）动态调整流量权重：
+
+```java
+@Configuration
+public class TrafficConfig {
+
+    @Autowired private ConfigService configService;
+
+    @Bean
+    public LoadBalancerInterceptor loadBalancerInterceptor() {
+        return new LoadBalancerInterceptor((serviceId, request) -> {
+            // 从配置中心读取目标服务版本
+            String version = configService.getProperty(
+                "traffic.version." + serviceId, "legacy");
+
+            if ("canary".equals(version)) {
+                return serviceId + "-canary";
+            } else {
+                return serviceId + "-legacy";
+            }
+        });
+    }
+}
+```
+
+## 灰度过程中的监控
+
+灰度期间，监控是判断新版本是否正常的关键依据。必须关注三类指标。
+
+### 错误率
+
+新版本的错误率不应该显著高于旧版本。通常设置阈值：与旧版本对比，错误率上升超过 0.1% 就需要告警。
+
+```java
+@Service
+public class CanaryMonitor {
+
+    @Autowired private PrometheusMetrics prometheusMetrics;
+
+    // 监控指标：每分钟计算一次新旧版本的错误率
+    @Scheduled(cron = "0 * * * * *")
+    public void checkErrorRate() {
+        double oldErrorRate = prometheusMetrics.getErrorRate(
+            "product-service", "legacy", "1m");
+        double newErrorRate = prometheusMetrics.getErrorRate(
+            "product-service", "canary", "1m");
+
+        double errorRateDelta = newErrorRate - oldErrorRate;
+
+        if (errorRateDelta > 0.001) {  // 上升超过 0.1%
+            alertService.alert("灰度版本错误率异常：旧版本={}%, 新版本={}%, 差值={}%",
+                oldErrorRate * 100, newErrorRate * 100, errorRateDelta * 100);
+        }
+    }
+}
+```
+
+### 延迟
+
+新版本的 P99 延迟不应该显著高于旧版本。如果延迟上升，说明新版本存在性能问题。
+
+### 业务指标
+
+对于业务系统，还需要关注业务指标的变化：
+
+- **转化率**：下单转化率是否有明显变化
+- **GMV**：交易额是否有明显变化
+- **用户行为**：点击率、停留时长等
+
+```java
+// 业务指标监控示例
+public void reportBusinessMetrics(String version, BusinessMetrics metrics) {
+    // 对比新旧版本的转化率
+    if ("canary".equals(version)) {
+        double conversionRate = metrics.getConversionRate();
+        double legacyConversionRate = cache.get("legacy_conversion_rate");
+
+        // 如果转化率下降超过 5%，告警
+        if (legacyConversionRate > 0 && 
+            conversionRate < legacyConversionRate * 0.95) {
+            alertService.alert("灰度版本转化率下降超过 5%：当前={}%, 基线={}%",
+                conversionRate * 100, legacyConversionRate * 100);
+        }
+    }
+}
+```
+
+## 灰度回退
+
+灰度过程中发现问题，必须能够快速回退。回退的核心是：把流量从新版本切回旧版本。
+
+### 回退操作
+
+```bash
+# Istio 回退：立即将新版本权重调回 0%
+kubectl patch virtualservice product-service \
+  --type='json' \
+  -p='[{"op": "replace", "path": "/spec/http/0/route/1/weight", "value": 0}]'
+
+# 或者通过配置中心回退
+apollo-cli --config "traffic.version.product-service" --value "legacy"
+```
+
+### 自动回退
+
+更高级的做法是配置自动回退：当错误率或延迟超过阈值时，自动将流量切回旧版本。
+
+```yaml
+# Prometheus AlertManager 配置
+groups:
+  - name: canary-alerts
+    rules:
+      - alert: CanaryErrorRateHigh
+        expr: |
+          (
+            rate(http_requests_total{service="product-service", version="canary", status=~"5.."}[5m])
+            /
+            rate(http_requests_total{service="product-service", version="canary"}[5m])
+          )
+          -
+          (
+            rate(http_requests_total{service="product-service", version="legacy", status=~"5.."}[5m])
+            /
+            rate(http_requests_total{service="product-service", version="legacy"}[5m])
+          ) > 0.005
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "灰度版本错误率上升超过 0.5%"
+          description: "新版本错误率比旧版本高 0.5% 以上，自动回退已触发"
+      - alert: CanaryAutoRollback
+        expr: increase(canary_rollback_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "灰度版本已自动回退"
+```
+
+## 真实案例
+
+> **真实案例**：某社交平台如何用金丝雀发布在 2 周内完成核心推荐服务升级
+>
+> - **背景**：推荐服务是从 Python 重写到 Go 的，性能预计提升 5 倍，但团队担心新版本的行为差异会影响推荐效果
+> - **灰度策略**：按用户 ID 哈希分流，第一周 5%，第二周 30%，第三周 100%
+> - **监控指标**：除基础指标外，额外关注「用户点击率」「推荐内容曝光率」「���户停留时长」
+> - **发现问题**：灰度到 15% 时，发现新版本对「冷启动用户」的推荐效果显著下降（点击率下降 40%）
+> - **回退与修复**：立即回滚到 5%，排查发现新版本在用户特征缺失时的兜底逻辑有误
+> - **结果**：修复后全量上线，推荐服务 P99 延迟从 200ms 降到 35ms，转化率提升 12%
+> - **来源**：内部技术博客
+
+## 全量发布与灰度发布的对比
+
+| 维度 | 全量发布 | 灰度发布 |
+| --- | --- | --- |
+| **风险** | 高，一次性影响全量用户 | 低，逐步放量，问题影响范围可控 |
+| **回退速度** | 慢，需要重新部署 | 快，只需调整流量权重 |
+| **验证充分性** | 依赖测试环境，难以发现线上问题 | 真实流量验证，更接近生产环境 |
+| **发布周期** | 短，一次完成 | 长，需要分批放量 |
+| **适用场景** | 非核心服务、低风险变更 | 核心服务、高风险变更、迁移场景 |
+
+**灰度发布的适用场景**：
+
+- 核心服务或有重大变更的功能
+- 性能优化（需要用真实流量验证）
+- 技术栈迁移（如 Python → Go）
+- 架构迁移（如单体 → 微服务）
+
+**可以跳过灰度的场景**：
+
+- 不涉及业务逻辑变更的基础设施升级（如升级 Kubernetes 版本）
+- 纯运维变更（如扩容、缩容）
+- 非核心服务的简单 Bug 修复
+
+## 总结
+
+灰度发布是迁移过程中的安全网。它的核心价值在于：**用小范围的风险，换取大范围的可控**。
+
+灰度策略的选择取决于业务场景：按用户灰度适合精准验证，按地区灰度符合业务扩展节奏，按流量比例灰度是最通用的方案。流量切换方式的选择取决于技术栈：网关路由适合 Spring Cloud 环境，Istio 适合 Kubernetes 环境，DNS 切换适合跨地域部署。
+
+**灰度期间必须做好三件事：**
+
+1. **监控**：错误率、延迟、业务指标，一个都不能少
+2. **回退预案**：发现问题后，必须能够快速把流量切回旧版本
+3. **灰度时长**：灰度时间要足够长（通常 1~2 周），才能发现偶发问题
+
+---
+
+**常见陷阱与反模式**：
+
+1. **灰度过短**：只跑 30 分钟就全量上线，很多偶发问题发现不了。建议至少灰度 1 周。
+2. **监控不完善**：只监控技术指标（错误率、延迟），不监控业务指标（转化率、GMV）。业务指标异常往往比技术指标异常更严重。
+3. **回退方案缺失**：灰度上线后才发现没有回退能力，只能紧急修复。灰度方案设计时必须同时设计回退方案。
+
+### 思考题
+
+**问题 1**：如果灰度过程中发现新版本性能更好（延迟更低、吞吐量更高），是否可以提前全量？
+
+<details>
+<summary>参考答案</summary>
+
+可以，但建议至少满足以下条件才全量：1. 灰度时间超过 48 小时，能覆盖不同时段（高峰期、低峰期）的表现；2. 新版本稳定性得到验证，没有出现错误率上升；3. 业务指标（如转化率）没有负面变化。即使决定提前全量，也要准备好回退预案，以防全量后出现新问题。
+
+</details>
+
+**问题 2**：如果新旧版本的功能有差异（如 UI 改版），用户在不同版本间切换时体验不一致，怎么办？
+
+<details>
+<summary>参考答案</summary>
+
+这是用户体验层面的灰度问题，有几种解决方案：1. **固定用户版本**：用 Cookie 或 Token 记录用户访问的版本，同一用户始终访问同一版本，避免体验不一致；2. **按入口灰度**：不同入口（如 App 端、Web 端）可以独立灰度，避免交叉影响；3. **A/B 测试框架**：使用专门的 A/B 测试平台（如 LaunchDarkly、Firebase Remote Config）实现更精细的灰度控制。
+
+</details>
+
+**问题 3**：灰度期间，如果需要紧急发布一个 Bug 修复，应该如何处理？
+
+<details>
+<summary>参考答案</summary>
+
+分为两种情况：1. **Bug 修复只在新版本**：直接在新版本代码中修复 Bug，重新部署新版本服务，灰度流量会自动使用修复后的版本；2. **Bug 修复需要同时影响新旧版本**：需要分别在新旧版本代码中修复，然后按紧急发布流程处理（跳过灰度或缩小灰度范围）。为避免这种情况，建议在新版本稳定后再进行其他紧急变更。
+
+</details>

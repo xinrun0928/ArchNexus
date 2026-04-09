@@ -101,18 +101,18 @@ export const nav = [
       { text: '⚖️ 合规与隐私（GDPR/等保/SOC2/数据脱敏）', link: '/security/compliance/' },
     ],
   },
-  // {
-  //   text: '演进与实战',
-  //   link: '/evolution-cases/',
-  //   items: [
-  //     { text: '🛤️ 架构演进路径（单体→SOA→微服务→网格→无服务器）', link: '/evolution-cases/evolution-path/' },
-  //     { text: '🚚 服务拆分与数据迁移（绞杀者模式/绞杀者/数据双写）', link: '/evolution-cases/migration/' },
-  //     { text: '💰 技术债务治理（量化/优先级/重构策略）', link: '/evolution-cases/technical-debt/' },
-  //     { text: '📋 架构决策记录（ADR/权衡框架）', link: '/evolution-cases/adr/' },
-  //     { text: '🏛️ 知名架构解析（淘宝/微信/抖音/Netflix）', link: '/evolution-cases/famous/' },
-  //     { text: '🔄 故障案例复盘（Hacker News/阿里/腾讯）', link: '/evolution-cases/postmortem/' },
-  //     { text: '⚡ 极限场景设计（双十一/春晚/秒杀）', link: '/evolution-cases/extreme/' },
-  //     { text: '🎯 架构师软技能（沟通/文档/技术雷达/团队赋能）', link: '/evolution-cases/soft-skills/' },
-  //   ],
-  // },
+  {
+    text: '演进与实战',
+    link: '/evolution-cases/',
+    items: [
+      { text: '🛤️ 架构演进路径（单体→SOA→微服务→网格→无服务器）', link: '/evolution-cases/evolution-path/' },
+      { text: '🚚 服务拆分与数据迁移（绞杀者模式/绞杀者/数据双写）', link: '/evolution-cases/migration/' },
+      { text: '💰 技术债务治理（量化/优先级/重构策略）', link: '/evolution-cases/technical-debt/' },
+      { text: '📋 架构决策记录（ADR/权衡框架）', link: '/evolution-cases/adr/' },
+      { text: '🏛️ 知名架构解析（淘宝/微信/抖音/Netflix）', link: '/evolution-cases/famous/' },
+      { text: '🔄 故障案例复盘（Hacker News/阿里/腾讯）', link: '/evolution-cases/postmortem/' },
+      { text: '⚡ 极限场景设计（双十一/春晚/秒杀）', link: '/evolution-cases/extreme/' },
+      { text: '🎯 架构师软技能（沟通/文档/技术雷达/团队赋能）', link: '/evolution-cases/soft-skills/' },
+    ],
+  },
 ];
