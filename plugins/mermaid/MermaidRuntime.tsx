@@ -21,6 +21,35 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
     let mermaidModule: any = null;
     let contentObserver: MutationObserver | null = null;
 
+    // 修复 SVG viewBox 高度，确保多行文本不被裁剪
+    const fixSvgViewBox = (svg: SVGElement) => {
+      const originalViewBox = svg.getAttribute('viewBox');
+      if (!originalViewBox) return;
+
+      const parts = originalViewBox.split(/\s+/);
+      if (parts.length < 4) return;
+
+      // 获取 SVG 实际内容高度
+      const bbox = svg.getBBox();
+      const currentHeight = parseFloat(parts[3]);
+
+      // 如果内容实际高度大于 viewBox 高度，增加 viewBox
+      if (bbox.height > currentHeight) {
+        // 添加一些 padding
+        const newHeight = Math.max(currentHeight, bbox.height + 20);
+        parts[3] = newHeight.toString();
+        svg.setAttribute('viewBox', parts.join(' '));
+
+        // 同时更新 width 和 height 属性
+        const width = svg.getAttribute('width');
+        const height = svg.getAttribute('height');
+        if (width && height) {
+          const scale = parseFloat(height) / currentHeight;
+          svg.setAttribute('height', (newHeight * scale).toString());
+        }
+      }
+    };
+
     const renderMermaidDiagrams = async () => {
       if (cancelled) return;
 
@@ -120,6 +149,12 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
           const wrapper = document.createElement('div');
           wrapper.className = 'mermaid-wrapper';
           wrapper.innerHTML = svg;
+
+          // 修复 SVG viewBox 高度问题，确保多行文本完整显示
+          const svgElement = wrapper.querySelector('svg');
+          if (svgElement) {
+            fixSvgViewBox(svgElement);
+          }
 
           container.appendChild(wrapper);
 
