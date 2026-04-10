@@ -81,7 +81,25 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
             !codeContent.trim().startsWith('stateDiagram') &&
             !codeContent.trim().startsWith('classDiagram') &&
             !codeContent.trim().startsWith('gantt') &&
-            !codeContent.trim().startsWith('pie')) {
+            !codeContent.trim().startsWith('pie') &&
+            !codeContent.trim().startsWith('timeline') &&
+            !codeContent.trim().startsWith('erDiagram') &&
+            !codeContent.trim().startsWith('gitGraph') &&
+            !codeContent.trim().startsWith('mindmap') &&
+            !codeContent.trim().startsWith('requirement') &&
+            !codeContent.trim().startsWith('graph') &&
+            !codeContent.trim().startsWith('radar') &&
+            !codeContent.trim().startsWith('block') &&
+            !codeContent.trim().startsWith('barChart') &&
+            !codeContent.trim().startsWith('lineChart') &&
+            !codeContent.trim().startsWith('quadrantChart') &&
+            !codeContent.trim().startsWith('journey') &&
+            !codeContent.trim().startsWith('sankey') &&
+            !codeContent.trim().startsWith('architecture') &&
+            !codeContent.trim().startsWith('packet') &&
+            !codeContent.trim().startsWith('deployment') &&
+            !codeContent.trim().startsWith('component') &&
+            !codeContent.trim().startsWith('>')) {
           continue;
         }
 
