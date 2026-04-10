@@ -4,6 +4,7 @@ import { pluginSass } from '@rsbuild/plugin-sass';
 
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
+import { pluginMermaid } from './plugins/mermaid';
 
 // Rspress 文档站点核心配置导出
 export default defineConfig({
@@ -11,7 +12,10 @@ export default defineConfig({
   // 注意：@rsbuild/plugin-sass 属于构建工具插件，应放在 builderConfig.plugins 中
   // ==============================================
   plugins: [
-
+    // Mermaid 图表渲染插件
+    // 支持在文档中使用 ```mermaid 代码块绘制流程图、时序图、状态图等
+    // 主题可选：default | dark | forest | neutral | base
+    pluginMermaid({ theme: 'forest' }),
   ],
 
   // ==============================================
