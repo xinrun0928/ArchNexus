@@ -19,6 +19,7 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
   useEffect(() => {
     let cancelled = false;
     let mermaidModule: any = null;
+    let contentObserver: MutationObserver | null = null;
 
     const renderMermaidDiagrams = async () => {
       if (cancelled) return;
@@ -120,30 +121,63 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
       }
     };
 
-    // 延迟执行，等待页面内容加载
-    const timer = setTimeout(renderMermaidDiagrams, 100);
+    // 使用 requestAnimationFrame 等待 DOM 更新后再渲染
+    const scheduleRender = () => {
+      if (cancelled) return;
+      requestAnimationFrame(() => {
+        if (cancelled) return;
+        renderMermaidDiagrams();
+      });
+    };
+
+    // 监听 Rspress 根容器的内容变化（处理 SPA 路由切换）
+    const setupContentObserver = () => {
+      const root = document.getElementById('__rspress_root');
+      if (!root) return;
+
+      contentObserver = new MutationObserver((mutations) => {
+        // 检查是否有子节点被添加
+        const hasAddedNodes = mutations.some(mutation => mutation.addedNodes.length > 0);
+        if (hasAddedNodes) {
+          scheduleRender();
+        }
+      });
+
+      contentObserver.observe(root, {
+        childList: true,
+        subtree: true,
+      });
+    };
+
+    // 初始延迟执行
+    const timer = setTimeout(scheduleRender, 300);
 
     // 监听主题切换
-    const observer = new MutationObserver(() => {
-      renderMermaidDiagrams();
+    const themeObserver = new MutationObserver(() => {
+      scheduleRender();
     });
 
-    observer.observe(document.documentElement, {
+    themeObserver.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ['class'],
     });
 
-    // 监听路由变化（Rspress SPA）
+    // 监听路由变化（兼容 Rspress 的 routechange 事件）
     const handleRouteChange = () => {
-      setTimeout(renderMermaidDiagrams, 100);
+      // 等待新内容加载完成
+      setTimeout(scheduleRender, 300);
     };
 
     document.addEventListener('routechange', handleRouteChange);
 
+    // 设置内容观察器
+    setupContentObserver();
+
     return () => {
       cancelled = true;
       clearTimeout(timer);
-      observer.disconnect();
+      themeObserver.disconnect();
+      contentObserver?.disconnect();
       document.removeEventListener('routechange', handleRouteChange);
     };
   }, [props?.defaultTheme]);
