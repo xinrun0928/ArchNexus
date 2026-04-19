@@ -5,7 +5,7 @@ interface MermaidRuntimeProps {
 }
 
 // Mermaid CDN URL
-const MERMAID_CDN_URL = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+const MERMAID_CDN_URL = 'https://cdn.jsdelivr.net/npm/mermaid@11.0.2/dist/mermaid.esm.min.mjs';
 
 /**
  * Mermaid 运行时组件
