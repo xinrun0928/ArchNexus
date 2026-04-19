@@ -1,12 +1,51 @@
+// ==============================================
+// 导入 Rspress 核心依赖
+// ==============================================
+
 import * as path from 'node:path';
 import { defineConfig } from '@rspress/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
-
+// @ts-ignore - 本地模块无类型声明
 import { nav } from './theme_config/nav';
+// @ts-ignore - 本地模块无类型声明
 import { sidebar } from './theme_config/sidebar';
+// @ts-ignore - 本地模块无类型声明
 import { pluginMermaid } from './plugins/mermaid';
+import { transformerNotationHighlight } from '@shikijs/transformers';
 
-// Rspress 文档站点核心配置导出
+// ==============================================
+// 经常变化的配置（站点信息、SEO、导航、社交链接等）
+// ==============================================
+
+/**
+ * 站点基础信息
+ */
+const siteMeta = {
+  /** 网站标题 - 显示在浏览器标签页和导航栏 */
+  title: 'ArchNexus',
+  /** 网站描述 - 用于 SEO 搜索引擎优化 */
+  description: '系统梳理 Java 后端核心知识与架构设计能力，从基础到进阶，一步一步成为真正的架构师',
+  /** 作者信息 */
+  author: 'Mr.zhang',
+  /** 网站配色主题 - 对应 styles/global_{theme}.css 样式文件名称 */
+  theme: 'default',
+  /** 站点关键词 - 根据导航栏目自动生成 */
+  keywords: [
+    'Java', '后端开发', '架构设计', '系统架构', '微服务', '分布式',
+    '并发编程', 'JVM', '数据库', '中间件', '面试', '进阶',
+    'Rspress', '静态网站生成器', 'Shiki', 'Mermaid',
+  ],
+};
+
+/**
+ * GitHub 仓库地址
+ */
+const gitHubRepo = 'https://github.com/xinrun0928/ArchNexus';
+
+// ==============================================
+// Rspress 核心配置
+// ==============================================
+
 export default defineConfig({
   // ==============================================
   // 注意：@rsbuild/plugin-sass 属于构建工具插件，应放在 builderConfig.plugins 中
@@ -34,21 +73,21 @@ export default defineConfig({
    * 配置全局 CSS 样式文件路径，会自动注入到所有页面
    * 可用于统一修改主题色、字体、布局等全局样式
    */
-  globalStyles: path.join(__dirname, 'styles/global.css'),
+  globalStyles: path.join(__dirname, `styles/global_${siteMeta.theme}.css`),
 
   /**
    * 网站标题
    * 显示在浏览器标签页、导航栏、SEO 标题中
    * 是站点的核心名称标识
    */
-  title: 'ArchNexus',
+  title: siteMeta.title,
 
   /**
    * 网站描述
    * 用于 SEO 搜索引擎优化，提升站点被搜索概率
    * 简洁概括站点内容，便于搜索引擎收录
    */
-  description: '系统梳理 Java 后端核心知识与架构设计能力，从基础到进阶，一步一步成为真正的架构师',
+  description: siteMeta.description,
 
   /**
    * 网站 favicon 图标（浏览器标签小图标）
@@ -56,13 +95,6 @@ export default defineConfig({
    * 支持 png / svg / ico 格式
    */
   icon: '/images/logo.png',
-
-  /**
-   * 暗黑模式开关
-   * true：页面顶部显示「日间/暗黑模式」切换按钮
-   * false：隐藏切换按钮，固定使用默认主题
-   */
-  darkMode: true,
 
   /**
    * 网站 Logo 配置
@@ -76,6 +108,18 @@ export default defineConfig({
     dark: '/icon.png',
   },
 
+  /**
+   * 搜索框开关
+   * true：在顶部导航栏显示文档搜索框（支持全文搜索）
+   * false：隐藏搜索功能
+   */
+  search: false,
+
+  /**
+   * 构建工具配置
+   * 用于配置 Rsbuild/Rspack 的构建行为，包括插件、编译器选项等
+   * 注意：@rsbuild/plugin-sass 等构建插件必须放在这里，而非顶层 plugins 配置
+   */
   builderConfig: {
     plugins: [
       pluginSass(),
@@ -94,6 +138,13 @@ export default defineConfig({
     sidebar: sidebar,
 
     /**
+     * 暗黑模式开关
+     * true：页面顶部显示「日间/暗黑模式」切换按钮
+     * false：隐藏切换按钮，固定使用默认主题
+     */
+    darkMode: true,
+
+    /**
      * 搜索框开关
      * true：在顶部导航栏显示文档搜索框（支持全文搜索）
      * false：隐藏搜索功能
@@ -107,20 +158,11 @@ export default defineConfig({
      */
     socialLinks: [
       {
-        // 使用 Rspress 内置的 GitHub 图标
         icon: 'github',
-        // 链接模式：link = 跳转到外部链接
         mode: 'link',
-        // 点击图标跳转的目标 URL
-        content: 'https://github.com/xinrun0928/ArchNexus',
+        content: gitHubRepo,
       },
     ],
-
-    /**
-     * 「下一篇」按钮文字
-     * 文档底部翻页区域的「下一篇」按钮显示文本
-     */
-    nextPageText: '下一篇',
 
     /**
      * 滚动到顶部按钮开关
@@ -136,7 +178,7 @@ export default defineConfig({
      */
     editLink: {
       // 文档在 Git 仓库中的根目录 URL
-      docRepoBaseUrl: 'https://github.com/xinrun0928/ArchNexus/blob/main/docs',
+      docRepoBaseUrl: `${gitHubRepo}/blob/main/docs`,
     },
 
     /**
@@ -145,9 +187,8 @@ export default defineConfig({
      * 支持 HTML 标签，可插入链接、样式等
      */
     footer: {
-      message:
-        'Copyright © 2025-2026 <a href="https://github.com/xinrun0928/ArchNexus">ArchNexus</a>',
-    },
+      message: `Copyright © 2025-2026 <a href="${gitHubRepo}">ArchNexus</a>`,
+    }
   },
 
   // ==============================================
@@ -160,6 +201,9 @@ export default defineConfig({
      * false：隐藏代码块行号
      */
     showLineNumbers: true,
+    shiki: {
+      transformers: [transformerNotationHighlight()],
+    },
   },
 
   // ==============================================
@@ -175,20 +219,12 @@ export default defineConfig({
     cleanUrls: true,
   },
 
-  /**
-   * 搜索框开关
-   * true：在顶部导航栏显示文档搜索框（支持全文搜索）
-   * false：隐藏搜索功能
-   */
-  search: false,
-
   // ==============================================
   // 页面头部标签配置（SEO、meta 标签、自定义 head）
   // 用于向 HTML <head> 中注入自定义标签
   // ==============================================
   head: [
-    // 写法 1：直接传入 HTML 字符串
-    '<meta name="author" content="Mr.zhang">',
-    '<meta name="keywords" content="Java,后端开发,架构设计,系统架构,微服务,分布式,并发编程,JVM,数据库,中间件,面试,进阶">',
+    `<meta name="author" content="${siteMeta.author}">`,
+    `<meta name="keywords" content="${siteMeta.keywords.join(',')}">`,
   ],
 });
