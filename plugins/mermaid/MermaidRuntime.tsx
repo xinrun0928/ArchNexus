@@ -29,24 +29,41 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
       const parts = originalViewBox.split(/\s+/);
       if (parts.length < 4) return;
 
-      // 获取 SVG 实际内容高度
-      const bbox = svg.getBBox();
+      const currentWidth = parseFloat(parts[2]);
       const currentHeight = parseFloat(parts[3]);
 
-      // 如果内容实际高度大于 viewBox 高度，增加 viewBox
-      if (bbox.height > currentHeight) {
-        // 添加一些 padding
-        const newHeight = Math.max(currentHeight, bbox.height + 20);
-        parts[3] = newHeight.toString();
-        svg.setAttribute('viewBox', parts.join(' '));
+      // 克隆 SVG，临时设为可见以正确测量内容高度
+      const clone = svg.cloneNode(true) as SVGElement;
+      clone.style.position = 'absolute';
+      clone.style.visibility = 'hidden';
+      clone.style.width = currentWidth + 'px';
+      clone.style.height = currentHeight + 'px';
+      document.body.appendChild(clone);
 
-        // 同时更新 width 和 height 属性
-        const width = svg.getAttribute('width');
-        const height = svg.getAttribute('height');
-        if (width && height) {
-          const scale = parseFloat(height) / currentHeight;
-          svg.setAttribute('height', (newHeight * scale).toString());
-        }
+      const bbox = (clone as SVGSVGElement).getBBox();
+      document.body.removeChild(clone);
+
+      const realHeight = bbox.height + bbox.y;
+      const realWidth = bbox.width + bbox.x;
+
+      // 多行文本（包含 <tspan>）每行约 16-20px，换行越多需要越多 padding
+      // 使用较大的 padding 避免裁剪（换行文本高度常超出一倍）
+      const extraPadding = Math.max(100, currentHeight * 0.3);
+      const newHeight = Math.max(currentHeight, realHeight + extraPadding);
+      const newWidth = Math.max(currentWidth, realWidth + 40);
+
+      parts[2] = newWidth.toString();
+      parts[3] = newHeight.toString();
+      svg.setAttribute('viewBox', parts.join(' '));
+
+      // 更新宽高属性以匹配新的 viewBox
+      const svgWidth = svg.getAttribute('width');
+      const svgHeight = svg.getAttribute('height');
+      if (svgWidth && svgHeight) {
+        const scaleX = parseFloat(svgWidth) / currentWidth;
+        const scaleY = parseFloat(svgHeight) / currentHeight;
+        svg.setAttribute('width', (newWidth * scaleX).toString());
+        svg.setAttribute('height', (newHeight * scaleY).toString());
       }
     };
 
@@ -81,7 +98,7 @@ export default function MermaidRuntime(props: MermaidRuntimeProps) {
         startOnLoad: false,
         theme,
         fontFamily: 'var(--rp-font-family-base)',
-        flowchart: { curve: 'basis', htmlLabels: true },
+        flowchart: { curve: 'basis', htmlLabels: true, nodeWidth: 180 },
         sequence: { useMaxWidth: true, diagramMaxWidth: 800 },
       });
 
